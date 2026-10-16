@@ -123,7 +123,8 @@ impl LinuxCommon {
         let (power_sender, power_receiver) = calloop::channel::channel();
 
         #[cfg(any(feature = "wayland", feature = "x11"))]
-        let text_system = Arc::new(crate::linux::CosmicTextSystem::new("IBM Plex Sans"));
+        // Omarchy: fonts are read through fontconfig when first used, not all parsed at startup.
+        let text_system = Arc::new(crate::linux::CosmicTextSystem::new_on_demand("IBM Plex Sans"));
         #[cfg(not(any(feature = "wayland", feature = "x11")))]
         let text_system = Arc::new(gpui::NoopTextSystem::new());
 

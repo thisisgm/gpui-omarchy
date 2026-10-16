@@ -11,6 +11,8 @@ use gpui::{
     ShapedRun, SharedString, Size, TextRenderingMode, point, size,
 };
 
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+use crate::fontconfig_on_demand::OnDemandFonts;
 use itertools::Itertools;
 use parking_lot::RwLock;
 use smallvec::SmallVec;
@@ -59,6 +61,9 @@ struct CosmicTextSystemState {
     font_ids_by_family_cache: HashMap<FontKey, SmallVec<[FontId; 4]>>,
     system_font_fallback: String,
     missing_glyph_sink: Option<Arc<dyn MissingGlyphSink>>,
+    /// Set when installed fonts are read on first use instead of all at startup.
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    on_demand: Option<OnDemandFonts>,
 }
 
 struct LoadedFont {
@@ -129,19 +134,7 @@ impl CosmicTextSystem {
     }
 
     pub fn new(system_font_fallback: &str) -> Self {
-        let font_system = FontSystem::new();
-
-        Self(RwLock::new(CosmicTextSystemState {
-            font_system,
-            scratch: ShapeBuffer::default(),
-            swash_scale_context: ScaleContext::new(),
-            pending_glyph_images: HashMap::default(),
-            loaded_fonts: Vec::new(),
-            loaded_font_ids_by_key: HashMap::default(),
-            font_ids_by_family_cache: HashMap::default(),
-            system_font_fallback: system_font_fallback.to_string(),
-            missing_glyph_sink: None,
-        }))
+        Self::from_font_system(FontSystem::new(), system_font_fallback)
     }
 
     pub fn new_without_system_fonts(system_font_fallback: &str) -> Self {
@@ -149,7 +142,22 @@ impl CosmicTextSystem {
             "en-US".to_string(),
             cosmic_text::fontdb::Database::new(),
         );
+        Self::from_font_system(font_system, system_font_fallback)
+    }
 
+    /// Starts with no fonts parsed; families and fallback faces are read through fontconfig when first used.
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    pub fn new_on_demand(system_font_fallback: &str) -> Self {
+        let font_system = FontSystem::new_with_locale_and_db(
+            locale_from_env(),
+            cosmic_text::fontdb::Database::new(),
+        );
+        let system = Self::from_font_system(font_system, system_font_fallback);
+        system.0.write().on_demand = Some(OnDemandFonts::default());
+        system
+    }
+
+    fn from_font_system(font_system: FontSystem, system_font_fallback: &str) -> Self {
         Self(RwLock::new(CosmicTextSystemState {
             font_system,
             scratch: ShapeBuffer::default(),
@@ -160,7 +168,26 @@ impl CosmicTextSystem {
             font_ids_by_family_cache: HashMap::default(),
             system_font_fallback: system_font_fallback.to_string(),
             missing_glyph_sink: None,
+            #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+            on_demand: None,
         }))
+    }
+}
+
+/// The BCP 47 tag cosmic-text's script fallback ranks by, from the POSIX locale.
+/// Sample input: LANG="ja_JP.UTF-8" gives "ja-JP"; unset or "C" gives "en-US".
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+fn locale_from_env() -> String {
+    let posix = ["LC_ALL", "LC_CTYPE", "LANG"]
+        .iter()
+        .filter_map(|name| std::env::var(name).ok())
+        .find(|value| !value.is_empty())
+        .unwrap_or_default();
+    let tag = posix.split(['.', '@']).next().unwrap_or_default().replace('_', "-");
+    if tag.is_empty() || tag == "C" || tag == "POSIX" {
+        "en-US".to_string()
+    } else {
+        tag
     }
 }
 
@@ -174,14 +201,19 @@ impl PlatformTextSystem for CosmicTextSystem {
     }
 
     fn all_font_names(&self) -> Vec<String> {
-        let mut result = self
-            .0
-            .read()
+        let state = self.0.read();
+        #[allow(unused_mut)]
+        let mut result = state
             .font_system
             .db()
             .faces()
             .filter_map(|face| face.families.first().map(|family| family.0.clone()))
             .collect_vec();
+        // On demand the database holds only what was used so far; fontconfig's cache lists the rest.
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+        if state.on_demand.is_some() {
+            result.extend(crate::fontconfig_on_demand::family_names());
+        }
         result.sort_unstable();
         result.dedup();
         result
@@ -335,6 +367,52 @@ impl CosmicTextSystemState {
         Ok(())
     }
 
+    fn faces_in_family(&self, name: &str) -> SmallVec<[(cosmic_text::fontdb::ID, String); 4]> {
+        self.font_system
+            .db()
+            .faces()
+            .filter(|face| face.families.iter().any(|family| name == family.0))
+            .map(|face| (face.id, face.post_script_name.clone()))
+            .collect()
+    }
+
+    /// Reads the family's files through fontconfig; true when a new face entered the database.
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    fn load_on_demand_family(&mut self, family: &str) -> bool {
+        let Some(on_demand) = self.on_demand.as_mut() else {
+            return false;
+        };
+        let files = on_demand.new_family_files(family);
+        self.load_font_files(files)
+    }
+
+    /// Reads fontconfig's covering face for each character; true when a new face entered the database.
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    fn load_on_demand_fallbacks(&mut self, chars: impl IntoIterator<Item = char>) -> bool {
+        let Some(on_demand) = self.on_demand.as_mut() else {
+            return false;
+        };
+        let files = on_demand.new_covering_files(chars);
+        self.load_font_files(files)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    fn load_font_files(&mut self, files: Vec<std::path::PathBuf>) -> bool {
+        if files.is_empty() {
+            return false;
+        }
+        // db_mut also drops cosmic-text's match cache, so its fallback sees the new faces.
+        let db = self.font_system.db_mut();
+        let mut loaded = false;
+        for file in files {
+            match db.load_font_file(&file) {
+                std::result::Result::Ok(()) => loaded = true,
+                Err(error) => log::warn!("could not load font {}: {error}", file.display()),
+            }
+        }
+        loaded
+    }
+
     #[profiling::function]
     fn load_family(
         &mut self,
@@ -383,15 +461,14 @@ impl CosmicTextSystemState {
             _ => Arc::from(Vec::new()),
         };
 
-        let name = gpui::font_name_with_fallbacks(name, &self.system_font_fallback);
+        let name = gpui::font_name_with_fallbacks(name, &self.system_font_fallback).to_string();
 
-        let families = self
-            .font_system
-            .db()
-            .faces()
-            .filter(|face| face.families.iter().any(|family| *name == family.0))
-            .map(|face| (face.id, face.post_script_name.clone()))
-            .collect::<SmallVec<[_; 4]>>();
+        #[allow(unused_mut)]
+        let mut families = self.faces_in_family(&name);
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+        if families.is_empty() && self.load_on_demand_family(&name) {
+            families = self.faces_in_family(&name);
+        }
 
         let cosmic_features = cosmic_font_features(features)?;
 
@@ -775,6 +852,20 @@ impl CosmicTextSystemState {
                 len: text.len(),
             };
         };
+
+        // Each character is looked up once, so this re-layout happens at most once per new script.
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+        if self.on_demand.is_some() {
+            let uncovered: SmallVec<[char; 8]> = layout
+                .glyphs
+                .iter()
+                .filter(|glyph| glyph.glyph_id == 0)
+                .filter_map(|glyph| text.get(glyph.start..).and_then(|rest| rest.chars().next()))
+                .collect();
+            if !uncovered.is_empty() && self.load_on_demand_fallbacks(uncovered) {
+                return self.layout_line_no_separators(text, font_size, font_runs);
+            }
+        }
 
         let missing_glyphs = self.missing_glyph_sink.as_ref().map(|_| {
             self.missing_glyphs(
