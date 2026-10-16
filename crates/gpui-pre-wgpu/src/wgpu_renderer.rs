@@ -1480,7 +1480,10 @@ impl WgpuRendererCore {
         );
 
         self.atlas.before_frame();
-        self.ensure_intermediate_textures(size);
+        // A full-window intermediate plus its MSAA copy is ~70 MB at 1440p; only frames that draw paths need it.
+        if !scene.paths.is_empty() {
+            self.ensure_intermediate_textures(size);
+        }
 
         let gamma_params = GammaParams {
             gamma_ratios: self.rendering_params.gamma_ratios,
