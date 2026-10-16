@@ -1,0 +1,6 @@
+gpui-omarchy
+Copyright 2026 GM
+
+This product includes software developed by Zed Industries, Inc. (GPUI, Apache-2.0),
+imported from the gpui-pre 0.3.9 crates (zed-industries/zed@93d7456). Files changed
+after the initial import commit are modified by GM; see the git history for each change.
