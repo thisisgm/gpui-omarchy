@@ -34,24 +34,19 @@ zed-rev = "93d745668805029476e6d7fbb19652116fed51de"
 [features]
 bench-support = [
     "gpui/bench-support",
-    "gpui_macos/bench-support",
     "gpui_wgpu/bench-support",
 ]
 default = ["multithreaded"]
-font-kit = ["gpui_macos/font-kit"]
+font-kit = []
 inspector = ["gpui/inspector"]
-multithreaded = ["gpui_web/multithreaded"]
-runtime_shaders = ["gpui_macos/runtime_shaders"]
+multithreaded = []
+runtime_shaders = []
 screen-capture = [
     "gpui/screen-capture",
-    "gpui_macos/screen-capture",
-    "gpui_windows/screen-capture",
     "gpui_linux/screen-capture",
 ]
 test-support = [
     "gpui/test-support",
-    "gpui_macos/test-support",
-    "gpui_windows/test-support",
     "gpui_wgpu/test-support",
 ]
 wayland = ["gpui_linux/wayland"]
@@ -89,36 +84,12 @@ version = "=0.3.9"
 default-features = false
 package = "gpui-pre-linux"
 
-[target.'cfg(target_family = "wasm")'.dependencies.console_error_panic_hook]
-version = "0.1.7"
-
-[target.'cfg(target_family = "wasm")'.dependencies.gpui_web]
-version = "=0.3.9"
-default-features = false
-package = "gpui-pre-web"
-
 [target.'cfg(target_os = "linux")'.dependencies.gpui_wgpu]
 path = "../gpui-pre-wgpu"
 version = "=0.3.9"
 optional = true
 package = "gpui-pre-wgpu"
 
-[target.'cfg(target_os = "macos")'.dependencies.gpui_macos]
-version = "=0.3.9"
-default-features = false
-package = "gpui-pre-macos"
-
-[target.'cfg(target_os = "windows")'.dependencies.gpui]
-path = "../gpui-pre"
-version = "=0.3.9"
-features = ["windows-manifest"]
-default-features = false
-package = "gpui-pre"
-
-[target.'cfg(target_os = "windows")'.dependencies.gpui_windows]
-version = "=0.3.9"
-default-features = false
-package = "gpui-pre-windows"
 
 [lints.clippy]
 dbg_macro = "deny"

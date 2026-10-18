@@ -333,6 +333,7 @@ version = "4.7"
 version = "0.3"
 
 [dependencies.bench_metrics]
+path = "../gpui-pre-bench-metrics"
 version = "=0.3.9"
 optional = true
 package = "gpui-pre-bench-metrics"

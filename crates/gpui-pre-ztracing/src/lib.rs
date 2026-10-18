@@ -83,7 +83,7 @@ pub fn init() {
         }
     }
 
-    zlog::info!("Starting tracy subscriber, you can now connect the profiler");
+    tracing::info!("Starting tracy subscriber, you can now connect the profiler");
     tracing::subscriber::set_global_default(
         tracing_subscriber::registry()
             .with(tracing_tracy::TracyLayer::new(TracyLayerConfig::default())),
@@ -109,7 +109,7 @@ pub fn init(start_reporter: impl FnOnce(PerformanceReporter)) {
     {
         start_reporter(reporter);
     } else {
-        zlog::error!("failed to set browser performance tracing subscriber");
+        tracing::error!("failed to set browser performance tracing subscriber");
     }
 }
 

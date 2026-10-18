@@ -35,7 +35,6 @@ zed-rev = "93d745668805029476e6d7fbb19652116fed51de"
 tracing-tracy = [
     "dep:tracing-tracy",
     "dep:tracing-subscriber",
-    "dep:zlog",
 ]
 tracy = [
     "tracing-tracy",
@@ -47,7 +46,6 @@ web = [
     "dep:tracing-subscriber",
     "dep:wasm-bindgen",
     "dep:web-sys",
-    "dep:zlog",
 ]
 
 [lib]
@@ -62,10 +60,6 @@ version = "0.1.40"
 version = "0.3"
 optional = true
 
-[dependencies.zlog]
-version = "=0.3.9"
-optional = true
-package = "gpui-pre-zlog"
 
 [dependencies.ztracing_macro]
 path = "../gpui-pre-ztracing-macro"

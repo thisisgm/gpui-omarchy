@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/gpui-pre",
+    "crates/gpui-pre-bench-metrics",
     "crates/gpui-pre-collections",
     "crates/gpui-pre-derive-refineable",
     "crates/gpui-pre-http-client",
