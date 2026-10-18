@@ -691,7 +691,10 @@ mod pending_read_tests {
         assert!(!selection.complete_read(old, Ok(ClipboardItem::new_string("stale".into()))));
         assert!(selection.ready().is_none());
     }
-    fn completed(selection: &mut Selection<Offer>) -> ReadCompletion {
+    fn completed(
+        selection: &mut Selection<Offer>,
+        pool: &transfer::TransferPool,
+    ) -> ReadCompletion {
         use std::{io::Write, os::unix::net::UnixStream};
         let (reader, mut writer) = UnixStream::pair().unwrap();
         writer.write_all(b"queued payload").unwrap();
@@ -705,7 +708,7 @@ mod pending_read_tests {
             deadline: Instant::now() + TRANSFER_TIMEOUT,
             files: vec![("UTF8_STRING".into(), File::from(OwnedFd::from(reader)))],
             _offer: selection.offer.clone().unwrap(),
-            _permit: transfer::TransferPermit::acquire().unwrap(),
+            _permit: pool.acquire().unwrap(),
             slot,
         }
         .run()
@@ -713,11 +716,12 @@ mod pending_read_tests {
     }
     #[test]
     fn review_r2_wayland_replacements_release_queued_payloads_before_ui_runs() {
+        let pool = transfer::TransferPool::default();
         let mut selection: Selection<Offer> = Selection::default();
         let mut queued = Vec::new();
         for _ in 0..100 {
             selection.set_offer(Some(echo("UTF8_STRING".into())));
-            let result = completed(&mut selection);
+            let result = completed(&mut selection, &pool);
             assert!(result.slot.0.lock().unwrap().is_some());
             selection.set_offer(None);
             assert!(result.slot.0.lock().unwrap().is_none());
@@ -731,12 +735,13 @@ mod pending_read_tests {
     }
     #[test]
     fn review_r2_wayland_drag_leave_releases_completed_payload_before_ui_runs() {
+        let pool = transfer::TransferPool::default();
         let mut selection: Selection<Offer> = Selection::default();
         selection.set_offer(Some(echo("UTF8_STRING".into())));
         let mut drag = super::super::drag::DragState::default();
         drag.begin(1, 2, gpui::Point::default(), vec![]);
         selection.cancel = drag.cancel.clone();
-        let result = completed(&mut selection);
+        let result = completed(&mut selection, &pool);
         drag.pending = Some(result.slot.clone());
         assert!(drag.leave());
         assert!(result.slot.0.lock().unwrap().is_none());
@@ -746,9 +751,10 @@ mod pending_read_tests {
     }
     #[test]
     fn review_r2_wayland_publication_rechecks_deadline_and_retains_byte_admission() {
+        let pool = transfer::TransferPool::default();
         let mut selection: Selection<Offer> = Selection::default();
         selection.set_offer(Some(echo("UTF8_STRING".into())));
-        let mut result = completed(&mut selection);
+        let mut result = completed(&mut selection, &pool);
         // Isolate the accounting assertion from other tests using the process-wide budget.
         let used = Arc::new(AtomicUsize::new(0));
         {
@@ -778,17 +784,20 @@ mod pending_read_tests {
     }
     #[test]
     fn review_r2_wayland_completed_reads_retain_admission_until_publication() {
+        let pool = transfer::TransferPool::default();
         use std::{io::Write, os::unix::net::UnixStream};
         let mut selection: Selection<Offer> = Selection::default();
         let mut awaiting_publication = Vec::new();
         for index in 0..17 {
             selection.set_offer(Some(echo("UTF8_STRING".into())));
-            let permit = transfer::TransferPermit::acquire();
+            let permit = pool.acquire();
             if index == 16 {
                 assert!(
-                    permit.is_err(),
+                    matches!(permit, Err(ClipboardReadError::Unavailable)),
                     "17 completed payloads admitted while publication remains queued"
                 );
+                drop(awaiting_publication);
+                assert!(pool.acquire().is_ok());
                 return;
             }
             let (reader, mut writer) = UnixStream::pair().unwrap();

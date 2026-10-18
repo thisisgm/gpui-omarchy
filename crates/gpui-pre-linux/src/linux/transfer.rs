@@ -7,8 +7,8 @@ use std::{
     io::{Read, Write},
     os::fd::AsRawFd,
     sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
+        Arc, OnceLock,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -23,21 +23,30 @@ pub(crate) const PATH_LIMIT: usize = 100_000;
 pub(crate) const TRANSFER_TIMEOUT: Duration = Duration::from_secs(2);
 pub(crate) const TYPE_LIMIT: usize = 64;
 pub(crate) type Cancel = Arc<AtomicBool>;
-static TRANSFERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-pub(crate) struct TransferPermit;
-impl TransferPermit {
-    pub fn acquire() -> Result<Self, ClipboardReadError> {
-        TRANSFERS
+#[derive(Clone, Default)]
+pub(crate) struct TransferPool(Arc<AtomicUsize>);
+impl TransferPool {
+    pub fn acquire(&self) -> Result<TransferPermit, ClipboardReadError> {
+        self.0
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
                 (count < 16).then_some(count + 1)
             })
-            .map(|_| Self)
+            .map(|_| TransferPermit { pool: self.clone() })
             .map_err(|_| ClipboardReadError::Unavailable)
+    }
+}
+pub(crate) struct TransferPermit {
+    pool: TransferPool,
+}
+impl TransferPermit {
+    pub fn acquire() -> Result<Self, ClipboardReadError> {
+        static TRANSFERS: OnceLock<TransferPool> = OnceLock::new();
+        TRANSFERS.get_or_init(TransferPool::default).acquire()
     }
 }
 impl Drop for TransferPermit {
     fn drop(&mut self) {
-        TRANSFERS.fetch_sub(1, Ordering::Release);
+        self.pool.0.fetch_sub(1, Ordering::Release);
     }
 }
 
@@ -434,6 +443,41 @@ mod tests {
             File::from(OwnedFd::from(write)),
         )
     }
+    #[test]
+    fn independent_transfer_pools_saturate_concurrently_and_release_on_drop() {
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let threads: Vec<_> = (0..2)
+            .map(|_| {
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let pool = TransferPool::default();
+                    let permits = (0..16)
+                        .map(|_| pool.acquire())
+                        .collect::<Result<Vec<_>, _>>();
+                    barrier.wait();
+                    let mut permits = permits.unwrap();
+                    assert!(matches!(
+                        pool.acquire(),
+                        Err(ClipboardReadError::Unavailable)
+                    ));
+                    drop(permits.pop());
+                    permits.push(pool.acquire().unwrap());
+                    assert!(matches!(
+                        pool.acquire(),
+                        Err(ClipboardReadError::Unavailable)
+                    ));
+                    drop(permits);
+                    assert_eq!(pool.0.load(Ordering::Acquire), 0);
+                    let permits: Vec<_> = (0..16).map(|_| pool.acquire().unwrap()).collect();
+                    assert_eq!(permits.len(), 16);
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+    }
+
     #[test]
     fn source_that_stops_writing_hits_absolute_deadline() {
         let (file, _writer) = pipe();
