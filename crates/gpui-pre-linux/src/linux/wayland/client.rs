@@ -3086,11 +3086,7 @@ impl Dispatch<wl_data_device::WlDataDevice, ()> for WaylandClientStatePtr {
                         }
                         match result {
                             Ok(item) => {
-                                let Some(data) = item.mime_payload().cloned() else {
-                                    state.drag.clear();
-                                    return;
-                                };
-                                if !state.drag.complete(generation, data) {
+                                if !state.drag.complete(generation, item) {
                                     return;
                                 }
                             }
@@ -3682,14 +3678,7 @@ impl WaylandClientStatePtr {
         let dropped = state.drag.dropped;
         let modifiers = state.modifiers;
         let common = state.common.clone();
-        let paths = match crate::linux::transfer::paths(&data) {
-            Ok(paths) => paths,
-            Err(_) => {
-                drop(state);
-                client.borrow_mut().drag.clear();
-                return;
-            }
-        };
+        let paths = state.drag.paths.clone();
         drop(state);
         if !entered {
             let event = gpui::NativeDropEvent {

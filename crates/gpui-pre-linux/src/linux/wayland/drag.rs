@@ -1,5 +1,7 @@
 use crate::linux::transfer::{self, Cancel};
-use gpui::{MimePayload, NativeDragAction, Pixels, Point};
+use gpui::{
+    ClipboardEntry, ClipboardItem, ExternalPaths, MimePayload, NativeDragAction, Pixels, Point,
+};
 use std::{
     marker::PhantomData,
     sync::{Arc, atomic::Ordering},
@@ -14,6 +16,7 @@ pub(crate) struct DragState<Offer, Window> {
     pub dropped: bool,
     pub entered: bool,
     pub data: Option<MimePayload>,
+    pub paths: ExternalPaths,
     pub offered_types: Arc<[String]>,
     pub action: Option<NativeDragAction>,
     _window: PhantomData<Window>,
@@ -29,6 +32,7 @@ impl<Offer, Window> Default for DragState<Offer, Window> {
             dropped: false,
             entered: false,
             data: None,
+            paths: ExternalPaths::default(),
             offered_types: Arc::default(),
             action: None,
             _window: PhantomData,
@@ -42,6 +46,7 @@ impl<Offer, Window> DragState<Offer, Window> {
         self.offer = None;
         self.window = None;
         self.data = None;
+        self.paths = ExternalPaths::default();
         self.entered = false;
         self.dropped = false;
         self.action = None;
@@ -61,13 +66,27 @@ impl<Offer, Window> DragState<Offer, Window> {
         self.offered_types = types.into();
         self.generation
     }
-    pub fn complete(&mut self, generation: u64, data: MimePayload) -> bool {
+    pub fn complete(&mut self, generation: u64, item: ClipboardItem) -> bool {
         if generation != self.generation
             || self.offer.is_none()
             || self.cancel.load(Ordering::Acquire)
         {
             return false;
         }
+        let Some(data) = item.mime_payload().cloned() else {
+            return false;
+        };
+        self.paths = item
+            .entries
+            .into_iter()
+            .find_map(|entry| {
+                if let ClipboardEntry::ExternalPaths(paths) = entry {
+                    Some(paths)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_default();
         self.data = Some(data);
         true
     }
@@ -89,14 +108,14 @@ impl<Offer, Window> DragState<Offer, Window> {
 mod tests {
     use super::*;
     use gpui::{MimeRepresentation, SelectionIntent, px};
-    fn payload() -> MimePayload {
-        MimePayload::new(
+    fn payload() -> ClipboardItem {
+        ClipboardItem::new_mime(MimePayload::new(
             [MimeRepresentation::new(
                 "text/uri-list",
                 &b"file:///a\r\n"[..],
             )],
             SelectionIntent::Copy,
-        )
+        ))
     }
     #[test]
     fn fast_release_before_eof_survives_drop_and_leave() {
@@ -380,5 +399,36 @@ mod action_policy_tests {
         };
         assert!(accept_offer(&offer, 77, &[transfer::URI_LIST.to_owned()], false).is_some());
         assert!(!offer.move_.get());
+    }
+}
+
+#[cfg(test)]
+mod decoded_paths_tests {
+    use super::*;
+    #[test]
+    fn review_drag_uses_decoded_paths_without_reparsing_for_entry_or_drop() {
+        let payload = MimePayload::new(
+            [gpui::MimeRepresentation::new(
+                "text/uri-list",
+                &b"unparsed bytes"[..],
+            )],
+            gpui::SelectionIntent::Copy,
+        );
+        let paths = ExternalPaths(vec!["/already/decoded".into()].into());
+        let item = ClipboardItem {
+            entries: vec![
+                ClipboardEntry::Mime(payload),
+                ClipboardEntry::ExternalPaths(paths.clone()),
+            ],
+        };
+        let mut drag = DragState::default();
+        let generation = drag.begin(1, 2, Point::default(), vec![]);
+        assert!(drag.complete(generation, item));
+        assert_eq!(drag.paths, paths);
+        drag.drop_pending();
+        assert!(!drag.leave());
+        assert_eq!(drag.paths, paths);
+        drag.clear();
+        assert!(drag.paths.paths().is_empty());
     }
 }
