@@ -390,6 +390,24 @@ mod tests {
     }
 
     #[test]
+    fn keypad_keystrokes_match_existing_bindings() {
+        let bindings = [KeyBinding::new("1", ActionAlpha {}, None)];
+        let mut keymap = Keymap::default();
+        keymap.add_bindings(bindings);
+        let keypad_one = Keystroke {
+            is_keypad: true,
+            ..Keystroke::parse("1->1").unwrap()
+        };
+        assert!(!Keystroke::parse("1").unwrap().is_keypad);
+
+        let (result, pending) = keymap.bindings_for_input(&[keypad_one], &[]);
+
+        assert!(!pending);
+        assert_eq!(result.len(), 1);
+        assert!(result[0].action.partial_eq(&ActionAlpha {}));
+    }
+
+    #[test]
     fn test_depth_precedence() {
         let bindings = [
             KeyBinding::new("ctrl-a", ActionBeta {}, Some("pane")),

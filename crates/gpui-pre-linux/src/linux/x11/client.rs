@@ -3099,6 +3099,51 @@ mod tests {
     }
 
     #[test]
+    fn keypad_keys_carry_keypad_identity_without_changing_key() {
+        let keymap = test_keymap("us");
+        let server_state = xkbc::State::new(&keymap);
+        let keypad_one = keymap
+            .key_by_name("KP1")
+            .expect("test key should exist in the keymap");
+        let main_one = keymap
+            .key_by_name("AE01")
+            .expect("test key should exist in the keymap");
+        let keypad_enter = keymap
+            .key_by_name("KPEN")
+            .expect("test key should exist in the keymap");
+        let num_lock = xproto::KeyButMask::MOD2;
+        let num_lock_state = xkb_state_for_key_event(&server_state, num_lock);
+        let num_lock_modifiers = modifiers_from_state(num_lock);
+        let no_lock_state = xkb_state_for_key_event(&server_state, xproto::KeyButMask::default());
+        let no_lock_modifiers = modifiers_from_state(xproto::KeyButMask::default());
+
+        // NumLock on: KP_1 keeps key "1" and key_char "1", flagged as keypad.
+        let keystroke = keystroke_from_xkb(&num_lock_state, num_lock_modifiers, keypad_one);
+        assert_eq!(keystroke.key, "1");
+        assert_eq!(keystroke.key_char.as_deref(), Some("1"));
+        assert!(keystroke.is_keypad);
+        // The main-row 1 is never keypad, with or without NumLock.
+        for (state, modifiers) in [
+            (&num_lock_state, num_lock_modifiers),
+            (&no_lock_state, no_lock_modifiers),
+        ] {
+            let keystroke = keystroke_from_xkb(state, modifiers, main_one);
+            assert_eq!(keystroke.key, "1");
+            assert_eq!(keystroke.key_char.as_deref(), Some("1"));
+            assert!(!keystroke.is_keypad);
+        }
+        // NumLock off: the same key is KP_End, still keypad.
+        let keystroke = keystroke_from_xkb(&no_lock_state, no_lock_modifiers, keypad_one);
+        assert_eq!(keystroke.key, "end");
+        assert_eq!(keystroke.key_char, None);
+        assert!(keystroke.is_keypad);
+        // KP_Enter keeps the key name of Return.
+        let keystroke = keystroke_from_xkb(&no_lock_state, no_lock_modifiers, keypad_enter);
+        assert_eq!(keystroke.key, "enter");
+        assert!(keystroke.is_keypad);
+    }
+
+    #[test]
     fn key_event_state_preserves_non_locked_layout_components() {
         // US + Russian dual-layout keyboard.
         let keymap = test_keymap("us,ru");

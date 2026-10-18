@@ -2409,6 +2409,7 @@ impl Dispatch<zwp_text_input_v3::ZwpTextInputV3, ()> for WaylandClientStatePtr {
                                 modifiers: Modifiers::default(),
                                 key: commit_text.clone(),
                                 key_char: Some(commit_text),
+                                is_keypad: false,
                             },
                             is_held: false,
                             prefer_character_input: false,
@@ -3448,6 +3449,65 @@ mod tests {
             frame_callback_instant(0, 60_000, received_at),
             received_at - Duration::from_secs(60),
         );
+    }
+
+    #[test]
+    fn keypad_keys_carry_keypad_identity_without_changing_key() {
+        // A compositor sends a compiled keymap, so compile one and reload its text as the client does.
+        let names_context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
+        let compiled = xkb::Keymap::new_from_names(
+            &names_context,
+            "",
+            "pc105",
+            "us",
+            "",
+            None,
+            KEYMAP_COMPILE_NO_FLAGS,
+        )
+        .expect("test keymap should compile");
+        let context = new_xkb_context().expect("xkb context");
+        let keymap = xkb::Keymap::new_from_string(
+            &context,
+            compiled.get_as_string(XKB_KEYMAP_FORMAT_TEXT_V1),
+            XKB_KEYMAP_FORMAT_TEXT_V1,
+            KEYMAP_COMPILE_NO_FLAGS,
+        )
+        .expect("compositor keymap text should load");
+        let num_lock = 1 << keymap.mod_get_index(xkb::MOD_NAME_NUM);
+        // Linux evdev codes, as wl_keyboard.key sends them.
+        let (key_kp1, key_1, key_kpenter) = (79, 2, 96);
+        let mut num_lock_state = xkb::State::new(&keymap);
+        num_lock_state.update_mask(0, 0, num_lock, 0, 0, 0);
+        let no_lock_state = xkb::State::new(&keymap);
+        let keystroke_for = |state: &xkb::State, key: u32| {
+            keystroke_from_xkb(
+                state,
+                modifiers_from_xkb(state),
+                Keycode::from(key + MIN_KEYCODE),
+            )
+        };
+
+        // NumLock on: KP_1 keeps key "1" and key_char "1", flagged as keypad.
+        let keystroke = keystroke_for(&num_lock_state, key_kp1);
+        assert_eq!(keystroke.key, "1");
+        assert_eq!(keystroke.key_char.as_deref(), Some("1"));
+        assert!(keystroke.is_keypad);
+        // The main-row 1 is never keypad, with or without NumLock.
+        for state in [&num_lock_state, &no_lock_state] {
+            let keystroke = keystroke_for(state, key_1);
+            assert_eq!(keystroke.key, "1");
+            assert_eq!(keystroke.key_char.as_deref(), Some("1"));
+            assert!(!keystroke.is_keypad);
+        }
+        // NumLock off: the same key is KP_End, still keypad.
+        let keystroke = keystroke_for(&no_lock_state, key_kp1);
+        assert_eq!(keystroke.key, "end");
+        assert_eq!(keystroke.key_char, None);
+        assert!(keystroke.is_keypad);
+        // KP_Enter keeps the key name of Return.
+        let keystroke = keystroke_for(&no_lock_state, key_kpenter);
+        assert_eq!(keystroke.key, "enter");
+        assert!(keystroke.is_keypad);
     }
 
     #[derive(Default)]

@@ -1566,6 +1566,7 @@ pub(super) fn keystroke_from_xkb(
         modifiers,
         key,
         key_char,
+        is_keypad: key_sym.is_keypad_key(),
     }
 }
 

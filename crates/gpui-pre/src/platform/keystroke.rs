@@ -30,6 +30,10 @@ pub struct Keystroke {
     /// this binding was pressed.
     /// e.g. for s this is "s", for option-s "ß", and cmd-s None
     pub key_char: Option<String>,
+
+    /// Whether the key is on the numeric keypad; `key` and `key_char` stay those of the main keys.
+    #[serde(default)]
+    pub is_keypad: bool,
 }
 
 /// Represents a keystroke that can be used in keybindings and displayed to the user.
@@ -216,6 +220,7 @@ impl Keystroke {
             modifiers,
             key,
             key_char,
+            is_keypad: false,
         })
     }
 
