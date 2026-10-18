@@ -33,7 +33,7 @@ use wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1;
 
 use crate::linux::wayland::{
     display::WaylandDisplay,
-    presentation::{FrameFeedback, FrameFeedbackData, PresentedFrameCounter},
+    presentation::{FrameFeedback, FrameFeedbackData, WindowFrameCounter},
     serial::SerialKind,
 };
 use crate::linux::{Globals, Output, WaylandClientStatePtr, get_window};
@@ -139,7 +139,7 @@ pub struct WaylandWindowState {
     redraw_requested: bool,
     presentation: PresentationState,
     pending_frame_callback: Option<wl_callback::WlCallback>,
-    presented_frames: PresentedFrameCounter,
+    presented_frames: WindowFrameCounter,
     in_progress_configure: Option<InProgressConfigure>,
     resize_throttle: bool,
     in_progress_window_controls: Option<WindowControls>,
@@ -610,7 +610,7 @@ impl WaylandWindowState {
                 .set_max_size(max_texture_size, max_texture_size);
         }
 
-        let presented_frames = PresentedFrameCounter::new(globals.presentation.is_some());
+        let presented_frames = WindowFrameCounter::new(globals.presentation.is_some());
         Ok(Self {
             surface_state,
             parent,
@@ -649,6 +649,12 @@ impl WaylandWindowState {
             client_inset: None,
             accesskit_adapter: None,
         })
+    }
+
+    /// Commits without a present; feedback a failed present kept rides this commit as frame 0.
+    fn commit_surface(&mut self) {
+        self.surface.commit();
+        self.presented_frames.surface_committed();
     }
 
     pub fn is_transparent(&self) -> bool {
@@ -695,6 +701,51 @@ impl WaylandWindowState {
             WindowDecorations::Server => px(0.0),
             WindowDecorations::Client => self.client_inset.unwrap_or(px(0.0)),
         }
+    }
+}
+
+// Runs the frame-presented callback outside the borrow, so it may register other callbacks.
+fn run_frame_presented(callbacks: &RefCell<Callbacks>) {
+    let callback = callbacks.borrow_mut().frame_presented.take();
+    if let Some(mut frame_presented) = callback {
+        frame_presented();
+        callbacks.borrow_mut().frame_presented = Some(frame_presented);
+    }
+}
+
+#[cfg(test)]
+mod frame_presented_callback_tests {
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
+
+    use super::{Callbacks, run_frame_presented};
+
+    #[test]
+    fn frame_presented_observer_may_register_another_callback() {
+        let callbacks = Rc::new(RefCell::new(Callbacks::default()));
+        let runs = Rc::new(Cell::new(0));
+        callbacks.borrow_mut().frame_presented = Some(Box::new({
+            let callbacks = Rc::downgrade(&callbacks);
+            let runs = runs.clone();
+            move || {
+                runs.set(runs.get() + 1);
+                // As WaylandWindow::on_should_close does for an observer's on_window_should_close.
+                callbacks.upgrade().unwrap().borrow_mut().should_close = Some(Box::new(|| true));
+            }
+        }));
+
+        run_frame_presented(&callbacks);
+        run_frame_presented(&callbacks);
+
+        assert_eq!(runs.get(), 2);
+        let mut callbacks = callbacks.borrow_mut();
+        assert!(callbacks.frame_presented.is_some());
+        assert!(
+            callbacks
+                .should_close
+                .as_mut()
+                .is_some_and(|should_close| should_close())
+        );
     }
 }
 
@@ -989,7 +1040,7 @@ impl WaylandWindowStatePtr {
                     let callback = state.surface.frame(&state.globals.qh, state.surface.id());
                     state.pending_frame_callback = Some(callback);
                 }
-                state.surface.commit();
+                state.commit_surface();
                 self.frame_loop.set(FrameLoop::AwaitingCallback);
                 return;
             }
@@ -1029,10 +1080,8 @@ impl WaylandWindowStatePtr {
             .borrow_mut()
             .presented_frames
             .feedback(frame, feedback, clock_id);
-        if advanced
-            && let Some(frame_presented) = self.callbacks.borrow_mut().frame_presented.as_mut()
-        {
-            frame_presented();
+        if advanced {
+            run_frame_presented(&self.callbacks);
         }
     }
 
@@ -2066,19 +2115,18 @@ impl PlatformWindow for WaylandWindow {
         }
         // The present's commit carries this feedback; it counts only if the present succeeds.
         let frame_feedback = state.globals.presentation.as_ref().map(|presentation| {
-            presentation.feedback(
-                &state.surface,
-                &state.globals.qh,
-                FrameFeedbackData::new(state.surface.id()),
-            )
+            state.presented_frames.feedback_for_present(|| {
+                presentation.feedback(
+                    &state.surface,
+                    &state.globals.qh,
+                    FrameFeedbackData::new(state.surface.id()),
+                )
+            })
         });
         let presented = renderer.draw(scene);
-        state.presented_frames.finish_present(
-            presented,
-            frame_feedback
-                .as_ref()
-                .and_then(|feedback| feedback.data::<FrameFeedbackData>()),
-        );
+        state
+            .presented_frames
+            .finish_present(presented, frame_feedback);
         if presented {
             state.presentation = PresentationState::Presented;
             self.0.frame_loop.set(FrameLoop::AwaitingCallback);
@@ -2155,28 +2203,28 @@ impl PlatformWindow for WaylandWindow {
     }
 
     fn set_exclusive_zone(&self, zone: Pixels) {
-        let state = self.borrow();
+        let mut state = self.borrow_mut();
         if state
             .surface_state
             .set_exclusive_zone(f32::from(zone) as i32)
         {
             // Commit to apply it immediately, otherwise it only takes effect
             // on the next frame.
-            state.surface.commit();
+            state.commit_surface();
         }
     }
 
     fn set_exclusive_edge(&self, edge: Anchor) {
-        let state = self.borrow();
+        let mut state = self.borrow_mut();
         if state.surface_state.set_exclusive_edge(edge) {
             // Commit to apply it immediately, otherwise it only takes effect
             // on the next frame.
-            state.surface.commit();
+            state.commit_surface();
         }
     }
 
     fn set_input_region(&self, region: Option<&[Bounds<Pixels>]>) {
-        let state = self.borrow();
+        let mut state = self.borrow_mut();
         match region {
             // No region means the whole surface receives input.
             None => state.surface.set_input_region(None),
@@ -2204,7 +2252,7 @@ impl PlatformWindow for WaylandWindow {
         // Commit so the new input region applies immediately. Otherwise it
         // waits for the next frame, which could be the very click we want to
         // allow passing through.
-        state.surface.commit();
+        state.commit_surface();
     }
 
     fn window_decorations(&self) -> Decorations {

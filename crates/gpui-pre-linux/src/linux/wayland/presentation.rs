@@ -5,6 +5,8 @@ use std::time::Duration;
 
 use gpui::PresentedFrames;
 use wayland_backend::client::ObjectId;
+use wayland_client::Proxy;
+use wayland_protocols::wp::presentation_time::client::wp_presentation_feedback;
 
 /// One feedback object's surface and frame number, 0 until its present succeeds.
 pub(crate) struct FrameFeedbackData {
@@ -42,30 +44,58 @@ pub(crate) fn presentation_timestamp(tv_sec_hi: u32, tv_sec_lo: u32, tv_nsec: u3
     Duration::from_secs(seconds).saturating_add(Duration::from_nanos(u64::from(tv_nsec)))
 }
 
-/// A window's frame counts; frames are numbered when their present succeeds.
-#[derive(Debug)]
-pub(crate) struct PresentedFrameCounter {
-    supported: bool,
-    frames: PresentedFrames,
+/// A feedback object the counter numbers; the protocol object in a window.
+pub(crate) trait FeedbackObject {
+    fn feedback_data(&self) -> Option<&FrameFeedbackData>;
 }
 
-impl PresentedFrameCounter {
+impl FeedbackObject for wp_presentation_feedback::WpPresentationFeedback {
+    fn feedback_data(&self) -> Option<&FrameFeedbackData> {
+        self.data()
+    }
+}
+
+/// The counter a Wayland window keeps.
+pub(crate) type WindowFrameCounter =
+    PresentedFrameCounter<wp_presentation_feedback::WpPresentationFeedback>;
+
+/// A window's frame counts; frames are numbered when their present succeeds.
+pub(crate) struct PresentedFrameCounter<F> {
+    supported: bool,
+    frames: PresentedFrames,
+    // Feedback a failed present left uncommitted, so the next present reuses it.
+    uncommitted: Option<F>,
+}
+
+impl<F: FeedbackObject> PresentedFrameCounter<F> {
     pub(crate) fn new(supported: bool) -> Self {
         Self {
             supported,
             frames: PresentedFrames::default(),
+            uncommitted: None,
         }
     }
 
-    /// Records a present; only one that reached the compositor numbers a frame and its feedback.
-    pub(crate) fn finish_present(&mut self, succeeded: bool, feedback: Option<&FrameFeedbackData>) {
+    /// The feedback for the next present: the one a failed present kept, else a new `request`.
+    pub(crate) fn feedback_for_present(&mut self, request: impl FnOnce() -> F) -> F {
+        self.uncommitted.take().unwrap_or_else(request)
+    }
+
+    /// Records a present: success numbers a frame and its feedback, failure keeps the feedback.
+    pub(crate) fn finish_present(&mut self, succeeded: bool, feedback: Option<F>) {
         if !succeeded {
+            self.uncommitted = feedback;
             return;
         }
         self.frames.committed += 1;
-        if let Some(feedback) = feedback {
-            feedback.adopt(self.frames.committed);
+        if let Some(data) = feedback.as_ref().and_then(FeedbackObject::feedback_data) {
+            data.adopt(self.frames.committed);
         }
+    }
+
+    /// A commit without a present carried any kept feedback, which stays frame 0.
+    pub(crate) fn surface_committed(&mut self) {
+        self.uncommitted = None;
     }
 
     /// Applies feedback for `frame`, returning whether the presented frame advanced.
@@ -90,27 +120,44 @@ impl PresentedFrameCounter {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
     use super::*;
 
     const MONOTONIC: u32 = libc::CLOCK_MONOTONIC as u32;
+
+    impl FeedbackObject for Rc<FrameFeedbackData> {
+        fn feedback_data(&self) -> Option<&FrameFeedbackData> {
+            Some(self)
+        }
+    }
 
     fn at(millis: u64) -> FrameFeedback {
         FrameFeedback::Presented(Duration::from_millis(millis))
     }
 
-    // One draw: a feedback object for the commit, then the present's outcome.
-    fn draw(counter: &mut PresentedFrameCounter, succeeded: bool) -> FrameFeedbackData {
-        let feedback = FrameFeedbackData::new(ObjectId::null());
-        counter.finish_present(succeeded, Some(&feedback));
+    // One draw as the window does it: the feedback its commit carries, then the present's outcome.
+    fn draw(
+        counter: &mut PresentedFrameCounter<Rc<FrameFeedbackData>>,
+        requests: &Cell<usize>,
+        succeeded: bool,
+    ) -> Rc<FrameFeedbackData> {
+        let feedback = counter.feedback_for_present(|| {
+            requests.set(requests.get() + 1);
+            Rc::new(FrameFeedbackData::new(ObjectId::null()))
+        });
+        counter.finish_present(succeeded, Some(feedback.clone()));
         feedback
     }
 
     #[test]
     fn presented_feedback_advances_the_counter() {
         let mut counter = PresentedFrameCounter::new(true);
+        let requests = Cell::new(0);
         assert_eq!(counter.snapshot(), Some(PresentedFrames::default()));
 
-        let first = draw(&mut counter, true);
+        let first = draw(&mut counter, &requests, true);
         assert!(counter.feedback(first.frame(), at(16), MONOTONIC));
         assert_eq!(
             counter.snapshot(),
@@ -126,9 +173,10 @@ mod tests {
     #[test]
     fn discarded_feedback_does_not_advance() {
         let mut counter = PresentedFrameCounter::new(true);
-        let first = draw(&mut counter, true);
+        let requests = Cell::new(0);
+        let first = draw(&mut counter, &requests, true);
         assert!(counter.feedback(first.frame(), at(16), MONOTONIC));
-        let second = draw(&mut counter, true);
+        let second = draw(&mut counter, &requests, true);
 
         assert!(!counter.feedback(second.frame(), FrameFeedback::Discarded, MONOTONIC));
 
@@ -140,29 +188,59 @@ mod tests {
     #[test]
     fn feedback_of_a_failed_present_does_not_advance() {
         let mut counter = PresentedFrameCounter::new(true);
-        let first = draw(&mut counter, true);
+        let requests = Cell::new(0);
+        let first = draw(&mut counter, &requests, true);
         assert!(counter.feedback(first.frame(), at(16), MONOTONIC));
 
-        // A failed present numbers no frame, and a later bare commit may still carry its feedback.
-        let failed = draw(&mut counter, false);
+        // A failed present numbers no frame; a bare commit then carries its feedback as frame 0.
+        let failed = draw(&mut counter, &requests, false);
+        counter.surface_committed();
         assert_eq!(failed.frame(), 0);
         assert_eq!(counter.snapshot().unwrap().committed, 1);
         assert!(!counter.feedback(failed.frame(), at(33), MONOTONIC));
         assert_eq!(counter.snapshot().unwrap().presented, 1);
 
-        // The retry that succeeds is the next frame, and its own feedback counts it.
-        let retry = draw(&mut counter, true);
+        // The retry that succeeds is the next frame, and its own new feedback counts it.
+        let retry = draw(&mut counter, &requests, true);
+        assert!(!Rc::ptr_eq(&failed, &retry));
+        assert_eq!(failed.frame(), 0);
         assert!(counter.feedback(retry.frame(), at(50), MONOTONIC));
         let frames = counter.snapshot().unwrap();
         assert_eq!((frames.committed, frames.presented), (2, 2));
         assert_eq!(frames.presented_at, Some(Duration::from_millis(50)));
+        assert_eq!(requests.get(), 3);
+    }
+
+    #[test]
+    fn failed_presents_without_a_commit_reuse_one_feedback() {
+        let mut counter = PresentedFrameCounter::new(true);
+        let requests = Cell::new(0);
+
+        // Retries before the first present commit nothing, so one feedback waits for the commit.
+        let failed = draw(&mut counter, &requests, false);
+        for _ in 0..4 {
+            assert!(Rc::ptr_eq(&failed, &draw(&mut counter, &requests, false)));
+        }
+        let presented = draw(&mut counter, &requests, true);
+
+        assert!(Rc::ptr_eq(&failed, &presented));
+        assert_eq!(requests.get(), 1);
+        assert_eq!(presented.frame(), 1);
+        assert!(counter.feedback(presented.frame(), at(16), MONOTONIC));
+        assert_eq!(counter.snapshot().unwrap().presented, 1);
+
+        // A presented frame leaves nothing kept, so the next frame requests its own feedback.
+        let next = draw(&mut counter, &requests, true);
+        assert!(!Rc::ptr_eq(&presented, &next));
+        assert_eq!((requests.get(), next.frame()), (2, 2));
     }
 
     #[test]
     fn presented_frame_never_moves_back_or_past_the_commits() {
         let mut counter = PresentedFrameCounter::new(true);
-        let first = draw(&mut counter, true);
-        let second = draw(&mut counter, true);
+        let requests = Cell::new(0);
+        let first = draw(&mut counter, &requests, true);
+        let second = draw(&mut counter, &requests, true);
         assert!(counter.feedback(second.frame(), at(33), MONOTONIC));
 
         assert!(!counter.feedback(first.frame(), at(16), MONOTONIC));
@@ -176,7 +254,7 @@ mod tests {
 
     #[test]
     fn unsupported_compositor_reports_no_feedback() {
-        let mut counter = PresentedFrameCounter::new(false);
+        let mut counter = PresentedFrameCounter::<Rc<FrameFeedbackData>>::new(false);
         counter.finish_present(true, None);
 
         assert_eq!(counter.snapshot(), None);

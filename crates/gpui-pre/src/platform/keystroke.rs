@@ -32,6 +32,7 @@ pub struct Keystroke {
     pub key_char: Option<String>,
 
     /// Whether the key is on the numeric keypad; `key` and `key_char` stay those of the main keys.
+    /// `==` and `Hash` include it, so match a typed keystroke to bindings with `should_match`.
     #[serde(default)]
     pub is_keypad: bool,
 }
