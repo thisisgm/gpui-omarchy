@@ -96,11 +96,22 @@ fn wait(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn read(
+    file: File,
+    cancel: &Cancel,
+    deadline: Instant,
+    limit: usize,
+) -> Result<Vec<u8>, ClipboardReadError> {
+    read_reserved(file, cancel, deadline, limit, |_| Ok(()))
+}
+
+pub(crate) fn read_reserved(
     mut file: File,
     cancel: &Cancel,
     deadline: Instant,
     limit: usize,
+    mut reserve: impl FnMut(usize) -> Result<(), ClipboardReadError>,
 ) -> Result<Vec<u8>, ClipboardReadError> {
     nonblocking(&file)?;
     let mut bytes = Vec::new();
@@ -113,6 +124,7 @@ pub(crate) fn read(
                 if len > limit.saturating_sub(bytes.len()) {
                     return Err(ClipboardReadError::TooLarge);
                 }
+                reserve(len)?;
                 bytes.extend_from_slice(&chunk[..len]);
             }
             Err(error)

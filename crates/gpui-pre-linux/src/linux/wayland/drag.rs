@@ -13,6 +13,7 @@ pub(crate) struct DragState<Offer, Window> {
     pub position: Point<Pixels>,
     pub generation: u64,
     pub cancel: Cancel,
+    pub pending: Option<super::clipboard::ReadSlot>,
     pub dropped: bool,
     pub entered: bool,
     pub data: Option<MimePayload>,
@@ -29,6 +30,7 @@ impl<Offer, Window> Default for DragState<Offer, Window> {
             position: Point::default(),
             generation: 0,
             cancel: transfer::cancelled(),
+            pending: None,
             dropped: false,
             entered: false,
             data: None,
@@ -42,6 +44,9 @@ impl<Offer, Window> Default for DragState<Offer, Window> {
 impl<Offer, Window> DragState<Offer, Window> {
     pub fn clear(&mut self) {
         self.cancel.store(true, Ordering::Release);
+        if let Some(pending) = self.pending.take() {
+            pending.cancel();
+        }
         self.generation = self.generation.wrapping_add(1);
         self.offer = None;
         self.window = None;

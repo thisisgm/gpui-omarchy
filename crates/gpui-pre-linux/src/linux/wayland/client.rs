@@ -89,7 +89,9 @@ use crate::linux::{
     keystroke_from_xkb, keystroke_underlying_dead_key, modifiers_from_xkb, new_xkb_context,
     open_uri_internal, reveal_path_internal,
     wayland::{
-        clipboard::{Clipboard, DataOffer, DataSourceKind, ReadRequest, SourceData},
+        clipboard::{
+            Clipboard, DataOffer, DataSourceKind, ReadCompletion, ReadRequest, ReadSlot, SourceData,
+        },
         cursor::Cursor,
         serial::{Serial, SerialKind, SerialTracker},
         to_shape,
@@ -3057,6 +3059,8 @@ impl Dispatch<wl_data_device::WlDataDevice, ()> for WaylandClientStatePtr {
                 if offer.inner.version() < 3 {
                     state.drag.action = Some(gpui::NativeDragAction::Copy);
                 }
+                let slot = ReadSlot::default();
+                state.drag.pending = Some(slot.clone());
                 let request = ReadRequest {
                     generation,
                     cancel: state.drag.cancel.clone(),
@@ -3064,6 +3068,7 @@ impl Dispatch<wl_data_device::WlDataDevice, ()> for WaylandClientStatePtr {
                     files,
                     _offer: offer,
                     _permit: permit,
+                    slot,
                 };
                 let task = state
                     .common
@@ -3084,17 +3089,16 @@ impl Dispatch<wl_data_device::WlDataDevice, ()> for WaylandClientStatePtr {
                         if state.drag.generation != generation {
                             return;
                         }
-                        match result {
-                            Ok(item) => {
-                                if !state.drag.complete(generation, item) {
-                                    return;
-                                }
-                            }
+                        let accepted = ReadCompletion::publish(result, |result| match result {
+                            Ok(item) => state.drag.complete(generation, item),
                             Err(error) => {
                                 log::debug!("native drop receive: {error}");
                                 state.drag.clear();
-                                return;
+                                false
                             }
+                        });
+                        if !accepted {
+                            return;
                         }
                         drop(state);
                         this.dispatch_native_drop();
@@ -3637,23 +3641,25 @@ impl WaylandClientStatePtr {
                     return;
                 };
                 let mut state = client.borrow_mut();
-                let error = result.as_ref().err().cloned();
-                let current = if primary {
-                    state.clipboard.primary.complete_read(generation, result)
-                } else {
-                    state.clipboard.selection.complete_read(generation, result)
-                };
-                if current && let Some(error) = error {
-                    crate::linux::transfer::notify_clipboard(
-                        &state.common,
-                        gpui::ClipboardChange {
-                            primary,
-                            generation,
-                            owned: false,
-                            error: Some(error),
-                        },
-                    );
-                }
+                ReadCompletion::publish(result, |result| {
+                    let error = result.as_ref().err().cloned();
+                    let current = if primary {
+                        state.clipboard.primary.complete_read(generation, result)
+                    } else {
+                        state.clipboard.selection.complete_read(generation, result)
+                    };
+                    if current && let Some(error) = error {
+                        crate::linux::transfer::notify_clipboard(
+                            &state.common,
+                            gpui::ClipboardChange {
+                                primary,
+                                generation,
+                                owned: false,
+                                error: Some(error),
+                            },
+                        );
+                    }
+                });
             })
             .detach();
     }

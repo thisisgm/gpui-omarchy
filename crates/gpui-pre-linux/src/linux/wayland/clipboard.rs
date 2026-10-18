@@ -4,7 +4,10 @@ use gpui::{ClipboardItem, ClipboardReadError, MimePayload, MimeRepresentation};
 use std::{
     fs::File,
     os::fd::{AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd},
-    sync::{Arc, atomic::Ordering},
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::Instant,
 };
 use wayland_client::{Connection, protocol::wl_data_offer::WlDataOffer};
@@ -69,6 +72,79 @@ impl<T: ReceiveData> DataOffer<T> {
     }
 }
 
+// Raw representations share one byte budget, including decoded results waiting for the UI.
+// Decode is bounded by the same input limit and the existing path count limit.
+#[derive(Default)]
+struct BytePermit {
+    used: Arc<AtomicUsize>,
+    bytes: usize,
+}
+impl BytePermit {
+    fn acquire() -> Self {
+        static USED: OnceLock<Arc<AtomicUsize>> = OnceLock::new();
+        Self {
+            used: USED.get_or_init(Default::default).clone(),
+            bytes: 0,
+        }
+    }
+    fn reserve(&mut self, bytes: usize) -> Result<(), ClipboardReadError> {
+        self.used
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                used.checked_add(bytes).filter(|total| *total <= BYTE_LIMIT)
+            })
+            .map_err(|_| ClipboardReadError::TooLarge)?;
+        self.bytes += bytes;
+        Ok(())
+    }
+}
+impl Drop for BytePermit {
+    fn drop(&mut self) {
+        self.used.fetch_sub(self.bytes, Ordering::Release);
+    }
+}
+struct ReadOutput {
+    item: ClipboardItem,
+    permit: transfer::TransferPermit,
+    bytes: BytePermit,
+}
+#[derive(Clone, Default)]
+pub(crate) struct ReadSlot(Arc<Mutex<Option<ReadOutput>>>);
+impl ReadSlot {
+    pub fn cancel(&self) {
+        self.0.lock().unwrap().take();
+    }
+}
+pub(crate) struct ReadCompletion {
+    slot: ReadSlot,
+    cancel: Cancel,
+    deadline: Instant,
+}
+impl ReadCompletion {
+    // Keep admission and bytes alive until the foreground publishes or rejects the item.
+    pub fn publish<R>(
+        result: Result<Self, ClipboardReadError>,
+        publish: impl FnOnce(Result<ClipboardItem, ClipboardReadError>) -> R,
+    ) -> R {
+        let completion = match result {
+            Ok(completion) => completion,
+            Err(error) => return publish(Err(error)),
+        };
+        let output = completion.slot.0.lock().unwrap().take();
+        let Some(output) = output else {
+            return publish(Err(ClipboardReadError::Cancelled));
+        };
+        let ReadOutput {
+            item,
+            permit,
+            bytes,
+        } = output;
+        let result = transfer::check(&completion.cancel, completion.deadline).map(|_| item);
+        let published = publish(result);
+        drop((permit, bytes));
+        published
+    }
+}
+
 pub(crate) struct ReadRequest<T: ReceiveData> {
     pub generation: u64,
     pub cancel: Cancel,
@@ -76,18 +152,36 @@ pub(crate) struct ReadRequest<T: ReceiveData> {
     pub files: Vec<(String, File)>,
     pub _offer: DataOffer<T>,
     pub _permit: transfer::TransferPermit,
+    pub slot: ReadSlot,
 }
 impl<T: ReceiveData> ReadRequest<T> {
-    pub fn run(self) -> Result<ClipboardItem, ClipboardReadError> {
+    pub fn run(self) -> Result<ReadCompletion, ClipboardReadError> {
+        let mut bytes = BytePermit::acquire();
         let mut representations = Vec::new();
         let mut left = BYTE_LIMIT;
         for (mime, file) in self.files {
-            let bytes = transfer::read(file, &self.cancel, self.deadline, left)?;
-            left -= bytes.len();
-            representations.push(MimeRepresentation::new(mime, bytes));
+            let data = transfer::read_reserved(file, &self.cancel, self.deadline, left, |len| {
+                bytes.reserve(len)
+            })?;
+            left -= data.len();
+            representations.push(MimeRepresentation::new(mime, data));
         }
         transfer::check(&self.cancel, self.deadline)?;
-        transfer::decode_offered(representations, self._offer.mime_types)
+        let item = transfer::decode_offered(representations, self._offer.mime_types)?;
+        {
+            let mut output = self.slot.0.lock().unwrap();
+            transfer::check(&self.cancel, self.deadline)?;
+            *output = Some(ReadOutput {
+                item,
+                permit: self._permit,
+                bytes,
+            });
+        }
+        Ok(ReadCompletion {
+            slot: self.slot,
+            cancel: self.cancel,
+            deadline: self.deadline,
+        })
     }
 }
 
@@ -102,6 +196,7 @@ pub(crate) struct Selection<T: ReceiveData> {
     latest_source: Option<(u64, ClipboardItem)>,
     last_source: u64,
     pub receiving: bool,
+    pending: Option<ReadSlot>,
     waiters:
         Vec<futures::channel::oneshot::Sender<Result<Option<ClipboardItem>, ClipboardReadError>>>,
 }
@@ -118,6 +213,7 @@ impl<T: ReceiveData> Default for Selection<T> {
             latest_source: None,
             last_source: 0,
             receiving: false,
+            pending: None,
             waiters: Vec::new(),
         }
     }
@@ -129,6 +225,9 @@ impl<T: ReceiveData> Selection<T> {
             let _ = waiter.send(Err(ClipboardReadError::Cancelled));
         }
         self.cancel.store(true, Ordering::Release);
+        if let Some(pending) = self.pending.take() {
+            pending.cancel();
+        }
         self.cancel = transfer::cancelled();
         self.generation = self.generation.wrapping_add(1);
         self.cached = None;
@@ -242,6 +341,8 @@ impl<T: ReceiveData> Selection<T> {
             .collect::<Result<Vec<_>, _>>()?;
         connection.flush().map_err(transfer::transport)?;
         self.receiving = true;
+        let slot = ReadSlot::default();
+        self.pending = Some(slot.clone());
         Ok(Some(ReadRequest {
             generation: self.generation,
             cancel: self.cancel.clone(),
@@ -249,6 +350,7 @@ impl<T: ReceiveData> Selection<T> {
             files,
             _offer: offer,
             _permit: permit,
+            slot,
         }))
     }
 }
@@ -588,5 +690,122 @@ mod pending_read_tests {
         );
         assert!(!selection.complete_read(old, Ok(ClipboardItem::new_string("stale".into()))));
         assert!(selection.ready().is_none());
+    }
+    fn completed(selection: &mut Selection<Offer>) -> ReadCompletion {
+        use std::{io::Write, os::unix::net::UnixStream};
+        let (reader, mut writer) = UnixStream::pair().unwrap();
+        writer.write_all(b"queued payload").unwrap();
+        drop(writer);
+        let slot = ReadSlot::default();
+        selection.pending = Some(slot.clone());
+        selection.receiving = true;
+        ReadRequest {
+            generation: selection.generation,
+            cancel: selection.cancel.clone(),
+            deadline: Instant::now() + TRANSFER_TIMEOUT,
+            files: vec![("UTF8_STRING".into(), File::from(OwnedFd::from(reader)))],
+            _offer: selection.offer.clone().unwrap(),
+            _permit: transfer::TransferPermit::acquire().unwrap(),
+            slot,
+        }
+        .run()
+        .unwrap()
+    }
+    #[test]
+    fn review_r2_wayland_replacements_release_queued_payloads_before_ui_runs() {
+        let mut selection: Selection<Offer> = Selection::default();
+        let mut queued = Vec::new();
+        for _ in 0..100 {
+            selection.set_offer(Some(echo("UTF8_STRING".into())));
+            let result = completed(&mut selection);
+            assert!(result.slot.0.lock().unwrap().is_some());
+            selection.set_offer(None);
+            assert!(result.slot.0.lock().unwrap().is_none());
+            queued.push(result);
+        }
+        for result in queued {
+            ReadCompletion::publish(Ok(result), |result| {
+                assert_eq!(result, Err(ClipboardReadError::Cancelled))
+            });
+        }
+    }
+    #[test]
+    fn review_r2_wayland_drag_leave_releases_completed_payload_before_ui_runs() {
+        let mut selection: Selection<Offer> = Selection::default();
+        selection.set_offer(Some(echo("UTF8_STRING".into())));
+        let mut drag = super::super::drag::DragState::default();
+        drag.begin(1, 2, gpui::Point::default(), vec![]);
+        selection.cancel = drag.cancel.clone();
+        let result = completed(&mut selection);
+        drag.pending = Some(result.slot.clone());
+        assert!(drag.leave());
+        assert!(result.slot.0.lock().unwrap().is_none());
+        ReadCompletion::publish(Ok(result), |result| {
+            assert_eq!(result, Err(ClipboardReadError::Cancelled))
+        });
+    }
+    #[test]
+    fn review_r2_wayland_publication_rechecks_deadline_and_retains_byte_admission() {
+        let mut selection: Selection<Offer> = Selection::default();
+        selection.set_offer(Some(echo("UTF8_STRING".into())));
+        let mut result = completed(&mut selection);
+        // Isolate the accounting assertion from other tests using the process-wide budget.
+        let used = Arc::new(AtomicUsize::new(0));
+        {
+            let mut output = result.slot.0.lock().unwrap();
+            let bytes = &mut output.as_mut().unwrap().bytes;
+            *bytes = BytePermit {
+                used: used.clone(),
+                bytes: 0,
+            };
+            bytes.reserve(100).unwrap();
+        }
+        result.deadline = Instant::now();
+        ReadCompletion::publish(Ok(result), |result| {
+            assert_eq!(result, Err(ClipboardReadError::TimedOut));
+            assert_eq!(used.load(Ordering::Acquire), 100);
+        });
+        assert_eq!(used.load(Ordering::Acquire), 0);
+        let mut first = BytePermit::default();
+        first.reserve(BYTE_LIMIT).unwrap();
+        let mut next = BytePermit {
+            used: first.used.clone(),
+            bytes: 0,
+        };
+        assert_eq!(next.reserve(1), Err(ClipboardReadError::TooLarge));
+        drop(first);
+        next.reserve(1).unwrap();
+    }
+    #[test]
+    fn review_r2_wayland_completed_reads_retain_admission_until_publication() {
+        use std::{io::Write, os::unix::net::UnixStream};
+        let mut selection: Selection<Offer> = Selection::default();
+        let mut awaiting_publication = Vec::new();
+        for index in 0..17 {
+            selection.set_offer(Some(echo("UTF8_STRING".into())));
+            let permit = transfer::TransferPermit::acquire();
+            if index == 16 {
+                assert!(
+                    permit.is_err(),
+                    "17 completed payloads admitted while publication remains queued"
+                );
+                return;
+            }
+            let (reader, mut writer) = UnixStream::pair().unwrap();
+            writer
+                .write_all(format!("foreign payload {index}").as_bytes())
+                .unwrap();
+            drop(writer);
+            let request = ReadRequest {
+                generation: selection.generation,
+                cancel: selection.cancel.clone(),
+                deadline: Instant::now() + TRANSFER_TIMEOUT,
+                files: vec![("UTF8_STRING".into(), File::from(OwnedFd::from(reader)))],
+                _offer: selection.offer.clone().unwrap(),
+                _permit: permit.unwrap(),
+                slot: ReadSlot::default(),
+            };
+            awaiting_publication.push(request.run().unwrap());
+        }
     }
 }
