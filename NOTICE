@@ -1,6 +1,15 @@
 gpui-omarchy
 Copyright 2026 GM
 
-This product includes software developed by Zed Industries, Inc. (GPUI, Apache-2.0),
-imported from the gpui-pre 0.3.9 crates (zed-industries/zed@93d7456). Files changed
-after the initial import commit are modified by GM; see the git history for each change.
+This product includes GPUI software developed by Zed Industries, Inc.
+Copyright 2022 - 2025 Zed Industries, Inc.
+Licensed under the Apache License, Version 2.0; see LICENSE-APACHE.
+
+The source was imported from the gpui-pre 0.3.9 crates, a snapshot of
+zed-industries/zed@93d745668805029476e6d7fbb19652116fed51de.
+
+GM modified this distribution to prefer Vulkan with an OpenGL fallback,
+allocate path textures lazily, load fontconfig fonts on demand, support
+opt-in fixed-size uniform lists, and resolve sibling crates from this fork.
+Additional changes provide dependency locking, layout tests, patch records,
+and CI checks. See OMARCHY-PATCHES.md and the git history for attribution.
