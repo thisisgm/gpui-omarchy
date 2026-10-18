@@ -573,6 +573,15 @@ pub trait Platform: 'static {
     fn read_from_clipboard(&self) -> Option<ClipboardItem>;
     fn write_to_clipboard(&self, item: ClipboardItem);
 
+    /// Observes selection replacement, clear and asynchronous receive errors.
+    fn on_clipboard_change(&self, _callback: Box<dyn FnMut(crate::ClipboardChange)>) {}
+
+    /// Installs native MIME drop policy. False rejects an unsuitable destination.
+    fn on_native_drop(&self, _callback: Box<dyn FnMut(crate::NativeDropEvent) -> bool>) {}
+
+    /// Observes action negotiation, completion and cancellation for an outbound drag.
+    fn on_native_drag(&self, _callback: Box<dyn FnMut(crate::NativeDragEvent)>) {}
+
     /// Reads the clipboard, resolving once its contents are available.
     ///
     /// Most platforms read synchronously and return a ready task. Platforms
@@ -3019,11 +3028,23 @@ pub enum ClipboardReadError {
     /// The clipboard contents could not be converted into a
     /// [`ClipboardItem`].
     UnsupportedContent,
+    /// The source exceeded the transfer deadline.
+    TimedOut,
+    /// The payload exceeded the configured byte ceiling.
+    TooLarge,
+    /// The selection changed before the transfer completed.
+    Cancelled,
+    /// A native transport failed.
+    Transport(String),
 }
 
 impl std::fmt::Display for ClipboardReadError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::TimedOut => formatter.write_str("clipboard transfer timed out"),
+            Self::TooLarge => formatter.write_str("clipboard transfer exceeded its byte ceiling"),
+            Self::Cancelled => formatter.write_str("clipboard selection changed"),
+            Self::Transport(message) => formatter.write_str(message),
             Self::Unavailable => formatter.write_str("the clipboard is unavailable"),
             Self::Denied(message) => {
                 write!(formatter, "clipboard access was denied: {message}")
@@ -3044,11 +3065,23 @@ pub enum ClipboardEntry {
     String(ClipboardString),
     /// An image entry
     Image(Image),
+    /// MIME representations supplied without decoding application-specific bytes.
+    Mime(crate::MimePayload),
     /// A file entry
     ExternalPaths(crate::ExternalPaths),
 }
 
 impl ClipboardItem {
+    /// Creates a clipboard item from immutable MIME representations.
+    pub fn new_mime(payload: crate::MimePayload) -> Self {
+        Self { entries: vec![ClipboardEntry::Mime(payload)] }
+    }
+
+    /// Returns the first MIME payload, when present.
+    pub fn mime_payload(&self) -> Option<&crate::MimePayload> {
+        self.entries.iter().find_map(|entry| match entry { ClipboardEntry::Mime(payload) => Some(payload), _ => None })
+    }
+
     /// Create a new ClipboardItem::String with no associated metadata
     pub fn new_string(text: String) -> Self {
         Self {

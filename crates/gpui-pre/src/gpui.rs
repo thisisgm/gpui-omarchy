@@ -31,6 +31,8 @@ mod inspector;
 mod interactive;
 mod key_dispatch;
 mod keymap;
+mod mime;
+pub use mime::*;
 mod path_builder;
 mod platform;
 pub mod prelude;

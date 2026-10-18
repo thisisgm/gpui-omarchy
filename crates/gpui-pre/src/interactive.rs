@@ -706,6 +706,8 @@ impl ExternalPaths {
 pub enum ExternalDragPayload {
     /// Real on-disk paths, handed to the platform as an outbound file drag.
     Files(FileDragPaths),
+    /// Immutable MIME bytes and native action policy supplied at lift.
+    Mime(crate::NativeDragPayload),
 }
 
 /// Paths handed to the platform for a native file drag. Directory metadata is

@@ -1747,6 +1747,21 @@ impl App {
     }
 
     /// Writes data to the platform clipboard.
+    /// Observes native selection changes and receive errors.
+    pub fn on_clipboard_change(&self, callback: impl FnMut(crate::ClipboardChange) + 'static) {
+        self.platform.on_clipboard_change(Box::new(callback));
+    }
+
+    /// Installs MIME-aware destination policy; return false to reject the drop.
+    pub fn on_native_drop(&self, callback: impl FnMut(crate::NativeDropEvent) -> bool + 'static) {
+        self.platform.on_native_drop(Box::new(callback));
+    }
+
+    /// Observes native source completion without performing file operations.
+    pub fn on_native_drag(&self, callback: impl FnMut(crate::NativeDragEvent) + 'static) {
+        self.platform.on_native_drag(Box::new(callback));
+    }
+
     pub fn write_to_clipboard(&self, item: ClipboardItem) {
         self.platform.write_to_clipboard(item)
     }
