@@ -58,6 +58,7 @@ version = "1.8"
 version = "0.1.40"
 
 [dependencies.ztracing]
+path = "../gpui-pre-ztracing"
 version = "=0.3.9"
 package = "gpui-pre-ztracing"
 

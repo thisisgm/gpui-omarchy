@@ -60,6 +60,7 @@ version = "1.0.86"
 version = "1"
 
 [dependencies.collections]
+path = "../gpui-pre-collections"
 version = "=0.3.9"
 package = "gpui-pre-collections"
 
@@ -76,11 +77,13 @@ default-features = false
 package = "zed-font-kit"
 
 [dependencies.gpui]
+path = "../gpui-pre"
 version = "=0.3.9"
 default-features = false
 package = "gpui-pre"
 
 [dependencies.gpui_util]
+path = "../gpui-pre-util"
 version = "=0.3.9"
 package = "gpui-pre-util"
 

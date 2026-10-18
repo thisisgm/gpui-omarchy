@@ -294,6 +294,7 @@ features = [
 default-features = true
 
 [dependencies.collections]
+path = "../gpui-pre-collections"
 version = "=0.3.9"
 package = "gpui-pre-collections"
 
@@ -329,14 +330,17 @@ version = "7.7.1"
 optional = true
 
 [dependencies.gpui_macros]
+path = "../gpui-pre-macros"
 version = "=0.3.9"
 package = "gpui-pre-macros"
 
 [dependencies.gpui_shared_string]
+path = "../gpui-pre-shared-string"
 version = "=0.3.9"
 package = "gpui-pre-shared-string"
 
 [dependencies.gpui_util]
+path = "../gpui-pre-util"
 version = "=0.3.9"
 package = "gpui-pre-util"
 
@@ -349,6 +353,7 @@ default-features = false
 version = "0.9.2"
 
 [dependencies.http_client]
+path = "../gpui-pre-http-client"
 version = "=0.3.9"
 package = "gpui-pre-http-client"
 
@@ -429,6 +434,7 @@ default-features = false
 version = "0.6"
 
 [dependencies.refineable]
+path = "../gpui-pre-refineable"
 version = "=0.3.9"
 package = "gpui-pre-refineable"
 
@@ -451,6 +457,7 @@ features = [
 default-features = false
 
 [dependencies.scheduler]
+path = "../gpui-pre-scheduler"
 version = "=0.3.9"
 package = "gpui-pre-scheduler"
 
@@ -508,6 +515,7 @@ version = "0.28"
 features = ["derive"]
 
 [dependencies.sum_tree]
+path = "../gpui-pre-sum-tree"
 version = "=0.3.9"
 package = "gpui-pre-sum-tree"
 

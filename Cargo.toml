@@ -17,21 +17,3 @@ members = [
     "crates/gpui-pre-ztracing",
     "crates/gpui-pre-ztracing-macro",
 ]
-
-# Every crate resolves to this tree, so a patch anywhere is seen by its siblings.
-[patch.crates-io]
-gpui-pre = { path = "crates/gpui-pre" }
-gpui-pre-collections = { path = "crates/gpui-pre-collections" }
-gpui-pre-derive-refineable = { path = "crates/gpui-pre-derive-refineable" }
-gpui-pre-http-client = { path = "crates/gpui-pre-http-client" }
-gpui-pre-linux = { path = "crates/gpui-pre-linux" }
-gpui-pre-macros = { path = "crates/gpui-pre-macros" }
-gpui-pre-platform = { path = "crates/gpui-pre-platform" }
-gpui-pre-refineable = { path = "crates/gpui-pre-refineable" }
-gpui-pre-scheduler = { path = "crates/gpui-pre-scheduler" }
-gpui-pre-shared-string = { path = "crates/gpui-pre-shared-string" }
-gpui-pre-sum-tree = { path = "crates/gpui-pre-sum-tree" }
-gpui-pre-util = { path = "crates/gpui-pre-util" }
-gpui-pre-wgpu = { path = "crates/gpui-pre-wgpu" }
-gpui-pre-ztracing = { path = "crates/gpui-pre-ztracing" }
-gpui-pre-ztracing-macro = { path = "crates/gpui-pre-ztracing-macro" }

@@ -117,6 +117,7 @@ version = "0.4.1"
 optional = true
 
 [target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies.collections]
+path = "../gpui-pre-collections"
 version = "=0.3.9"
 package = "gpui-pre-collections"
 
@@ -128,21 +129,25 @@ optional = true
 version = "0.3.34"
 
 [target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies.gpui]
+path = "../gpui-pre"
 version = "=0.3.9"
 default-features = false
 package = "gpui-pre"
 
 [target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies.gpui_util]
+path = "../gpui-pre-util"
 version = "=0.3.9"
 package = "gpui-pre-util"
 
 [target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies.gpui_wgpu]
+path = "../gpui-pre-wgpu"
 version = "=0.3.9"
 features = ["font-kit"]
 optional = true
 package = "gpui-pre-wgpu"
 
 [target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies.http_client]
+path = "../gpui-pre-http-client"
 version = "=0.3.9"
 package = "gpui-pre-http-client"
 
