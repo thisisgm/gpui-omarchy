@@ -82,8 +82,8 @@ raw-window-handle = { workspace = true }
 regex = { workspace = true, default-features = true }
 refineable = { workspace = true }
 scheduler = { workspace = true }
-resvg = { workspace = true }
-usvg = { workspace = true }
+resvg = { version = "=0.48.1", default-features = false, features = ["text", "system-fonts", "memmap-fonts", "raster-images"] }
+usvg = { version = "=0.48.1", default-features = false }
 ttf-parser = "0.25"
 schemars = { workspace = true, features = ["derive"] }
 seahash = "4.1"

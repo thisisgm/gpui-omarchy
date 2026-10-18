@@ -503,7 +503,7 @@ features = [
 default-features = true
 
 [dependencies.resvg]
-version = "0.46.0"
+version = "=0.48.1"
 features = [
     "text",
     "system-fonts",
@@ -598,7 +598,7 @@ version = "0.25"
 version = "2.2"
 
 [dependencies.usvg]
-version = "0.46.0"
+version = "=0.48.1"
 default-features = false
 
 [dependencies.uuid]
