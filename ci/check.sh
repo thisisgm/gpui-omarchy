@@ -35,6 +35,7 @@ run_gate cargo test --locked -p gpui-pre --features test-support --test uniform_
 run_gate cargo test --workspace --locked --features "$ci_features"
 
 if command -v cargo-deny >/dev/null 2>&1; then
+    printf 'LICENSE BASELINE: 25 exact-version inherited entries; see ci/LICENSE-BASELINE.md.\n'
     run_gate cargo deny check licenses
 else
     printf 'SKIP: cargo-deny is not installed; license check did not run.\n'
