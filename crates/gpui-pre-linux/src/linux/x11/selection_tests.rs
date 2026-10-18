@@ -128,6 +128,9 @@ fn clipboard() -> Clipboard<FakeWire> {
         handover_sent: false,
         handover_checked: false,
         initialized: true,
+        initial_owners: [false, false],
+        init_deadline: Instant::now() + TRANSFER_TIMEOUT,
+        failed: false,
         queued_events: VecDeque::new(),
         queued_sets: [None, None],
         clear_pending: None,
@@ -921,4 +924,43 @@ fn review_x11_byte_budget_is_aggregate_and_held_through_publish() {
     drop(decoded);
     assert_eq!(budget.0.lock().unwrap().bytes, 0);
     assert_eq!(budget.0.lock().unwrap().transfers, 0);
+}
+
+#[test]
+fn review_x11_startup_prefetches_both_existing_foreign_owners() {
+    let mut clipboard = clipboard();
+    clipboard.wire.owner.set(88);
+    clipboard.initial_owners = [true, true];
+    clipboard.tick();
+    for index in 0..2 {
+        assert_eq!(clipboard.selections[index].owner, 88);
+        assert!(clipboard.selections[index].pending.is_some());
+        assert!(clipboard.selections[index].requested.is_some());
+    }
+    assert_eq!(clipboard.wire.conversions.borrow().len(), 2);
+}
+#[test]
+fn review_x11_uncached_sync_read_starts_acquisition_once() {
+    let mut clipboard = clipboard();
+    clipboard.replaced(true, 88);
+    assert!(clipboard.cached_or_request(true).is_none());
+    assert!(clipboard.cached_or_request(true).is_none());
+    assert!(clipboard.selections[1].pending.is_some());
+    assert_eq!(clipboard.wire.conversions.borrow().len(), 1);
+}
+
+#[test]
+fn review_x11_initialization_timeout_stops_timer_and_completes_reads() {
+    let mut clipboard = clipboard();
+    clipboard.initialized = false;
+    clipboard.initial_owners = [true, true];
+    clipboard.init_deadline = Instant::now();
+    let receiver = clipboard.read(false);
+    clipboard.tick();
+    assert_eq!(
+        futures::executor::block_on(receiver).unwrap(),
+        Err(ClipboardReadError::TimedOut)
+    );
+    assert!(!clipboard.active());
+    assert!(clipboard.failed);
 }

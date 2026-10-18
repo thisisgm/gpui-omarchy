@@ -229,6 +229,9 @@ pub(crate) struct Clipboard<W: SelectionWire = Server> {
     handover_sent: bool,
     handover_checked: bool,
     initialized: bool,
+    initial_owners: [bool; 2],
+    init_deadline: Instant,
+    failed: bool,
     queued_events: VecDeque<(Instant, Event)>,
     queued_sets: [Option<(Instant, ClipboardItem)>; 2],
     clear_pending: Option<Instant>,
@@ -256,6 +259,9 @@ impl Clipboard<Server> {
             handover_sent: false,
             handover_checked: false,
             initialized: false,
+            initial_owners: [true, true],
+            init_deadline: Instant::now() + TRANSFER_TIMEOUT,
+            failed: false,
             queued_events: VecDeque::new(),
             queued_sets: [None, None],
             clear_pending: None,
@@ -282,6 +288,28 @@ impl<W: SelectionWire> Clipboard<W> {
     pub fn cached(&self, primary: bool) -> Option<ClipboardItem> {
         let selection = &self.selections[primary as usize];
         selection.item.clone().or_else(|| selection.cached.clone())
+    }
+    pub fn cached_or_request(&mut self, primary: bool) -> Option<ClipboardItem> {
+        let item = self.cached(primary);
+        if item.is_none() {
+            let _ = self.read(primary);
+        }
+        item
+    }
+    fn initial_owner(&mut self, primary: bool) -> anyhow::Result<()> {
+        let index = primary as usize;
+        let owner = self.wire.owner(self.selection_atom(primary))?;
+        self.initial_owners[index] = false;
+        if self.selections[index].generation != 0 {
+            return Ok(());
+        }
+        self.selections[index].owner = owner;
+        if owner != NONE && owner != self.window {
+            let _ = self.read(primary);
+        } else if owner == NONE {
+            self.complete_selection(primary, Ok(None));
+        }
+        Ok(())
     }
     fn initialize(&mut self) -> anyhow::Result<()> {
         let names = [
@@ -351,6 +379,9 @@ impl<W: SelectionWire> Clipboard<W> {
         }
     }
     fn try_set(&mut self, primary: bool) -> anyhow::Result<()> {
+        if self.failed {
+            return Err(ClipboardReadError::Unavailable.into());
+        }
         if !self.initialized {
             return Err(super::selection_wire::Pending.into());
         }
@@ -432,11 +463,22 @@ impl<W: SelectionWire> Clipboard<W> {
     }
     pub fn read(&mut self, primary: bool) -> oneshot::Receiver<ReadResult> {
         let (sender, receiver) = oneshot::channel();
+        if self.failed {
+            let _ = sender.send(Err(ClipboardReadError::Unavailable));
+            return receiver;
+        }
+        if self.selections[primary as usize].waiters.len() >= 64 {
+            let _ = sender.send(Err(ClipboardReadError::Unavailable));
+            return receiver;
+        }
         if let Some(item) = self.cached(primary) {
             let _ = sender.send(Ok(Some(item)));
             return receiver;
         }
-        if self.initialized && self.selections[primary as usize].owner == NONE {
+        if self.initialized
+            && !self.initial_owners[primary as usize]
+            && self.selections[primary as usize].owner == NONE
+        {
             let _ = sender.send(Ok(None));
             return receiver;
         }
@@ -450,6 +492,7 @@ impl<W: SelectionWire> Clipboard<W> {
     fn drive_read(&mut self, primary: bool) {
         let selection = &self.selections[primary as usize];
         if !self.initialized
+            || self.initial_owners[primary as usize]
             || selection.requested.is_none()
             || selection.pending.is_some()
             || selection.decoding
@@ -965,6 +1008,7 @@ impl<W: SelectionWire> Clipboard<W> {
     }
     pub fn active(&self) -> bool {
         !self.initialized
+            || self.initial_owners.iter().any(|pending| *pending)
             || !self.queued_events.is_empty()
             || self.queued_sets.iter().any(Option::is_some)
             || self.clear_pending.is_some()
@@ -978,6 +1022,17 @@ impl<W: SelectionWire> Clipboard<W> {
     }
     pub fn tick(&mut self) {
         if !self.initialized {
+            if Instant::now() >= self.init_deadline {
+                self.initialized = true;
+                self.failed = true;
+                self.initial_owners = [false, false];
+                self.queued_sets = [None, None];
+                self.queued_events.clear();
+                for primary in [false, true] {
+                    self.complete_selection(primary, Err(ClipboardReadError::TimedOut));
+                }
+                return;
+            }
             if let Err(error) = self.initialize() {
                 if !pending(&error) {
                     log::error!("X11 clipboard initialization: {error}");
@@ -988,6 +1043,14 @@ impl<W: SelectionWire> Clipboard<W> {
             }
         }
         for primary in [false, true] {
+            if self.initial_owners[primary as usize] {
+                if let Err(error) = self.initial_owner(primary) {
+                    if !pending(&error) {
+                        self.initial_owners[primary as usize] = false;
+                        self.complete_selection(primary, Err(wire_error(error)));
+                    }
+                }
+            }
             if let Some((deadline, _)) = self.queued_sets[primary as usize] {
                 if Instant::now() >= deadline {
                     self.queued_sets[primary as usize] = None;

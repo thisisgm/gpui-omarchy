@@ -1541,62 +1541,46 @@ impl WaylandConnection {
     }
 
     pub(crate) fn read_from_primary(&self) -> Option<gpui::ClipboardItem> {
-        self.0.borrow().clipboard.read_primary()
+        let item = self.0.borrow().clipboard.read_primary();
+        if item.is_none() {
+            WaylandClientStatePtr(Rc::downgrade(&self.0)).prefetch(true);
+        }
+        item
     }
     pub(crate) fn read_from_clipboard(&self) -> Option<gpui::ClipboardItem> {
-        self.0.borrow().clipboard.read()
+        let item = self.0.borrow().clipboard.read();
+        if item.is_none() {
+            WaylandClientStatePtr(Rc::downgrade(&self.0)).prefetch(false);
+        }
+        item
     }
-
+    pub(crate) fn read_from_primary_async(
+        &self,
+    ) -> gpui::Task<Result<Option<gpui::ClipboardItem>, gpui::ClipboardReadError>> {
+        self.read_selection_async(true)
+    }
     pub(crate) fn read_from_clipboard_async(
         &self,
     ) -> gpui::Task<Result<Option<gpui::ClipboardItem>, gpui::ClipboardReadError>> {
-        let state = self.0.borrow();
-        if let Some(item) = state.clipboard.read() {
-            return gpui::Task::ready(Ok(Some(item)));
-        }
-        let request = match state
-            .clipboard
-            .selection
-            .prepare(&state.clipboard.connection)
-        {
-            Ok(Some(request)) => request,
-            Ok(None) => return gpui::Task::ready(Ok(None)),
-            Err(error) => return gpui::Task::ready(Err(error)),
+        self.read_selection_async(false)
+    }
+    fn read_selection_async(
+        &self,
+        primary: bool,
+    ) -> gpui::Task<Result<Option<gpui::ClipboardItem>, gpui::ClipboardReadError>> {
+        let mut state = self.0.borrow_mut();
+        let receiver = if primary {
+            state.clipboard.primary.subscribe()
+        } else {
+            state.clipboard.selection.subscribe()
         };
-        let generation = request.generation;
-        let cancel = request.cancel.clone();
-        let executor = state.common.borrow().background_executor.clone();
-        let this = WaylandClientStatePtr(Rc::downgrade(&self.0));
-        let task = executor.spawn(async move { request.run() });
-        state.common.borrow().foreground_executor.spawn(async move {
-            let result = task.await;
-            let Some(client) = this.0.upgrade() else {
-                return Err(gpui::ClipboardReadError::Cancelled);
-            };
-            let mut state = client.borrow_mut();
-            if state.clipboard.selection.generation != generation
-                || cancel.load(std::sync::atomic::Ordering::Acquire)
-            {
-                return Err(gpui::ClipboardReadError::Cancelled);
-            }
-            match result {
-                Ok(item) => {
-                    state.clipboard.selection.cached = Some(item.clone());
-                    Ok(Some(item))
-                }
-                Err(error) => {
-                    crate::linux::transfer::notify_clipboard(
-                        &state.common,
-                        gpui::ClipboardChange {
-                            primary: false,
-                            generation,
-                            owned: false,
-                            error: Some(error.clone()),
-                        },
-                    );
-                    Err(error)
-                }
-            }
+        let foreground = state.common.borrow().foreground_executor.clone();
+        drop(state);
+        WaylandClientStatePtr(Rc::downgrade(&self.0)).prefetch(primary);
+        foreground.spawn(async move {
+            receiver
+                .await
+                .unwrap_or(Err(gpui::ClipboardReadError::Cancelled))
         })
     }
 
@@ -3590,34 +3574,64 @@ impl WaylandClientStatePtr {
         let Some(client) = self.0.upgrade() else {
             return;
         };
-        let state = client.borrow();
-        let connection = &state.clipboard.connection;
+        let mut state = client.borrow_mut();
+        let connection = state.clipboard.connection.clone();
         let background = state.common.borrow().background_executor.clone();
         let foreground = state.common.borrow().foreground_executor.clone();
-        let (generation, task) = if primary {
-            if state.clipboard.primary.ready().is_some() {
-                return;
-            }
-            let request = match state.clipboard.primary.prepare(connection) {
-                Ok(Some(request)) => request,
-                _ => return,
-            };
-            (
-                request.generation,
-                background.spawn(async move { request.run() }),
-            )
+        let request = if primary {
+            state.clipboard.primary.prepare(&connection).map(|request| {
+                request.map(|request| {
+                    (
+                        request.generation,
+                        background.spawn(async move { request.run() }),
+                    )
+                })
+            })
         } else {
-            if state.clipboard.selection.ready().is_some() {
+            state
+                .clipboard
+                .selection
+                .prepare(&connection)
+                .map(|request| {
+                    request.map(|request| {
+                        (
+                            request.generation,
+                            background.spawn(async move { request.run() }),
+                        )
+                    })
+                })
+        };
+        let (generation, task) = match request {
+            Ok(Some(request)) => request,
+            Ok(None) => return,
+            Err(error) => {
+                let generation = if primary {
+                    state.clipboard.primary.generation
+                } else {
+                    state.clipboard.selection.generation
+                };
+                if primary {
+                    state
+                        .clipboard
+                        .primary
+                        .complete_read(generation, Err(error.clone()));
+                } else {
+                    state
+                        .clipboard
+                        .selection
+                        .complete_read(generation, Err(error.clone()));
+                }
+                crate::linux::transfer::notify_clipboard(
+                    &state.common,
+                    gpui::ClipboardChange {
+                        primary,
+                        generation,
+                        owned: false,
+                        error: Some(error),
+                    },
+                );
                 return;
             }
-            let request = match state.clipboard.selection.prepare(connection) {
-                Ok(Some(request)) => request,
-                _ => return,
-            };
-            (
-                request.generation,
-                background.spawn(async move { request.run() }),
-            )
         };
         let this = self.clone();
         foreground
@@ -3627,23 +3641,14 @@ impl WaylandClientStatePtr {
                     return;
                 };
                 let mut state = client.borrow_mut();
-                let current_generation = if primary {
-                    state.clipboard.primary.generation
+                let error = result.as_ref().err().cloned();
+                let current = if primary {
+                    state.clipboard.primary.complete_read(generation, result)
                 } else {
-                    state.clipboard.selection.generation
+                    state.clipboard.selection.complete_read(generation, result)
                 };
-                if current_generation != generation {
-                    return;
-                }
-                match result {
-                    Ok(item) => {
-                        if primary {
-                            state.clipboard.primary.cached = Some(item);
-                        } else {
-                            state.clipboard.selection.cached = Some(item);
-                        }
-                    }
-                    Err(error) => crate::linux::transfer::notify_clipboard(
+                if current && let Some(error) = error {
+                    crate::linux::transfer::notify_clipboard(
                         &state.common,
                         gpui::ClipboardChange {
                             primary,
@@ -3651,7 +3656,7 @@ impl WaylandClientStatePtr {
                             owned: false,
                             error: Some(error),
                         },
-                    ),
+                    );
                 }
             })
             .detach();

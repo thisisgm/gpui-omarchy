@@ -145,9 +145,17 @@ impl TextInput {
     }
 
     fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-            self.replace_text_in_range(None, &text.replace("\n", " "), window, cx);
-        }
+        let read = cx.read_from_clipboard_async();
+        cx.spawn_in(window, async move |this, cx| {
+            if let Ok(Some(item)) = read.await
+                && let Some(text) = item.text()
+            {
+                let _ = this.update_in(cx, |this, window, cx| {
+                    this.replace_text_in_range(None, &text.replace("\n", " "), window, cx);
+                });
+            }
+        })
+        .detach();
     }
 
     fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {

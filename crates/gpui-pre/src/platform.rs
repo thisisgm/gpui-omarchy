@@ -595,6 +595,7 @@ pub trait Platform: 'static {
     fn on_native_drag(&self, _callback: Box<dyn FnMut(crate::NativeDragEvent)>) {}
 
     /// Reads the clipboard, resolving once its contents are available.
+    /// Linux synchronous reads return the current cache and start acquisition when uncached.
     ///
     /// Most platforms read synchronously and return a ready task. Platforms
     /// whose clipboard access is inherently asynchronous and permission-gated
@@ -609,6 +610,12 @@ pub trait Platform: 'static {
     fn read_from_primary(&self) -> Option<ClipboardItem>;
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     fn write_to_primary(&self, item: ClipboardItem);
+
+    /// Reads PRIMARY once acquisition completes; synchronous reads return only the current cache.
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    fn read_from_primary_async(&self) -> Task<Result<Option<ClipboardItem>, ClipboardReadError>> {
+        Task::ready(Ok(self.read_from_primary()))
+    }
 
     #[cfg(target_os = "macos")]
     fn read_from_find_pasteboard(&self) -> Option<ClipboardItem>;

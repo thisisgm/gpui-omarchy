@@ -207,6 +207,12 @@ impl DisplayConnection {
         dispatch!(self, connection => connection.read_from_primary(), headless => None)
     }
 
+    pub(crate) fn read_from_primary_async(
+        &self,
+    ) -> gpui::Task<Result<Option<ClipboardItem>, gpui::ClipboardReadError>> {
+        dispatch!(self, connection => connection.read_from_primary_async(), headless => gpui::Task::ready(Ok(None)))
+    }
+
     pub(crate) fn read_from_clipboard_async(
         &self,
     ) -> gpui::Task<Result<Option<ClipboardItem>, gpui::ClipboardReadError>> {

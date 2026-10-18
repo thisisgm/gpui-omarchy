@@ -101,6 +101,9 @@ pub(crate) struct Selection<T: ReceiveData> {
     own_prefix: String,
     pending_sources: std::collections::HashMap<u64, String>,
     last_source: u64,
+    pub receiving: bool,
+    waiters:
+        Vec<futures::channel::oneshot::Sender<Result<Option<ClipboardItem>, ClipboardReadError>>>,
 }
 impl<T: ReceiveData> Default for Selection<T> {
     fn default() -> Self {
@@ -114,11 +117,17 @@ impl<T: ReceiveData> Default for Selection<T> {
             own_prefix: String::new(),
             pending_sources: Default::default(),
             last_source: 0,
+            receiving: false,
+            waiters: Vec::new(),
         }
     }
 }
 impl<T: ReceiveData> Selection<T> {
     fn advance(&mut self) {
+        self.receiving = false;
+        for waiter in self.waiters.drain(..) {
+            let _ = waiter.send(Err(ClipboardReadError::Cancelled));
+        }
         self.cancel.store(true, Ordering::Release);
         self.cancel = transfer::cancelled();
         self.generation = self.generation.wrapping_add(1);
@@ -169,10 +178,46 @@ impl<T: ReceiveData> Selection<T> {
     pub fn ready(&self) -> Option<ClipboardItem> {
         self.contents.clone().or_else(|| self.cached.clone())
     }
+    pub fn subscribe(
+        &mut self,
+    ) -> futures::channel::oneshot::Receiver<Result<Option<ClipboardItem>, ClipboardReadError>>
+    {
+        let (sender, receiver) = futures::channel::oneshot::channel();
+        if let Some(item) = self.ready() {
+            let _ = sender.send(Ok(Some(item)));
+        } else if self.offer.is_none() {
+            let _ = sender.send(Ok(None));
+        } else if self.waiters.len() < 64 {
+            self.waiters.push(sender);
+        } else {
+            let _ = sender.send(Err(ClipboardReadError::Unavailable));
+        }
+        receiver
+    }
+    pub fn complete_read(
+        &mut self,
+        generation: u64,
+        result: Result<ClipboardItem, ClipboardReadError>,
+    ) -> bool {
+        if self.generation != generation {
+            return false;
+        }
+        self.receiving = false;
+        if let Ok(item) = &result {
+            self.cached = Some(item.clone());
+        }
+        for waiter in self.waiters.drain(..) {
+            let _ = waiter.send(result.clone().map(Some));
+        }
+        true
+    }
     pub fn prepare(
-        &self,
+        &mut self,
         connection: &Connection,
     ) -> Result<Option<ReadRequest<T>>, ClipboardReadError> {
+        if self.receiving || self.ready().is_some() {
+            return Ok(None);
+        }
         let Some(offer) = self.offer.clone() else {
             return Ok(None);
         };
@@ -186,6 +231,7 @@ impl<T: ReceiveData> Selection<T> {
             .map(|mime| offer.receive(&mime).map(|file| (mime, file)))
             .collect::<Result<Vec<_>, _>>()?;
         connection.flush().map_err(transfer::transport)?;
+        self.receiving = true;
         Ok(Some(ReadRequest {
             generation: self.generation,
             cancel: self.cancel.clone(),
@@ -456,5 +502,58 @@ mod source_identity_tests {
         exercise(DataSourceKind::Primary, |data| {
             primary.create_source(&qh, data)
         });
+    }
+}
+
+#[cfg(test)]
+mod pending_read_tests {
+    use super::review_ownership::{Offer, echo};
+    use super::*;
+    #[test]
+    fn review_wayland_paste_and_primary_wait_for_existing_prefetch() {
+        for _primary in [false, true] {
+            let mut selection: Selection<Offer> = Selection::default();
+            selection.set_offer(Some(echo("UTF8_STRING".into())));
+            let generation = selection.generation;
+            selection.receiving = true;
+            let mut first = selection.subscribe();
+            let mut second = selection.subscribe();
+            assert_eq!(first.try_recv().unwrap(), None);
+            assert_eq!(second.try_recv().unwrap(), None);
+            assert!(selection.complete_read(
+                generation,
+                Ok(ClipboardItem::new_string("prefetched".into()))
+            ));
+            for receiver in [first, second] {
+                assert_eq!(
+                    futures::executor::block_on(receiver)
+                        .unwrap()
+                        .unwrap()
+                        .unwrap()
+                        .text()
+                        .as_deref(),
+                    Some("prefetched")
+                );
+            }
+            assert!(!selection.receiving);
+            assert_eq!(
+                selection.ready().unwrap().text().as_deref(),
+                Some("prefetched")
+            );
+        }
+    }
+    #[test]
+    fn review_wayland_replacement_cancels_waiters_without_publishing_old_read() {
+        let mut selection: Selection<Offer> = Selection::default();
+        selection.set_offer(Some(echo("UTF8_STRING".into())));
+        let old = selection.generation;
+        let receiver = selection.subscribe();
+        selection.set_offer(None);
+        assert_eq!(
+            futures::executor::block_on(receiver).unwrap(),
+            Err(ClipboardReadError::Cancelled)
+        );
+        assert!(!selection.complete_read(old, Ok(ClipboardItem::new_string("stale".into()))));
+        assert!(selection.ready().is_none());
     }
 }

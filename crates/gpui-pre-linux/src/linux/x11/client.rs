@@ -1890,15 +1890,30 @@ impl X11Client {
         self.clipboard_progress();
     }
     pub(crate) fn read_from_primary(&self) -> Option<gpui::ClipboardItem> {
-        self.0.borrow().clipboard.cached(true)
+        let item = self.0.borrow_mut().clipboard.cached_or_request(true);
+        self.clipboard_progress();
+        item
     }
     pub(crate) fn read_from_clipboard(&self) -> Option<gpui::ClipboardItem> {
-        self.0.borrow().clipboard.cached(false)
+        let item = self.0.borrow_mut().clipboard.cached_or_request(false);
+        self.clipboard_progress();
+        item
     }
     pub(crate) fn read_from_clipboard_async(
         &self,
     ) -> gpui::Task<Result<Option<gpui::ClipboardItem>, gpui::ClipboardReadError>> {
-        let receiver = self.0.borrow_mut().clipboard.read(false);
+        self.read_selection_async(false)
+    }
+    pub(crate) fn read_from_primary_async(
+        &self,
+    ) -> gpui::Task<Result<Option<gpui::ClipboardItem>, gpui::ClipboardReadError>> {
+        self.read_selection_async(true)
+    }
+    fn read_selection_async(
+        &self,
+        primary: bool,
+    ) -> gpui::Task<Result<Option<gpui::ClipboardItem>, gpui::ClipboardReadError>> {
+        let receiver = self.0.borrow_mut().clipboard.read(primary);
         self.clipboard_progress();
         self.0
             .borrow()

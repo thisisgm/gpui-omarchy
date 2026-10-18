@@ -1167,6 +1167,12 @@ impl Platform for LinuxPlatform {
         self.connection.borrow().write_to_clipboard(item)
     }
 
+    fn read_from_primary_async(
+        &self,
+    ) -> gpui::Task<Result<Option<ClipboardItem>, gpui::ClipboardReadError>> {
+        self.connection.borrow().read_from_primary_async()
+    }
+
     fn read_from_primary(&self) -> Option<ClipboardItem> {
         self.connection.borrow().read_from_primary()
     }

@@ -1786,6 +1786,14 @@ impl App {
         self.platform.read_from_primary()
     }
 
+    /// Reads PRIMARY after acquisition completes, including a pending native prefetch.
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    pub fn read_from_primary_async(
+        &self,
+    ) -> Task<Result<Option<ClipboardItem>, ClipboardReadError>> {
+        self.platform.read_from_primary_async()
+    }
+
     /// Writes data to the primary selection buffer.
     /// Only available on Linux.
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
