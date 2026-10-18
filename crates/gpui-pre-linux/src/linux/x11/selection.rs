@@ -537,7 +537,9 @@ impl<W: SelectionWire> Clipboard<W> {
                     if self.wire.owner(event.selection)? != event.owner {
                         return Ok(true);
                     }
-                    if event.owner != self.selections[index].owner {
+                    if event.owner != self.selections[index].owner
+                        || (event.owner != NONE && event.owner != self.window)
+                    {
                         self.replaced(index == 1, event.owner);
                         if event.owner != NONE && event.owner != self.window {
                             let _ = self.read(index == 1);

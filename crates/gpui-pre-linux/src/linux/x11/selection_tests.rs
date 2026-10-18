@@ -553,3 +553,22 @@ fn owner_without_targets_can_still_convert_utf8_text() {
         .unwrap();
     assert_eq!(item.text().unwrap(), "legacy owner");
 }
+
+#[test]
+fn same_foreign_owner_replacing_its_selection_invalidates_the_cached_bytes() {
+    let mut clipboard = clipboard();
+    clipboard.replaced(false, 88);
+    clipboard.wire.owner.set(88);
+    clipboard.selections[0].cached = Some(ClipboardItem::new_string("old bytes".into()));
+    let generation = clipboard.selections[0].generation;
+    let event = Event::XfixesSelectionNotify(x11rb::protocol::xfixes::SelectionNotifyEvent {
+        window: clipboard.window,
+        owner: 88,
+        selection: clipboard.atoms.CLIPBOARD,
+        ..Default::default()
+    });
+    clipboard.handle_event(&event).unwrap();
+    assert!(clipboard.cached(false).is_none());
+    assert!(clipboard.selections[0].generation > generation);
+    assert!(clipboard.selections[0].pending.is_some());
+}
