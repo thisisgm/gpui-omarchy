@@ -243,6 +243,13 @@ pub(crate) struct Clipboard<W: SelectionWire = Server> {
     clear_pending: Option<Instant>,
 }
 impl Clipboard<Server> {
+    pub fn register_event_wakeup(
+        &mut self,
+        handle: &calloop::LoopHandle<'static, ()>,
+        drain: impl FnMut() + 'static,
+    ) -> anyhow::Result<calloop::RegistrationToken> {
+        self.wire.register_event_wakeup(handle, drain)
+    }
     pub fn new(connection: Arc<XCBConnection>, root: Window) -> anyhow::Result<Self> {
         Ok(Self {
             wire: Server::new(connection, root)?,

@@ -123,6 +123,7 @@ fn remember<R: TryParse + Send + 'static>(
 
 pub(crate) struct Server {
     work: mpsc::SyncSender<Work>,
+    event_wakeup: Option<calloop::channel::Channel<()>>,
     queries: RefCell<HashMap<Query, Answer>>,
     atoms: RefCell<HashMap<String, Atom>>,
     root: Window,
@@ -131,6 +132,7 @@ pub(crate) struct Server {
 impl Server {
     pub fn new(connection: Arc<XCBConnection>, root: Window) -> anyhow::Result<Self> {
         let (work, receiver) = mpsc::sync_channel::<Work>(128);
+        let (wake, event_wakeup) = calloop::channel::sync_channel(1);
         std::thread::Builder::new()
             .name("x11-selection".into())
             .spawn(move || {
@@ -154,6 +156,9 @@ impl Server {
                         Err(mpsc::RecvTimeoutError::Timeout) => {}
                         Err(mpsc::RecvTimeoutError::Disconnected) => break,
                     }
+                    // Flush and reply polling can both pull events off the shared socket.
+                    // Wake the foreground drain even when no reply was ready. The bounded
+                    // channel coalesces wakes without blocking or relying on socket readiness.
                     let mut index = 0;
                     while index < replies.len() {
                         let result = if Instant::now() >= replies[index].deadline {
@@ -172,6 +177,7 @@ impl Server {
                             index += 1;
                         }
                     }
+                    let _ = wake.try_send(());
                 }
                 for reply in replies {
                     connection.discard_reply(
@@ -183,11 +189,29 @@ impl Server {
             })?;
         Ok(Self {
             work,
+            event_wakeup: Some(event_wakeup),
             queries: RefCell::new(HashMap::new()),
             atoms: RefCell::new(HashMap::new()),
             root,
             fixes_ready: Cell::new(false),
         })
+    }
+    pub fn register_event_wakeup(
+        &mut self,
+        handle: &calloop::LoopHandle<'static, ()>,
+        mut drain: impl FnMut() + 'static,
+    ) -> anyhow::Result<calloop::RegistrationToken> {
+        let channel = self
+            .event_wakeup
+            .take()
+            .expect("X11 event wakeup registered once");
+        handle
+            .insert_source(channel, move |event, _, _| {
+                if let calloop::channel::Event::Msg(()) = event {
+                    drain();
+                }
+            })
+            .map_err(|error| anyhow::anyhow!("Failed to register X11 selection wakeup: {error}"))
     }
     fn enqueue(
         &self,
@@ -489,5 +513,125 @@ impl SelectionWire for Server {
                 )
                 .map(|cookie| cookie.ignore_error());
         })
+    }
+}
+
+#[cfg(test)]
+mod review_event_wakeup {
+    use super::*;
+    use std::{
+        io::{Read, Write},
+        os::fd::{AsRawFd, IntoRawFd},
+        os::unix::net::UnixStream,
+    };
+
+    #[link(name = "xcb")]
+    unsafe extern "C" {
+        fn xcb_connect_to_fd(fd: i32, auth: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
+    }
+
+    #[test]
+    fn review_r2_reply_worker_preserves_selection_event_wakeup() {
+        let (socket, mut peer) = UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        let fake = std::thread::spawn(move || {
+            let mut hello = [0u8; 12];
+            peer.read_exact(&mut hello).unwrap();
+            assert_eq!(hello[0], b'l');
+            let name = u16::from_ne_bytes(hello[6..8].try_into().unwrap()) as usize;
+            let data = u16::from_ne_bytes(hello[8..10].try_into().unwrap()) as usize;
+            let mut auth = vec![0; name.next_multiple_of(4) + data.next_multiple_of(4)];
+            peer.read_exact(&mut auth).unwrap();
+            let mut setup = [0u8; 40];
+            setup[0] = 1;
+            setup[2..4].copy_from_slice(&11u16.to_ne_bytes());
+            setup[6..8].copy_from_slice(&8u16.to_ne_bytes());
+            setup[12..16].copy_from_slice(&0x20_0000u32.to_ne_bytes());
+            setup[16..20].copy_from_slice(&0x1f_ffffu32.to_ne_bytes());
+            setup[26..28].copy_from_slice(&65535u16.to_ne_bytes());
+            setup[32] = 32;
+            setup[33] = 32;
+            setup[34] = 8;
+            setup[35] = 255;
+            peer.write_all(&setup).unwrap();
+            let mut sequence = 0u16;
+            loop {
+                let mut header = [0u8; 4];
+                if peer.read_exact(&mut header).is_err() {
+                    break;
+                }
+                sequence += 1;
+                let length = u16::from_ne_bytes(header[2..4].try_into().unwrap()) as usize * 4;
+                let mut body = vec![0; length - 4];
+                peer.read_exact(&mut body).unwrap();
+                let mut reply = [0u8; 32];
+                reply[0] = 1;
+                reply[2..4].copy_from_slice(&sequence.to_ne_bytes());
+                if header[0] == 16 {
+                    reply[8..12].copy_from_slice(&42u32.to_ne_bytes());
+                    let mut event = [0u8; 32];
+                    event[0] = 31;
+                    event[2..4].copy_from_slice(&sequence.to_ne_bytes());
+                    event[8..12].copy_from_slice(&50u32.to_ne_bytes());
+                    event[12..16].copy_from_slice(&1u32.to_ne_bytes());
+                    event[16..20].copy_from_slice(&12u32.to_ne_bytes());
+                    event[20..24].copy_from_slice(&6u32.to_ne_bytes());
+                    peer.write_all(&[event, reply].concat()).unwrap();
+                } else {
+                    assert_eq!(header[0], 98, "unexpected fake-server opcode");
+                    peer.write_all(&reply).unwrap();
+                }
+            }
+        });
+        let fd = socket.as_raw_fd();
+        let raw = unsafe { xcb_connect_to_fd(socket.into_raw_fd(), std::ptr::null_mut()) };
+        let connection =
+            Arc::new(unsafe { XCBConnection::from_raw_xcb_connection(raw, true).unwrap() });
+        let mut wire = Server::new(connection.clone(), 50).unwrap();
+        let mut event_loop = calloop::EventLoop::try_new().unwrap();
+        let events = std::rc::Rc::new(RefCell::new(Vec::new()));
+        let observed = events.clone();
+        let drain_connection = connection.clone();
+        wire.register_event_wakeup(&event_loop.handle(), move || {
+            while let Some(event) = drain_connection.poll_for_event().unwrap() {
+                observed.borrow_mut().push(event);
+            }
+        })
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match wire.atom("REVIEW_WAKEUP") {
+                Ok(atom) => {
+                    assert_eq!(atom, 42);
+                    break;
+                }
+                Err(error) if pending(&error) && Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(2))
+                }
+                Err(error) => panic!("fake transport failed: {error}"),
+            }
+        }
+        let mut pollfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ready = unsafe { libc::poll(&mut pollfd, 1, 0) };
+        while events.borrow().is_empty() && Instant::now() < deadline {
+            event_loop
+                .dispatch(Some(Duration::from_millis(20)), &mut ())
+                .unwrap();
+        }
+        assert!(
+            events
+                .borrow()
+                .iter()
+                .any(|event| matches!(event, x11rb::protocol::Event::SelectionNotify(_))),
+            "reply worker buffered SelectionNotify without waking the UI event source (fd readiness={ready})"
+        );
+        drop(event_loop);
+        drop(wire);
+        drop(connection);
+        fake.join().unwrap();
     }
 }

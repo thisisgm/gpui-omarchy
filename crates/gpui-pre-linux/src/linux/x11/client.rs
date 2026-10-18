@@ -585,6 +585,21 @@ impl X11Client {
         let this = self.0.borrow().this.clone();
         let xcb_connection = self.0.borrow().xcb_connection.clone();
 
+        let token = self
+            .0
+            .borrow_mut()
+            .clipboard
+            .register_event_wakeup(handle, {
+                let this = this.clone();
+                let xcb_connection = xcb_connection.clone();
+                move || {
+                    if let Some(client) = this.get_client() {
+                        client.process_x11_events(&xcb_connection).log_err();
+                    }
+                }
+            })?;
+        self.0.borrow_mut().registrations.push(token);
+
         // Safety: Safe if xcb::Connection always returns a valid fd
         let fd = unsafe { FdWrapper::new(Arc::clone(&xcb_connection)) };
         let token = handle
