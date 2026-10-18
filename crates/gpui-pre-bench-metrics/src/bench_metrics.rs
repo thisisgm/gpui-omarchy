@@ -2121,11 +2121,53 @@ mod tests {
     fn resource_counter_counts_page_faults_and_context_switches() {
         let faults = ResourceCounter::new(ResourceMetric::MinorPageFaults, MetricScope::Process)
             .expect("RUSAGE_SELF is always available");
+        struct Mapping {
+            address: *mut libc::c_void,
+            length: usize,
+        }
+        impl Drop for Mapping {
+            fn drop(&mut self) {
+                // SAFETY: this guard owns exactly the live region returned by mmap below.
+                assert_eq!(unsafe { libc::munmap(self.address, self.length) }, 0);
+            }
+        }
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        assert!(page_size > 0);
+        let page_size = page_size as usize;
+        let page_count = (4_usize << 20).div_ceil(page_size);
+        let length = page_count * page_size;
+        // SAFETY: request a fresh private anonymous mapping without prepopulating its pages.
+        let address = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                length,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(address, libc::MAP_FAILED);
+        let mapping = Mapping { address, length };
+        #[cfg(target_os = "linux")]
+        // SAFETY: the mapping is live, page-aligned and spans length bytes.
+        assert_eq!(
+            unsafe { libc::madvise(address, length, libc::MADV_NOHUGEPAGE) },
+            0
+        );
         let start = faults.start();
-        // Touch fresh pages: a 4 MiB allocation faults in ~1000 pages.
-        let buffer = vec![1_u8; 4 << 20];
-        std::hint::black_box(&buffer);
-        assert!(faults.end(start) > 100.0);
+        for page in 0..page_count {
+            // SAFETY: each volatile write is within the live writable mapping.
+            unsafe { address.cast::<u8>().add(page * page_size).write_volatile(1) };
+        }
+        let observed = faults.end(start);
+        drop(mapping);
+        eprintln!("minor_faults={observed}; base_pages={page_count}; page_size={page_size}");
+        // Each first write needs a base-page fault; no undercount margin is necessary.
+        assert!(
+            observed >= page_count as f64,
+            "observed {observed} faults for {page_count} pages"
+        );
 
         #[cfg(target_os = "linux")]
         {
