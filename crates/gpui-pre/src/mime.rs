@@ -153,3 +153,20 @@ pub struct ClipboardChange {
     /// An asynchronous receive failure, if any.
     pub error: Option<ClipboardReadError>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn two_mime_requests_return_their_own_immutable_bytes() {
+        let payload = MimePayload::new([
+            MimeRepresentation::new("text/uri-list", &b"file:///a\r\n"[..]),
+            MimeRepresentation::new("x-special/gnome-copied-files", &b"cut\nfile:///a\n"[..]),
+            MimeRepresentation::new("application/x-test-token", &b"token"[..]),
+        ], SelectionIntent::Cut);
+        assert_eq!(&*payload.get("text/uri-list").unwrap(), b"file:///a\r\n");
+        assert_eq!(&*payload.get("x-special/gnome-copied-files").unwrap(), b"cut\nfile:///a\n");
+        assert!(payload.get("text/plain").is_none());
+        assert!(Arc::ptr_eq(&payload.get("application/x-test-token").unwrap(), &payload.clone().get("application/x-test-token").unwrap()));
+    }
+}

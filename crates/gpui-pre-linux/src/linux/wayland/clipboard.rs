@@ -132,3 +132,31 @@ impl SourceData {
         }).detach();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{cell::Cell, rc::Rc};
+    #[derive(Clone)]
+    struct FakeOffer { destroyed: Rc<Cell<usize>> }
+    impl ReceiveData for FakeOffer {
+        fn receive_data(&self, _: String, _: BorrowedFd<'_>) {}
+        fn destroy_offer(&self) { self.destroyed.set(self.destroyed.get() + 1); }
+    }
+    #[test]
+    fn offer_is_destroyed_exactly_once_after_pending_reader_releases_it() {
+        let destroyed = Rc::new(Cell::new(0));
+        let offer = DataOffer::new(FakeOffer { destroyed: destroyed.clone() });
+        let reader = offer.clone(); drop(offer);
+        assert_eq!(destroyed.get(), 0); drop(reader); assert_eq!(destroyed.get(), 1);
+    }
+    #[test]
+    fn old_source_cancellation_does_not_clear_a_new_selection() {
+        let mut selection: Selection<FakeOffer> = Selection::default();
+        let old = selection.set(ClipboardItem::new_string("old".into()));
+        let new = selection.set(ClipboardItem::new_string("new".into()));
+        assert_ne!(old, new);
+        if selection.generation == old { selection.set_offer(None); }
+        assert_eq!(selection.ready().unwrap().text().unwrap(), "new");
+    }
+}

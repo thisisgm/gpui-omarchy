@@ -198,3 +198,85 @@ pub(crate) fn allow_drop(common: &std::rc::Rc<std::cell::RefCell<super::LinuxCom
     if common.callbacks.native_drop.is_none() { common.callbacks.native_drop = Some(callback); }
     accepted
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{os::{fd::OwnedFd, unix::net::UnixStream}, thread};
+
+    fn pipe() -> (File, File) {
+        let (read, write) = UnixStream::pair().unwrap();
+        (File::from(OwnedFd::from(read)), File::from(OwnedFd::from(write)))
+    }
+    #[test]
+    fn source_that_stops_writing_hits_absolute_deadline() {
+        let (file, _writer) = pipe();
+        let start = Instant::now();
+        assert_eq!(read(file, &cancelled(), start + Duration::from_millis(40), 1024), Err(ClipboardReadError::TimedOut));
+        assert!(start.elapsed() < Duration::from_secs(1));
+    }
+    #[test]
+    fn continuously_writing_oversized_source_is_bounded() {
+        let (file, mut writer) = pipe();
+        let source = thread::spawn(move || { while writer.write_all(&[1; 256]).is_ok() {} });
+        assert_eq!(read(file, &cancelled(), Instant::now() + TRANSFER_TIMEOUT, 1024), Err(ClipboardReadError::TooLarge));
+        source.join().unwrap();
+    }
+    #[test]
+    fn drip_source_cannot_extend_deadline() {
+        let (file, mut writer) = pipe();
+        let source = thread::spawn(move || {
+            while writer.write_all(b"a").is_ok() { thread::sleep(Duration::from_millis(5)); }
+        });
+        let start = Instant::now();
+        assert_eq!(read(file, &cancelled(), start + Duration::from_millis(50), 1024), Err(ClipboardReadError::TimedOut));
+        source.join().unwrap();
+        assert!(start.elapsed() < Duration::from_secs(1));
+    }
+    #[test]
+    fn stalled_send_does_not_block_past_deadline() {
+        let (_reader, file) = pipe();
+        let bytes = vec![0; 1024 * 1024].into();
+        assert_eq!(write(file, bytes, &cancelled(), Instant::now() + Duration::from_millis(40)), Err(ClipboardReadError::TimedOut));
+    }
+    #[test]
+    fn cancelled_generation_stops_read_and_write() {
+        let (file, _writer) = pipe();
+        let cancel = cancelled(); cancel.store(true, Ordering::Release);
+        assert_eq!(read(file, &cancel, Instant::now() + TRANSFER_TIMEOUT, 1024), Err(ClipboardReadError::Cancelled));
+        let (_reader, file) = pipe();
+        assert_eq!(write(file, Arc::from(&b"a"[..]), &cancel, Instant::now() + TRANSFER_TIMEOUT), Err(ClipboardReadError::Cancelled));
+    }
+    #[test]
+    fn file_selection_serves_distinct_mime_bytes_and_escaped_uris() {
+        let payload = file_payload(["/fixture/a b#c".into(), "/fixture/second".into()], SelectionIntent::Cut).unwrap();
+        assert_eq!(&*payload.get(URI_LIST).unwrap(), b"file:///fixture/a%20b%23c\r\nfile:///fixture/second\r\n");
+        assert_eq!(&*payload.get(GNOME_FILES).unwrap(), b"cut\nfile:///fixture/a%20b%23c\nfile:///fixture/second\n");
+        let item = decode(payload.representations().to_vec()).unwrap();
+        assert_eq!(item.mime_payload().unwrap().intent(), SelectionIntent::Cut);
+        assert_eq!(paths(item.mime_payload().unwrap()).unwrap().paths().len(), 2);
+    }
+    #[test]
+    fn uri_only_is_copy_and_custom_tokens_are_never_paths() {
+        let item = decode(vec![MimeRepresentation::new(URI_LIST, &b"# comment\r\nfile:///a\r\n"[..])]).unwrap();
+        assert_eq!(item.mime_payload().unwrap().intent(), SelectionIntent::Copy);
+        let item = decode(vec![MimeRepresentation::new("application/x-test-token", &b"single-use-token"[..])]).unwrap();
+        assert!(paths(item.mime_payload().unwrap()).unwrap().paths().is_empty());
+        assert_eq!(&*item.mime_payload().unwrap().get("application/x-test-token").unwrap(), b"single-use-token");
+    }
+    #[test]
+    fn old_source_snapshot_is_independent_of_replacement_before_send() {
+        let old = snapshot(&ClipboardItem::new_mime(file_payload(["/old".into()], SelectionIntent::Cut).unwrap())).unwrap();
+        let replacement = snapshot(&ClipboardItem::new_string("replacement".into())).unwrap();
+        assert_eq!(&*old.get(GNOME_FILES).unwrap(), b"cut\nfile:///old\n");
+        assert!(replacement.get(GNOME_FILES).is_none());
+        assert!(Arc::ptr_eq(&old.get(URI_LIST).unwrap(), &old.clone().get(URI_LIST).unwrap()));
+    }
+    #[test]
+    fn normal_text_and_images_retain_their_entry_types() {
+        let item = ClipboardItem::new_string("a\r\nb".into());
+        assert_eq!(decode(snapshot(&item).unwrap().representations().to_vec()).unwrap().text().unwrap(), "a\nb");
+        let item = ClipboardItem::new_image(&Image { id: 1, format: ImageFormat::Png, bytes: vec![1, 2, 3] });
+        assert!(decode(snapshot(&item).unwrap().representations().to_vec()).unwrap().entries().iter().any(|entry| matches!(entry, ClipboardEntry::Image(image) if image.bytes == vec![1, 2, 3])));
+    }
+}
