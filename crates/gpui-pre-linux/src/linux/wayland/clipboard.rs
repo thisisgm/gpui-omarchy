@@ -99,7 +99,7 @@ pub(crate) struct Selection<T: ReceiveData> {
     pub cancel: Cancel,
     pub marker: String,
     own_prefix: String,
-    pending_sources: std::collections::HashMap<u64, String>,
+    latest_source: Option<(u64, ClipboardItem)>,
     last_source: u64,
     pub receiving: bool,
     waiters:
@@ -115,7 +115,7 @@ impl<T: ReceiveData> Default for Selection<T> {
             cancel: transfer::cancelled(),
             marker: String::new(),
             own_prefix: String::new(),
-            pending_sources: Default::default(),
+            latest_source: None,
             last_source: 0,
             receiving: false,
             waiters: Vec::new(),
@@ -141,8 +141,7 @@ impl<T: ReceiveData> Selection<T> {
         }
         self.marker = format!("{}{}", self.own_prefix, self.generation);
         self.last_source = self.generation;
-        self.pending_sources
-            .insert(self.generation, self.marker.clone());
+        self.latest_source = Some((self.last_source, item.clone()));
         self.contents = Some(item);
         self.generation
     }
@@ -156,8 +155,16 @@ impl<T: ReceiveData> Selection<T> {
                     .filter(|generation| *generation <= self.last_source)
             })
         }) {
-            self.pending_sources.remove(&generation);
-            if generation == self.generation && self.contents.is_some() {
+            if let Some((source, item)) = &self.latest_source
+                && *source == generation
+            {
+                let item = item.clone();
+                if self.contents.is_none() {
+                    // A queued foreign predecessor can invalidate a receive, but cannot
+                    // erase the immutable snapshot of the source just accepted.
+                    self.advance();
+                }
+                self.contents = Some(item);
                 self.offer = offer;
             }
             return;
@@ -168,8 +175,11 @@ impl<T: ReceiveData> Selection<T> {
     }
     pub fn cancel_source(&mut self, source: &SourceData) -> bool {
         source.cancel.store(true, Ordering::Release);
-        self.pending_sources.remove(&source.generation);
-        if self.generation != source.generation || self.contents.is_none() {
+        if self.latest_source.as_ref().map(|(id, _)| *id) != Some(source.generation) {
+            return false;
+        }
+        self.latest_source = None;
+        if self.contents.is_none() {
             return false;
         }
         self.set_offer(None);
@@ -383,6 +393,23 @@ mod review_ownership {
             Some("new")
         );
     }
+
+    #[test]
+    fn review_r2_queued_foreign_selection_before_latest_own_echo_restores_owner() {
+        let mut selection: Selection<Offer> = Selection::default();
+        selection.set(ClipboardItem::new_string("old own source".into()));
+        selection.set_offer(Some(echo(selection.marker.clone())));
+        selection.set(ClipboardItem::new_string("new own source".into()));
+        let latest_marker = selection.marker.clone();
+        // This foreign notification was queued before the compositor accepted the new source.
+        selection.set_offer(Some(echo("UTF8_STRING".into())));
+        selection.set_offer(Some(echo(latest_marker)));
+        assert_eq!(
+            selection.ready().and_then(|item| item.text()).as_deref(),
+            Some("new own source"),
+            "the latest accepted source must own the cache after its compositor echo"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -471,11 +498,12 @@ mod source_identity_tests {
         selection.set_offer(Some(echo(old_marker.clone())));
         assert!(!selection.cancel_source(old.data().unwrap()));
         selection.set_offer(Some(echo(old_marker)));
-        selection.set_offer(Some(echo(new_marker)));
-        assert_eq!(
-            selection.generation,
-            new.data::<SourceData>().unwrap().generation
-        );
+        selection.set_offer(Some(echo("UTF8_STRING".into())));
+        let foreign_generation = selection.generation;
+        let foreign_cancel = selection.cancel.clone();
+        selection.set_offer(Some(echo(new_marker.clone())));
+        assert!(selection.generation > foreign_generation);
+        assert!(foreign_cancel.load(Ordering::Acquire));
         assert_eq!(
             selection.ready().unwrap().text().as_deref(),
             Some("new source")
@@ -486,6 +514,11 @@ mod source_identity_tests {
         assert!(selection.cancel_source(new.data().unwrap()));
         assert!(receive_cancel.load(Ordering::Acquire));
         assert!(selection.ready().is_none());
+        selection.set_offer(Some(echo(new_marker)));
+        assert!(
+            selection.ready().is_none(),
+            "cancelled source echo resurrected ownership"
+        );
     }
     #[test]
     fn source_associated_send_cancel_and_queued_echoes_preserve_latest_owner() {
