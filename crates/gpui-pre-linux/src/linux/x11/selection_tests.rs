@@ -123,6 +123,7 @@ fn clipboard() -> Clipboard<FakeWire> {
         incoming: HashMap::new(),
         changes: Vec::new(),
         decode_jobs: Vec::new(),
+        budget: ReceiveBudget::default(),
         handover: None,
         handover_sent: false,
         handover_checked: false,
@@ -160,6 +161,49 @@ fn review_x11_handover_waits_for_pending_ownership_setup() {
     futures::executor::block_on(receiver).unwrap();
     assert!(!clipboard.handover_pending());
 }
+#[test]
+fn review_x11_late_decoded_success_cannot_overwrite_timeout_or_retry() {
+    for retry in [false, true] {
+        let mut clipboard = clipboard();
+        clipboard.replaced(false, 88);
+        let receiver = clipboard.read(false);
+        let window = clipboard.selections[0].pending.unwrap();
+        let target = clipboard.atoms.UTF8_STRING;
+        let targets = clipboard.atoms.TARGETS;
+        notify(
+            &mut clipboard,
+            window,
+            targets,
+            target.to_ne_bytes().to_vec(),
+            32,
+            AtomEnum::ATOM.into(),
+        );
+        clipboard.wire.reads.borrow_mut().push_back(PropertyData {
+            type_: target,
+            format: 8,
+            bytes: b"queued success".to_vec(),
+            remaining: 0,
+        });
+        clipboard.receive(window, true).unwrap();
+        let decoded = clipboard.decode_jobs.pop().unwrap().run();
+        assert!(decoded.result.is_ok());
+        clipboard.complete_selection(false, Err(ClipboardReadError::TimedOut));
+        assert_eq!(
+            futures::executor::block_on(receiver).unwrap(),
+            Err(ClipboardReadError::TimedOut)
+        );
+        let mut next = retry.then(|| clipboard.read(false));
+        if retry {
+            clipboard.selections[0].decoding = true;
+            clipboard.selections[0].decode_deadline = Some(Instant::now() + TRANSFER_TIMEOUT);
+        }
+        clipboard.finish_decoded(decoded);
+        assert!(clipboard.cached(false).is_none());
+        if let Some(next) = next.as_mut() {
+            assert_eq!(next.try_recv().unwrap(), None);
+        }
+    }
+}
 fn request(clipboard: &Clipboard<FakeWire>, target: Atom) -> SelectionRequestEvent {
     SelectionRequestEvent {
         owner: clipboard.window,
@@ -195,8 +239,9 @@ fn notify(
     flush_decode(clipboard);
 }
 fn flush_decode(clipboard: &mut Clipboard<FakeWire>) {
-    for (primary, generation, representations) in std::mem::take(&mut clipboard.decode_jobs) {
-        clipboard.finish_decode(primary, generation, transfer::decode(representations));
+    for job in std::mem::take(&mut clipboard.decode_jobs) {
+        let decoded = job.run();
+        clipboard.finish_decoded(decoded);
     }
 }
 fn property(
@@ -700,7 +745,14 @@ fn review_x11_replaced_selections_cannot_accumulate_unbounded_decode_jobs() {
         // The real client drains these jobs into background tasks without admission or cancellation.
         // Keep the jobs here until the final assertion rather than completing that background work.
         let jobs = std::mem::take(&mut clipboard.decode_jobs);
-        REVIEW_JOBS.with(|pending| pending.borrow_mut().extend(jobs));
+        REVIEW_JOBS.with(|pending| {
+            let mut pending = pending.borrow_mut();
+            pending.retain(DecodeJob::live);
+            pending.extend(jobs);
+        });
+        let usage = clipboard.budget.0.lock().unwrap();
+        assert!(usage.transfers <= MAX_TRANSFERS);
+        assert!(usage.bytes <= BYTE_LIMIT);
     }
     REVIEW_JOBS.with(|pending| {
         assert!(
@@ -711,7 +763,7 @@ fn review_x11_replaced_selections_cannot_accumulate_unbounded_decode_jobs() {
     });
 }
 thread_local! {
-    static REVIEW_JOBS: RefCell<Vec<(bool, u64, Vec<MimeRepresentation>)>> = const { RefCell::new(Vec::new()) };
+    static REVIEW_JOBS: RefCell<Vec<DecodeJob>> = const { RefCell::new(Vec::new()) };
 }
 
 #[test]
@@ -797,6 +849,7 @@ fn review_x11_decode_completion_rechecks_absolute_deadline() {
     clipboard.replaced(false, 88);
     let receiver = clipboard.read(false);
     let generation = clipboard.selections[0].generation;
+    clipboard.selections[0].decoding = true;
     clipboard.selections[0].decode_deadline = Some(Instant::now());
     clipboard.finish_decode(
         false,
@@ -808,4 +861,64 @@ fn review_x11_decode_completion_rechecks_absolute_deadline() {
         Err(ClipboardReadError::TimedOut)
     );
     assert!(clipboard.cached(false).is_none());
+}
+
+#[test]
+fn review_x11_cancelled_queued_decode_releases_payload_and_skips_decode() {
+    let mut clipboard = clipboard();
+    clipboard.replaced(false, 88);
+    let _receiver = clipboard.read(false);
+    let window = clipboard.selections[0].pending.unwrap();
+    let target = clipboard.atoms.UTF8_STRING;
+    let targets = clipboard.atoms.TARGETS;
+    notify(
+        &mut clipboard,
+        window,
+        targets,
+        target.to_ne_bytes().to_vec(),
+        32,
+        AtomEnum::ATOM.into(),
+    );
+    clipboard.wire.reads.borrow_mut().push_back(PropertyData {
+        type_: target,
+        format: 8,
+        bytes: b"queued".to_vec(),
+        remaining: 0,
+    });
+    clipboard.receive(window, true).unwrap();
+    let job = clipboard.decode_jobs.pop().unwrap();
+    assert_eq!(clipboard.budget.0.lock().unwrap().bytes, 6);
+    clipboard.replaced(false, 89);
+    assert_eq!(clipboard.budget.0.lock().unwrap().bytes, 0);
+    assert_eq!(clipboard.budget.0.lock().unwrap().transfers, 0);
+    assert!(job.slot.lock().unwrap().is_none());
+    assert_eq!(job.run().result, Err(ClipboardReadError::Cancelled));
+}
+#[test]
+fn review_x11_byte_budget_is_aggregate_and_held_through_publish() {
+    let budget = ReceiveBudget::default();
+    let mut first = budget.acquire().unwrap();
+    first.reserve(BYTE_LIMIT).unwrap();
+    let mut second = budget.acquire().unwrap();
+    assert_eq!(second.reserve(1), Err(ClipboardReadError::TooLarge));
+    drop(first);
+    second.reserve(1).unwrap();
+    let slot = Arc::new(Mutex::new(Some(DecodeInput {
+        representations: vec![MimeRepresentation::new("UTF8_STRING", &b"x"[..])],
+        permit: second,
+    })));
+    let job = DecodeJob {
+        primary: false,
+        generation: 1,
+        cancel: transfer::cancelled(),
+        deadline: Instant::now() + TRANSFER_TIMEOUT,
+        slot,
+    };
+    let decoded = job.run();
+    assert!(decoded.result.is_ok());
+    assert_eq!(budget.0.lock().unwrap().bytes, 1);
+    assert_eq!(budget.0.lock().unwrap().transfers, 1);
+    drop(decoded);
+    assert_eq!(budget.0.lock().unwrap().bytes, 0);
+    assert_eq!(budget.0.lock().unwrap().transfers, 0);
 }

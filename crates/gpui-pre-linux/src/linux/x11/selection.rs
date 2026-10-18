@@ -3,7 +3,7 @@ use futures::channel::oneshot;
 use gpui::{ClipboardChange, ClipboardItem, ClipboardReadError, MimePayload, MimeRepresentation};
 use std::{
     collections::{HashMap, VecDeque},
-    sync::Arc,
+    sync::{Arc, Mutex, atomic::Ordering},
     time::Instant,
 };
 use x11rb::{
@@ -90,6 +90,92 @@ fn wire_error(error: anyhow::Error) -> ClipboardReadError {
         .unwrap_or_else(transfer::transport)
 }
 #[derive(Default)]
+struct Usage {
+    transfers: usize,
+    bytes: usize,
+}
+#[derive(Default, Clone)]
+struct ReceiveBudget(Arc<Mutex<Usage>>);
+struct ReceivePermit {
+    budget: ReceiveBudget,
+    bytes: usize,
+}
+impl ReceiveBudget {
+    fn acquire(&self) -> Result<ReceivePermit, ClipboardReadError> {
+        let mut usage = self.0.lock().unwrap();
+        if usage.transfers >= MAX_TRANSFERS {
+            return Err(ClipboardReadError::Unavailable);
+        }
+        usage.transfers += 1;
+        Ok(ReceivePermit {
+            budget: self.clone(),
+            bytes: 0,
+        })
+    }
+}
+impl ReceivePermit {
+    fn reserve(&mut self, bytes: usize) -> Result<(), ClipboardReadError> {
+        let mut usage = self.budget.0.lock().unwrap();
+        if bytes > BYTE_LIMIT.saturating_sub(usage.bytes) {
+            return Err(ClipboardReadError::TooLarge);
+        }
+        usage.bytes += bytes;
+        self.bytes += bytes;
+        Ok(())
+    }
+}
+impl Drop for ReceivePermit {
+    fn drop(&mut self) {
+        let mut usage = self.budget.0.lock().unwrap();
+        usage.transfers -= 1;
+        usage.bytes -= self.bytes;
+    }
+}
+struct DecodeInput {
+    representations: Vec<MimeRepresentation>,
+    permit: ReceivePermit,
+}
+type DecodeSlot = Arc<Mutex<Option<DecodeInput>>>;
+pub(crate) struct DecodeJob {
+    pub primary: bool,
+    pub generation: u64,
+    cancel: transfer::Cancel,
+    deadline: Instant,
+    slot: DecodeSlot,
+}
+pub(crate) struct Decoded {
+    pub primary: bool,
+    pub generation: u64,
+    pub result: Result<ClipboardItem, ClipboardReadError>,
+    cancel: transfer::Cancel,
+    deadline: Instant,
+    _permit: Option<ReceivePermit>,
+}
+impl DecodeJob {
+    fn live(&self) -> bool {
+        !self.cancel.load(Ordering::Acquire) && self.slot.lock().unwrap().is_some()
+    }
+    pub fn run(self) -> Decoded {
+        let input = self.slot.lock().unwrap().take();
+        let (result, permit) = if let Some(input) = input {
+            let result = transfer::check(&self.cancel, self.deadline)
+                .and_then(|()| transfer::decode(input.representations))
+                .and_then(|item| transfer::check(&self.cancel, self.deadline).map(|()| item));
+            (result, Some(input.permit))
+        } else {
+            (Err(ClipboardReadError::Cancelled), None)
+        };
+        Decoded {
+            primary: self.primary,
+            generation: self.generation,
+            result,
+            cancel: self.cancel,
+            deadline: self.deadline,
+            _permit: permit,
+        }
+    }
+}
+#[derive(Default)]
 struct Selection {
     owner: Window,
     generation: u64,
@@ -101,6 +187,8 @@ struct Selection {
     waiters: Vec<oneshot::Sender<ReadResult>>,
     requested: Option<Instant>,
     decode_deadline: Option<Instant>,
+    cancel: transfer::Cancel,
+    queued_decode: Option<DecodeSlot>,
 }
 struct Outgoing {
     target: Atom,
@@ -124,6 +212,7 @@ struct Incoming {
     draining: bool,
     probing: bool,
     waiting: Option<bool>,
+    permit: ReceivePermit,
 }
 
 pub(crate) struct Clipboard<W: SelectionWire = Server> {
@@ -134,7 +223,8 @@ pub(crate) struct Clipboard<W: SelectionWire = Server> {
     outgoing: HashMap<(Window, Atom), Outgoing>,
     incoming: HashMap<Window, Incoming>,
     pub changes: Vec<ClipboardChange>,
-    pub decode_jobs: Vec<(bool, u64, Vec<MimeRepresentation>)>,
+    pub decode_jobs: Vec<DecodeJob>,
+    budget: ReceiveBudget,
     handover: Option<(Instant, Vec<oneshot::Sender<()>>)>,
     handover_sent: bool,
     handover_checked: bool,
@@ -161,6 +251,7 @@ impl Clipboard<Server> {
             incoming: HashMap::new(),
             changes: Vec::new(),
             decode_jobs: Vec::new(),
+            budget: ReceiveBudget::default(),
             handover: None,
             handover_sent: false,
             handover_checked: false,
@@ -311,6 +402,11 @@ impl<W: SelectionWire> Clipboard<W> {
     }
     fn replaced(&mut self, primary: bool, owner: Window) {
         let selection = &mut self.selections[primary as usize];
+        selection.cancel.store(true, Ordering::Release);
+        if let Some(slot) = selection.queued_decode.take() {
+            slot.lock().unwrap().take();
+        }
+        selection.cancel = transfer::cancelled();
         selection.decoding = false;
         selection.decode_deadline = None;
         selection.requested = None;
@@ -371,6 +467,7 @@ impl<W: SelectionWire> Clipboard<W> {
             return Err(ClipboardReadError::Unavailable.into());
         }
         let window = self.wire.window()?;
+        let permit = self.budget.acquire()?;
         let selection = &self.selections[primary as usize];
         let incoming = Incoming {
             primary,
@@ -388,6 +485,7 @@ impl<W: SelectionWire> Clipboard<W> {
             draining: false,
             probing: false,
             waiting: None,
+            permit,
         };
         self.incoming.insert(window, incoming);
         self.selections[primary as usize].pending = Some(window);
@@ -400,6 +498,11 @@ impl<W: SelectionWire> Clipboard<W> {
     }
     fn complete_selection(&mut self, primary: bool, result: ReadResult) {
         let selection = &mut self.selections[primary as usize];
+        selection.cancel.store(true, Ordering::Release);
+        if let Some(slot) = selection.queued_decode.take() {
+            slot.lock().unwrap().take();
+        }
+        selection.cancel = transfer::cancelled();
         selection.decoding = false;
         selection.decode_deadline = None;
         selection.requested = None;
@@ -422,13 +525,23 @@ impl<W: SelectionWire> Clipboard<W> {
             let _ = waiter.send(result.clone());
         }
     }
-    pub fn finish_decode(
+    pub fn finish_decoded(&mut self, decoded: Decoded) {
+        if decoded.cancel.load(Ordering::Acquire) {
+            return;
+        }
+        let result =
+            transfer::check(&decoded.cancel, decoded.deadline).and_then(|()| decoded.result);
+        self.finish_decode(decoded.primary, decoded.generation, result);
+    }
+    fn finish_decode(
         &mut self,
         primary: bool,
         generation: u64,
         result: Result<ClipboardItem, ClipboardReadError>,
     ) {
-        if self.selections[primary as usize].generation == generation {
+        if self.selections[primary as usize].generation == generation
+            && self.selections[primary as usize].decoding
+        {
             let result = if self.selections[primary as usize]
                 .decode_deadline
                 .is_some_and(|deadline| Instant::now() >= deadline)
@@ -740,6 +853,9 @@ impl<W: SelectionWire> Clipboard<W> {
         {
             return Err(ClipboardReadError::TooLarge);
         }
+        if incoming.target != self.atoms.TARGETS {
+            incoming.permit.reserve(property.bytes.len())?;
+        }
         let empty = property.bytes.is_empty();
         incoming.chunk.extend_from_slice(&property.bytes);
         incoming.offset += (property.bytes.len() / 4) as u32;
@@ -799,16 +915,26 @@ impl<W: SelectionWire> Clipboard<W> {
                 self.complete_selection(primary, Err(ClipboardReadError::UnsupportedContent));
             } else {
                 let generation = incoming.generation;
-                let representations = std::mem::take(&mut incoming.representations);
                 let deadline = incoming.deadline;
-                self.incoming.remove(&window);
+                let incoming = self.incoming.remove(&window).unwrap();
+                let slot = Arc::new(Mutex::new(Some(DecodeInput {
+                    representations: incoming.representations,
+                    permit: incoming.permit,
+                })));
                 self.wire.destroy(window);
                 let selection = &mut self.selections[primary as usize];
                 selection.pending = None;
                 selection.decoding = true;
                 selection.decode_deadline = Some(deadline);
-                self.decode_jobs
-                    .push((primary, generation, representations));
+                selection.queued_decode = Some(slot.clone());
+                self.decode_jobs.retain(DecodeJob::live);
+                self.decode_jobs.push(DecodeJob {
+                    primary,
+                    generation,
+                    cancel: selection.cancel.clone(),
+                    deadline,
+                    slot,
+                });
             }
         }
         Ok(())

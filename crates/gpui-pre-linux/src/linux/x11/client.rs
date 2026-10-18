@@ -1916,23 +1916,16 @@ impl X11Client {
         for event in std::mem::take(&mut state.clipboard.changes) {
             crate::linux::transfer::notify_clipboard(&state.common, event);
         }
-        for (primary, generation, representations) in
-            std::mem::take(&mut state.clipboard.decode_jobs)
-        {
+        for job in std::mem::take(&mut state.clipboard.decode_jobs) {
             let this = state.this.clone();
             let background = state.common.borrow().background_executor.clone();
             let foreground = state.common.borrow().foreground_executor.clone();
-            let task =
-                background.spawn(async move { crate::linux::transfer::decode(representations) });
+            let task = background.spawn(async move { job.run() });
             foreground
                 .spawn(async move {
-                    let result = task.await;
+                    let decoded = task.await;
                     if let Some(client) = this.get_client() {
-                        client
-                            .0
-                            .borrow_mut()
-                            .clipboard
-                            .finish_decode(primary, generation, result);
+                        client.0.borrow_mut().clipboard.finish_decoded(decoded);
                         client.clipboard_progress();
                     }
                 })
