@@ -123,7 +123,7 @@ pub(crate) fn snapshot(item: &ClipboardItem) -> Result<MimePayload, ClipboardRea
 
 pub(crate) fn paths(payload: &MimePayload) -> Result<ExternalPaths, ClipboardReadError> {
     let gnome = payload.get(GNOME_FILES);
-    let bytes = gnome.as_ref().or_else(|| None).cloned().or_else(|| payload.get(URI_LIST));
+    let bytes = gnome.clone().or_else(|| payload.get(URI_LIST));
     let Some(bytes) = bytes else { return Ok(ExternalPaths::default()); };
     let text = std::str::from_utf8(&bytes).map_err(transport)?;
     let mut lines = text.lines();

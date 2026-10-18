@@ -548,8 +548,6 @@ impl LinuxPlatform {
 impl Drop for LinuxPlatform {
     fn drop(&mut self) {
         self.replace_connection(DisplayConnection::Headless(HeadlessConnection::new()));
-        #[cfg(feature = "x11")]
-        crate::linux::wait_for_clipboard_handovers();
     }
 }
 
@@ -628,8 +626,6 @@ impl Platform for LinuxPlatform {
         if let Some(mut fun) = quit {
             fun();
         }
-        #[cfg(feature = "x11")]
-        crate::linux::wait_for_clipboard_handovers();
     }
 
     fn quit(&self) {

@@ -248,6 +248,7 @@ version = "0.13.1"
 features = [
     "allow-unsafe-code",
     "xkb",
+    "xfixes",
     "randr",
     "xinput",
     "cursor",

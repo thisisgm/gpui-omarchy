@@ -43,7 +43,7 @@ use xkbcommon::xkb::{self as xkbc, STATE_LAYOUT_EFFECTIVE};
 use super::{
     ButtonOrScroll, ScrollDirection, X11Display, X11WindowStatePtr, XcbAtoms, XimCallbackEvent,
     XimHandler, button_or_scroll_from_event_detail, check_reply,
-    clipboard::{self, Clipboard},
+    selection::Clipboard,
     get_reply, get_valuator_axis_index, handle_connection_error, modifiers_from_state,
     pressed_button_from_mask, xcb_flush,
 };
@@ -237,7 +237,7 @@ pub struct X11ClientState {
 
     pub(crate) common: Rc<RefCell<LinuxCommon>>,
     pub(crate) clipboard: Clipboard,
-    pub(crate) clipboard_item: Option<ClipboardItem>,
+    clipboard_timer: Option<RegistrationToken>,
     pub(crate) xdnd_state: Xdnd,
 }
 
@@ -337,6 +337,7 @@ impl Drop for X11Connection {
     fn drop(&mut self) {
         let mut state = self.0.0.borrow_mut();
         state.common.borrow_mut().after_runnable = None;
+        if let Some(token) = state.clipboard_timer.take() { state.loop_handle.remove(token); }
         for token in std::mem::take(&mut state.registrations) {
             state.loop_handle.remove(token);
         }
@@ -483,7 +484,7 @@ impl X11Connection {
             .reply()
             .context("Failed to initialize cursor theme handler")?;
 
-        let clipboard = Clipboard::new(display).context("Failed to initialize clipboard")?;
+        let clipboard = Clipboard::new(xcb_connection.clone(), xcb_connection.setup().roots[x_root_index].root).context("Failed to initialize clipboard")?;
 
         let screen = &xcb_connection.setup().roots[x_root_index];
         let compositor_gpu = detect_compositor_gpu(&xcb_connection, screen);
@@ -552,7 +553,7 @@ impl X11Connection {
                 supports_xinput_gestures,
 
                 clipboard,
-                clipboard_item: None,
+                clipboard_timer: None,
                 xdnd_state: Xdnd::default(),
             })
         })));
@@ -880,6 +881,10 @@ impl X11Client {
     }
 
     fn handle_event(&self, event: Event) -> Option<()> {
+        let selection_event = self.0.borrow_mut().clipboard.handle_event(&event);
+        self.clipboard_progress();
+        match selection_event { Ok(true) => return Some(()), Err(error) => { log::debug!("native clipboard event: {error}"); return Some(()); }, Ok(false) => (), }
+
         match event {
             Event::UnmapNotify(event) => {
                 let mut state = self.0.borrow_mut();
@@ -1823,57 +1828,34 @@ impl X11Client {
         );
     }
 
-    pub(crate) fn write_to_primary(&self, item: gpui::ClipboardItem) {
-        let state = self.0.borrow_mut();
-        state
-            .clipboard
-            .set_text(
-                std::borrow::Cow::Owned(item.text().unwrap_or_default()),
-                clipboard::ClipboardKind::Primary,
-                clipboard::WaitConfig::None,
-            )
-            .context("X11 Failed to write to clipboard (primary)")
-            .log_with_level(log::Level::Debug);
+    pub(crate) fn write_to_primary(&self, item: gpui::ClipboardItem) { self.set_clipboard(true, item); }
+    pub(crate) fn write_to_clipboard(&self, item: gpui::ClipboardItem) { self.set_clipboard(false, item); }
+    fn set_clipboard(&self, primary: bool, item: gpui::ClipboardItem) {
+        let result = self.0.borrow_mut().clipboard.set(primary, item);
+        if let Err(error) = result { log::debug!("native clipboard write: {error}"); }
+        self.clipboard_progress();
     }
-
-    pub(crate) fn write_to_clipboard(&self, item: gpui::ClipboardItem) {
+    pub(crate) fn read_from_primary(&self) -> Option<gpui::ClipboardItem> { self.0.borrow().clipboard.cached(true) }
+    pub(crate) fn read_from_clipboard(&self) -> Option<gpui::ClipboardItem> { self.0.borrow().clipboard.cached(false) }
+    pub(crate) fn read_from_clipboard_async(&self) -> gpui::Task<Result<Option<gpui::ClipboardItem>, gpui::ClipboardReadError>> {
+        let receiver = self.0.borrow_mut().clipboard.read(false);
+        self.clipboard_progress();
+        self.0.borrow().common.borrow().foreground_executor.spawn(async move { receiver.await.unwrap_or(Err(gpui::ClipboardReadError::Cancelled)) })
+    }
+    fn clipboard_progress(&self) {
         let mut state = self.0.borrow_mut();
-        state
-            .clipboard
-            .set_text(
-                std::borrow::Cow::Owned(item.text().unwrap_or_default()),
-                clipboard::ClipboardKind::Clipboard,
-                clipboard::WaitConfig::None,
-            )
-            .context("X11: Failed to write to clipboard (clipboard)")
-            .log_with_level(log::Level::Debug);
-        state.clipboard_item.replace(item);
-    }
-
-    pub(crate) fn read_from_primary(&self) -> Option<gpui::ClipboardItem> {
-        let state = self.0.borrow_mut();
-        state
-            .clipboard
-            .get_any(clipboard::ClipboardKind::Primary)
-            .context("X11: Failed to read from clipboard (primary)")
-            .log_with_level(log::Level::Debug)
-    }
-
-    pub(crate) fn read_from_clipboard(&self) -> Option<gpui::ClipboardItem> {
-        let state = self.0.borrow_mut();
-        // if the last copy was from this app, return our cached item
-        // which has metadata attached.
-        if state
-            .clipboard
-            .is_owner(clipboard::ClipboardKind::Clipboard)
-        {
-            return state.clipboard_item.clone();
-        }
-        state
-            .clipboard
-            .get_any(clipboard::ClipboardKind::Clipboard)
-            .context("X11: Failed to read from clipboard (clipboard)")
-            .log_with_level(log::Level::Debug)
+        for event in std::mem::take(&mut state.clipboard.changes) { crate::linux::transfer::notify_clipboard(&state.common, event); }
+        if !state.clipboard.active() || state.clipboard_timer.is_some() { return; }
+        let this = state.this.clone();
+        let token = state.loop_handle.insert_source(calloop::timer::Timer::from_duration(Duration::from_millis(1)), move |_, _, _| {
+            let Some(client) = this.get_client() else { return calloop::timer::TimeoutAction::Drop; };
+            client.0.borrow_mut().clipboard.tick();
+            client.clipboard_progress();
+            let mut state = client.0.borrow_mut();
+            if state.clipboard.active() { calloop::timer::TimeoutAction::ToDuration(Duration::from_millis(5)) }
+            else { state.clipboard_timer = None; calloop::timer::TimeoutAction::Drop }
+        });
+        match token { Ok(token) => state.clipboard_timer = Some(token), Err(error) => log::error!("native clipboard deadline timer: {error}") }
     }
 
     pub(crate) fn active_window(&self) -> Option<AnyWindowHandle> {
