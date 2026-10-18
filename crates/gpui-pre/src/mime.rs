@@ -44,6 +44,7 @@ pub enum SelectionIntent {
 pub struct MimePayload {
     representations: Arc<[MimeRepresentation]>,
     intent: SelectionIntent,
+    offered_types: Arc<[String]>,
 }
 
 impl MimePayload {
@@ -62,10 +63,36 @@ impl MimePayload {
                 unique.push(representation);
             }
         }
+        let offered_types = unique
+            .iter()
+            .map(|representation| representation.mime_type().to_owned())
+            .collect::<Vec<_>>()
+            .into();
         Self {
             representations: unique.into(),
             intent,
+            offered_types,
         }
+    }
+
+    /// Records bounded native offered names, including alternatives whose bytes were not fetched.
+    pub fn with_offered_types(mut self, names: impl IntoIterator<Item = String>) -> Self {
+        let mut offered = Vec::new();
+        for name in names {
+            if offered.len() >= 64 {
+                break;
+            }
+            if !name.is_empty() && name.len() <= 4096 && !offered.contains(&name) {
+                offered.push(name);
+            }
+        }
+        self.offered_types = offered.into();
+        self
+    }
+
+    /// Bounded native offered names; these names alone do not validate application data.
+    pub fn offered_types(&self) -> &[String] {
+        &self.offered_types
     }
 
     /// All representations, in caller preference order.

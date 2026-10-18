@@ -87,7 +87,7 @@ impl<T: ReceiveData> ReadRequest<T> {
             representations.push(MimeRepresentation::new(mime, bytes));
         }
         transfer::check(&self.cancel, self.deadline)?;
-        transfer::decode(representations)
+        transfer::decode_offered(representations, self._offer.mime_types)
     }
 }
 

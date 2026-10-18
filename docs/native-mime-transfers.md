@@ -1,6 +1,6 @@
 # Native MIME transfers on Linux
 
-`ClipboardItem::new_mime` and `ExternalDragPayload::Mime` carry immutable `MimeRepresentation` values. Each representation has its own exact type and `Arc<[u8]>` bytes. Cloning the payload shares those bytes. Type names supplied by an application are opaque to GPUI.
+`ClipboardItem::new_mime` and `ExternalDragPayload::Mime` carry immutable `MimeRepresentation` values. Each representation has its own exact type and `Arc<[u8]>` bytes. Cloning the payload shares those bytes. Type names supplied by an application are opaque to GPUI. `MimePayload::offered_types` exposes bounded native offered names, including unfetched standard alternatives. `with_offered_types` records at most 64 distinct names of at most 4096 bytes each. X11 resolves TARGETS names asynchronously and requests the preferred standard representation plus offered opaque MIME representations. They share one aggregate byte ceiling and one absolute deadline.
 
 Text and image constructors remain available. An `ExternalPaths` clipboard entry advertises escaped local file URLs through `text/uri-list`, GNOME's `copy` file representation, and plain-text aliases. To publish Cut intent, supply both the URI and GNOME representations with `SelectionIntent::Cut`:
 

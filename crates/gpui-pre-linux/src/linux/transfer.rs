@@ -254,8 +254,15 @@ pub(crate) fn paths(payload: &MimePayload) -> Result<ExternalPaths, ClipboardRea
     Ok(paths)
 }
 
+#[cfg(test)]
 pub(crate) fn decode(
     representations: Vec<MimeRepresentation>,
+) -> Result<ClipboardItem, ClipboardReadError> {
+    decode_offered(representations, Vec::new())
+}
+pub(crate) fn decode_offered(
+    representations: Vec<MimeRepresentation>,
+    offered_types: Vec<String>,
 ) -> Result<ClipboardItem, ClipboardReadError> {
     let intent = representations
         .iter()
@@ -269,6 +276,11 @@ pub(crate) fn decode(
         })
         .unwrap_or_default();
     let payload = MimePayload::new(representations, intent);
+    let payload = if offered_types.is_empty() {
+        payload
+    } else {
+        payload.with_offered_types(offered_types)
+    };
     let mut entries = vec![ClipboardEntry::Mime(payload.clone())];
     if payload.get(GNOME_FILES).is_some() || payload.get(URI_LIST).is_some() {
         entries.push(ClipboardEntry::ExternalPaths(paths(&payload)?));
@@ -617,4 +629,28 @@ pub(crate) fn destination_actions(
         common.callbacks.native_offer = Some(callback);
     }
     actions
+}
+
+#[cfg(test)]
+mod review_main_thread_work {
+    use super::*;
+    #[test]
+    fn review_drag_uri_decode_work_on_foreground_path() {
+        let bytes = b"file:///fixture/example.txt\r\n".repeat(PATH_LIMIT);
+        let payload = MimePayload::new(
+            [MimeRepresentation::new(URI_LIST, bytes)],
+            SelectionIntent::Copy,
+        );
+        let mut samples = Vec::new();
+        for _ in 0..3 {
+            let start = Instant::now();
+            let decoded = paths(&payload).unwrap();
+            samples.push(start.elapsed());
+            assert_eq!(decoded.paths().len(), PATH_LIMIT);
+        }
+        println!(
+            "review: paths() foreground call over {} offered paths: {samples:?}",
+            PATH_LIMIT
+        );
+    }
 }

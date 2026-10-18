@@ -4,6 +4,7 @@ use x11rb::protocol::xproto::{self, SelectionNotifyEvent};
 #[derive(Default)]
 struct FakeWire {
     next: Cell<u32>,
+    names: RefCell<HashMap<Atom, String>>,
     reply_delay: Cell<std::time::Duration>,
     owner: Cell<Window>,
     reply_ready: Cell<Option<Instant>>,
@@ -17,14 +18,31 @@ struct FakeWire {
 }
 impl SelectionWire for FakeWire {
     fn atom(&self, name: &str) -> anyhow::Result<Atom> {
-        Ok(match name {
+        let atom = match name {
             transfer::URI_LIST => 10,
             transfer::GNOME_FILES => 11,
             "UTF8_STRING" => 12,
             "text/plain;charset=utf-8" => 13,
             "text/plain" => 14,
             _ => 100 + name.bytes().map(u32::from).sum::<u32>(),
-        })
+        };
+        self.names.borrow_mut().insert(atom, name.into());
+        Ok(atom)
+    }
+    fn name(&self, atom: Atom) -> anyhow::Result<String> {
+        Ok(self
+            .names
+            .borrow()
+            .get(&atom)
+            .cloned()
+            .unwrap_or_else(|| match atom {
+                10 => transfer::URI_LIST.into(),
+                11 => transfer::GNOME_FILES.into(),
+                12 => "UTF8_STRING".into(),
+                13 => "text/plain;charset=utf-8".into(),
+                14 => "text/plain".into(),
+                _ => String::new(),
+            }))
     }
     fn window(&self) -> anyhow::Result<Window> {
         let window = self.next.get() + 100;
@@ -786,10 +804,42 @@ fn review_x11_foreign_custom_mime_survives_public_payload_roundtrip() {
         32,
         AtomEnum::ATOM.into(),
     );
+    assert_eq!(clipboard.incoming[&window].target, target);
+    assert!(
+        clipboard
+            .wire
+            .conversions
+            .borrow()
+            .iter()
+            .any(|(_, _, atom)| *atom == target)
+    );
+    notify(
+        &mut clipboard,
+        window,
+        target,
+        b"opaque token".to_vec(),
+        8,
+        target,
+    );
     let result = futures::executor::block_on(receiver).unwrap();
     assert!(
         result.is_ok(),
         "public MIME representation was rejected before requesting its bytes: {result:?}"
+    );
+    let item = result.unwrap().unwrap();
+    assert_eq!(
+        &*item.mime_payload().unwrap().get(mime).unwrap(),
+        b"opaque token"
+    );
+    assert_eq!(
+        item.mime_payload().unwrap().offered_types(),
+        &[mime.to_owned()]
+    );
+    assert!(
+        !item
+            .entries
+            .iter()
+            .any(|entry| matches!(entry, gpui::ClipboardEntry::ExternalPaths(_)))
     );
 }
 
@@ -908,6 +958,7 @@ fn review_x11_byte_budget_is_aggregate_and_held_through_publish() {
     second.reserve(1).unwrap();
     let slot = Arc::new(Mutex::new(Some(DecodeInput {
         representations: vec![MimeRepresentation::new("UTF8_STRING", &b"x"[..])],
+        offered_types: Vec::new(),
         permit: second,
     })));
     let job = DecodeJob {
@@ -947,6 +998,106 @@ fn review_x11_uncached_sync_read_starts_acquisition_once() {
     assert!(clipboard.cached_or_request(true).is_none());
     assert!(clipboard.selections[1].pending.is_some());
     assert_eq!(clipboard.wire.conversions.borrow().len(), 1);
+}
+
+#[test]
+fn review_x11_file_plus_token_roundtrip_keeps_preferred_standard_and_opaque_bytes() {
+    for primary in [false, true] {
+        let mut clipboard = clipboard();
+        clipboard.replaced(primary, 88);
+        let receiver = clipboard.read(primary);
+        let window = clipboard.selections[primary as usize].pending.unwrap();
+        let gnome = clipboard.wire.atom(transfer::GNOME_FILES).unwrap();
+        let uri = clipboard.wire.atom(transfer::URI_LIST).unwrap();
+        let token = clipboard.wire.atom("application/x-test-token").unwrap();
+        let targets = clipboard.atoms.TARGETS;
+        notify(
+            &mut clipboard,
+            window,
+            targets,
+            [uri, token, gnome]
+                .into_iter()
+                .flat_map(u32::to_ne_bytes)
+                .collect(),
+            32,
+            AtomEnum::ATOM.into(),
+        );
+        assert_eq!(clipboard.incoming[&window].target, gnome);
+        notify(
+            &mut clipboard,
+            window,
+            gnome,
+            b"cut\nfile:///fixture/a\n".to_vec(),
+            8,
+            gnome,
+        );
+        assert_eq!(clipboard.incoming[&window].target, token);
+        notify(
+            &mut clipboard,
+            window,
+            token,
+            b"file-token".to_vec(),
+            8,
+            token,
+        );
+        let item = futures::executor::block_on(receiver)
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let payload = item.mime_payload().unwrap();
+        assert_eq!(payload.intent(), gpui::SelectionIntent::Cut);
+        assert_eq!(
+            &*payload.get("application/x-test-token").unwrap(),
+            b"file-token"
+        );
+        assert!(payload.get(transfer::URI_LIST).is_none());
+        assert!(payload.offered_types().contains(&transfer::URI_LIST.into()));
+        assert!(item.entries.iter().any(|entry| matches!(entry, gpui::ClipboardEntry::ExternalPaths(paths) if paths.paths() == [std::path::PathBuf::from("/fixture/a")])));
+    }
+}
+#[test]
+fn review_x11_multiple_representations_share_one_deadline() {
+    let mut clipboard = clipboard();
+    clipboard.replaced(false, 88);
+    let receiver = clipboard.read(false);
+    let window = clipboard.selections[0].pending.unwrap();
+    let standard = clipboard.atoms.UTF8_STRING;
+    let token = clipboard.wire.atom("application/x-test-token").unwrap();
+    let targets = clipboard.atoms.TARGETS;
+    notify(
+        &mut clipboard,
+        window,
+        targets,
+        [standard, token]
+            .into_iter()
+            .flat_map(u32::to_ne_bytes)
+            .collect(),
+        32,
+        AtomEnum::ATOM.into(),
+    );
+    let deadline = clipboard.incoming[&window].deadline;
+    notify(
+        &mut clipboard,
+        window,
+        standard,
+        b"standard".to_vec(),
+        8,
+        standard,
+    );
+    assert_eq!(clipboard.incoming[&window].deadline, deadline);
+    clipboard.incoming.get_mut(&window).unwrap().deadline = Instant::now();
+    notify(
+        &mut clipboard,
+        window,
+        token,
+        b"late token".to_vec(),
+        8,
+        token,
+    );
+    assert_eq!(
+        futures::executor::block_on(receiver).unwrap(),
+        Err(ClipboardReadError::TimedOut)
+    );
 }
 
 #[test]

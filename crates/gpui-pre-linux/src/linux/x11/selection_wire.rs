@@ -44,12 +44,14 @@ struct Reply {
 enum Query {
     Atom(String),
     FixesVersion,
+    Name(Atom),
     Owner(Atom),
     Window,
     Property(Window, Atom, u32),
 }
 enum Value {
     Atom(Atom),
+    Name(String),
     Window(Window),
     Property(PropertyData),
 }
@@ -261,6 +263,27 @@ impl SelectionWire for Server {
         }
         self.atoms.borrow_mut().insert(name.into(), atom);
         Ok(atom)
+    }
+    fn name(&self, atom: Atom) -> anyhow::Result<String> {
+        let Value::Name(name) = self.query(
+            Query::Name(atom),
+            move |connection, replies, sender, deadline| match connection.get_atom_name(atom) {
+                Ok(cookie) => remember(cookie, deadline, replies, sender, |reply| {
+                    Value::Name(if reply.name.len() <= 4096 {
+                        String::from_utf8(reply.name).unwrap_or_default()
+                    } else {
+                        String::new()
+                    })
+                }),
+                Err(error) => {
+                    let _ = sender.try_send(Err(error.into()));
+                }
+            },
+        )?
+        else {
+            unreachable!()
+        };
+        Ok(name)
     }
     fn window(&self) -> anyhow::Result<Window> {
         let root = self.root;

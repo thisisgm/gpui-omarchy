@@ -57,6 +57,7 @@ pub(crate) trait SelectionWire {
         Ok(())
     }
     fn atom(&self, name: &str) -> anyhow::Result<Atom>;
+    fn name(&self, atom: Atom) -> anyhow::Result<String>;
     fn window(&self) -> anyhow::Result<Window>;
     fn destroy(&self, window: Window);
     fn owner(&self, selection: Atom) -> anyhow::Result<Window>;
@@ -133,6 +134,7 @@ impl Drop for ReceivePermit {
 }
 struct DecodeInput {
     representations: Vec<MimeRepresentation>,
+    offered_types: Vec<String>,
     permit: ReceivePermit,
 }
 type DecodeSlot = Arc<Mutex<Option<DecodeInput>>>;
@@ -159,7 +161,7 @@ impl DecodeJob {
         let input = self.slot.lock().unwrap().take();
         let (result, permit) = if let Some(input) = input {
             let result = transfer::check(&self.cancel, self.deadline)
-                .and_then(|()| transfer::decode(input.representations))
+                .and_then(|()| transfer::decode_offered(input.representations, input.offered_types))
                 .and_then(|item| transfer::check(&self.cancel, self.deadline).map(|()| item));
             (result, Some(input.permit))
         } else {
@@ -212,6 +214,9 @@ struct Incoming {
     draining: bool,
     probing: bool,
     waiting: Option<bool>,
+    available: Vec<Atom>,
+    names: Vec<(Atom, String)>,
+    naming: bool,
     permit: ReceivePermit,
 }
 
@@ -528,6 +533,9 @@ impl<W: SelectionWire> Clipboard<W> {
             draining: false,
             probing: false,
             waiting: None,
+            available: Vec::new(),
+            names: Vec::new(),
+            naming: false,
             permit,
         };
         self.incoming.insert(window, incoming);
@@ -916,20 +924,14 @@ impl<W: SelectionWire> Clipboard<W> {
         }
         incoming.incr = false;
         if incoming.target == self.atoms.TARGETS {
-            let mut available = Vec::new();
-            for bytes in incoming.chunk.chunks_exact(4) {
-                let atom = u32::from_ne_bytes(bytes.try_into().unwrap());
-                available.push(atom);
-            }
+            incoming.available = incoming
+                .chunk
+                .chunks_exact(4)
+                .map(|bytes| u32::from_ne_bytes(bytes.try_into().unwrap()))
+                .collect();
             incoming.chunk.clear();
-            let desired = preferred_mime_types();
-            for mime in desired {
-                let atom = self.wire.atom(&mime).map_err(transfer::transport)?;
-                if available.contains(&atom) {
-                    incoming.types.push_back((atom, mime));
-                    break;
-                }
-            }
+            incoming.naming = true;
+            return self.resolve_types(window);
         } else {
             if incoming.probing {
                 incoming.types.clear();
@@ -940,6 +942,44 @@ impl<W: SelectionWire> Clipboard<W> {
                 std::mem::take(&mut incoming.chunk),
             ));
         }
+        self.advance_type(window)
+    }
+    fn resolve_types(&mut self, window: Window) -> Result<(), ClipboardReadError> {
+        let incoming = self.incoming.get_mut(&window).unwrap();
+        if Instant::now() >= incoming.deadline {
+            return Err(ClipboardReadError::TimedOut);
+        }
+        while incoming.names.len() < incoming.available.len() {
+            let atom = incoming.available[incoming.names.len()];
+            let name = match self.wire.name(atom) {
+                Ok(name) => name,
+                Err(error) if pending(&error) => return Ok(()),
+                Err(error) => return Err(wire_error(error)),
+            };
+            incoming.names.push((atom, name));
+        }
+        let preferred = preferred_mime_types();
+        if let Some((atom, name)) = preferred
+            .iter()
+            .find_map(|name| incoming.names.iter().find(|(_, offered)| offered == name))
+        {
+            incoming.types.push_back((*atom, name.clone()));
+        }
+        for (atom, name) in &incoming.names {
+            if name.contains('/')
+                && name.len() <= 4096
+                && !preferred.contains(name)
+                && !name.starts_with("pid/")
+                && !incoming.types.iter().any(|(_, selected)| selected == name)
+            {
+                incoming.types.push_back((*atom, name.clone()));
+            }
+        }
+        incoming.naming = false;
+        self.advance_type(window)
+    }
+    fn advance_type(&mut self, window: Window) -> Result<(), ClipboardReadError> {
+        let incoming = self.incoming.get_mut(&window).unwrap();
         if let Some((target, mime)) = incoming.types.pop_front() {
             incoming.target = target;
             incoming.mime = Some(mime);
@@ -962,6 +1002,12 @@ impl<W: SelectionWire> Clipboard<W> {
                 let incoming = self.incoming.remove(&window).unwrap();
                 let slot = Arc::new(Mutex::new(Some(DecodeInput {
                     representations: incoming.representations,
+                    offered_types: incoming
+                        .names
+                        .into_iter()
+                        .map(|(_, name)| name)
+                        .filter(|name| !name.is_empty())
+                        .collect(),
                     permit: incoming.permit,
                 })));
                 self.wire.destroy(window);
@@ -1111,6 +1157,10 @@ impl<W: SelectionWire> Clipboard<W> {
             let primary = incoming.primary;
             if Instant::now() >= incoming.deadline {
                 self.complete_selection(primary, Err(ClipboardReadError::TimedOut));
+            } else if incoming.naming {
+                if let Err(error) = self.resolve_types(window) {
+                    self.complete_selection(primary, Err(error));
+                }
             } else if (incoming.draining || incoming.waiting.is_some())
                 && let Err(error) = self.receive(window, incoming.waiting.unwrap_or(false))
             {
