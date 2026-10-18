@@ -62,6 +62,9 @@ const FILE_PICKER_PORTAL_MISSING: &str =
 
 #[derive(Default)]
 pub(crate) struct PlatformHandlers {
+    pub(crate) clipboard_change: Option<Box<dyn FnMut(gpui::ClipboardChange)>>,
+    pub(crate) native_drop: Option<Box<dyn FnMut(gpui::NativeDropEvent) -> bool>>,
+    pub(crate) native_drag: Option<Box<dyn FnMut(gpui::NativeDragEvent)>>,
     pub(crate) open_urls: Option<Box<dyn FnMut(Vec<String>)>>,
     pub(crate) quit: Option<Box<dyn FnMut() -> bool>>,
     pub(crate) reopen: Option<Box<dyn FnMut()>>,
@@ -1108,6 +1111,22 @@ impl Platform for LinuxPlatform {
 
     fn write_to_primary(&self, item: ClipboardItem) {
         self.connection.borrow().write_to_primary(item)
+    }
+
+    fn on_clipboard_change(&self, callback: Box<dyn FnMut(gpui::ClipboardChange)>) {
+        self.common.borrow_mut().callbacks.clipboard_change = Some(callback);
+    }
+
+    fn on_native_drop(&self, callback: Box<dyn FnMut(gpui::NativeDropEvent) -> bool>) {
+        self.common.borrow_mut().callbacks.native_drop = Some(callback);
+    }
+
+    fn on_native_drag(&self, callback: Box<dyn FnMut(gpui::NativeDragEvent)>) {
+        self.common.borrow_mut().callbacks.native_drag = Some(callback);
+    }
+
+    fn read_from_clipboard_async(&self) -> Task<Result<Option<ClipboardItem>, gpui::ClipboardReadError>> {
+        self.connection.borrow().read_from_clipboard_async()
     }
 
     fn write_to_clipboard(&self, item: ClipboardItem) {
