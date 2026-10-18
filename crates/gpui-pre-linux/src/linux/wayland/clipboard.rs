@@ -1,257 +1,134 @@
-use std::{
-    fs::File,
-    io::{ErrorKind, Write},
-    os::fd::{AsRawFd, BorrowedFd, OwnedFd},
-};
-
-use calloop::{LoopHandle, PostAction};
+use std::{fs::File, os::fd::{AsRawFd, BorrowedFd, OwnedFd, FromRawFd, IntoRawFd}, sync::{Arc, atomic::Ordering}, time::Instant};
 use filedescriptor::Pipe;
-use strum::IntoEnumIterator;
+use gpui::{ClipboardItem, ClipboardReadError, MimePayload, MimeRepresentation};
 use wayland_client::{Connection, protocol::wl_data_offer::WlDataOffer};
 use wayland_protocols::wp::primary_selection::zv1::client::zwp_primary_selection_offer_v1::ZwpPrimarySelectionOfferV1;
+use crate::linux::transfer::{self, Cancel, BYTE_LIMIT, TYPE_LIMIT, TRANSFER_TIMEOUT};
 
-use crate::linux::platform::{PIPE_READ_TIMEOUT, read_fd_with_timeout};
-use gpui::{ClipboardEntry, ClipboardItem, Image, ImageFormat, hash};
+pub(crate) const FILE_LIST_MIME_TYPE: &str = transfer::URI_LIST;
 
-/// Text mime types that we'll offer to other programs.
-pub(crate) const TEXT_MIME_TYPES: [&str; 3] =
-    ["text/plain;charset=utf-8", "UTF8_STRING", "text/plain"];
-pub(crate) const FILE_LIST_MIME_TYPE: &str = "text/uri-list";
-
-/// Text mime types that we'll accept from other programs.
-pub(crate) const ALLOWED_TEXT_MIME_TYPES: [&str; 2] = ["text/plain;charset=utf-8", "UTF8_STRING"];
-
-pub(crate) struct Clipboard {
-    connection: Connection,
-    loop_handle: LoopHandle<'static, ()>,
-    self_mime: String,
-
-    // Internal clipboard
-    contents: Option<ClipboardItem>,
-    primary_contents: Option<ClipboardItem>,
-
-    // External clipboard
-    cached_read: Option<ClipboardItem>,
-    current_offer: Option<DataOffer<WlDataOffer>>,
-    cached_primary_read: Option<ClipboardItem>,
-    current_primary_offer: Option<DataOffer<ZwpPrimarySelectionOfferV1>>,
-}
-
-pub(crate) trait ReceiveData {
+pub(crate) trait ReceiveData: Clone {
     fn receive_data(&self, mime_type: String, fd: BorrowedFd<'_>);
+    fn destroy_offer(&self);
 }
-
 impl ReceiveData for WlDataOffer {
-    fn receive_data(&self, mime_type: String, fd: BorrowedFd<'_>) {
-        self.receive(mime_type, fd);
-    }
+    fn receive_data(&self, mime_type: String, fd: BorrowedFd<'_>) { self.receive(mime_type, fd); }
+    fn destroy_offer(&self) { self.destroy(); }
 }
-
 impl ReceiveData for ZwpPrimarySelectionOfferV1 {
-    fn receive_data(&self, mime_type: String, fd: BorrowedFd<'_>) {
-        self.receive(mime_type, fd);
-    }
+    fn receive_data(&self, mime_type: String, fd: BorrowedFd<'_>) { self.receive(mime_type, fd); }
+    fn destroy_offer(&self) { self.destroy(); }
 }
+struct OfferLife<T: ReceiveData>(T);
+impl<T: ReceiveData> Drop for OfferLife<T> { fn drop(&mut self) { self.0.destroy_offer(); } }
 
-#[derive(Clone, Debug)]
-/// Wrapper for `WlDataOffer` and `ZwpPrimarySelectionOfferV1`, used to help track mime types.
+#[derive(Clone)]
 pub(crate) struct DataOffer<T: ReceiveData> {
     pub inner: T,
-    mime_types: Vec<String>,
+    pub mime_types: Vec<String>,
+    _life: Arc<OfferLife<T>>,
 }
-
 impl<T: ReceiveData> DataOffer<T> {
-    pub fn new(offer: T) -> Self {
-        Self {
-            inner: offer,
-            mime_types: Vec::new(),
-        }
-    }
-
+    pub fn new(inner: T) -> Self { Self { _life: Arc::new(OfferLife(inner.clone())), inner, mime_types: Vec::new() } }
     pub fn add_mime_type(&mut self, mime_type: String) {
-        self.mime_types.push(mime_type)
+        if self.mime_types.len() < TYPE_LIMIT && !self.mime_types.contains(&mime_type) { self.mime_types.push(mime_type); }
     }
-
-    fn has_mime_type(&self, mime_type: &str) -> bool {
-        self.mime_types.iter().any(|t| t == mime_type)
-    }
-
-    fn read_bytes(&self, connection: &Connection, mime_type: &str) -> Option<Vec<u8>> {
-        let pipe = Pipe::new().unwrap();
-        self.inner.receive_data(mime_type.to_string(), unsafe {
-            BorrowedFd::borrow_raw(pipe.write.as_raw_fd())
-        });
-        let fd = pipe.read;
+    pub fn receive(&self, mime: &str) -> Result<File, ClipboardReadError> {
+        let pipe = Pipe::new().map_err(transfer::transport)?;
+        self.inner.receive_data(mime.to_owned(), unsafe { BorrowedFd::borrow_raw(pipe.write.as_raw_fd()) });
         drop(pipe.write);
-
-        connection.flush().unwrap();
-
-        match read_fd_with_timeout(fd, PIPE_READ_TIMEOUT) {
-            Ok(bytes) => Some(bytes),
-            Err(err) => {
-                log::error!("error reading clipboard pipe: {err:?}");
-                None
-            }
-        }
-    }
-
-    fn read_text(&self, connection: &Connection) -> Option<ClipboardItem> {
-        let mime_type = self.mime_types.iter().find(|&mime_type| {
-            ALLOWED_TEXT_MIME_TYPES
-                .iter()
-                .any(|&allowed| allowed == mime_type)
-        })?;
-        let bytes = self.read_bytes(connection, mime_type)?;
-        let text_content = match String::from_utf8(bytes) {
-            Ok(content) => content,
-            Err(e) => {
-                log::error!("Failed to convert clipboard content to UTF-8: {}", e);
-                return None;
-            }
-        };
-
-        // Normalize the text to unix line endings, otherwise
-        // copying from eg: firefox inserts a lot of blank
-        // lines, and that is super annoying.
-        let result = text_content.replace("\r\n", "\n");
-        Some(ClipboardItem::new_string(result))
-    }
-
-    fn read_image(&self, connection: &Connection) -> Option<ClipboardItem> {
-        for format in ImageFormat::iter() {
-            let mime_type = format.mime_type();
-            if !self.has_mime_type(mime_type) {
-                continue;
-            }
-
-            if let Some(bytes) = self.read_bytes(connection, mime_type) {
-                let id = hash(&bytes);
-                return Some(ClipboardItem {
-                    entries: vec![ClipboardEntry::Image(Image { format, bytes, id })],
-                });
-            }
-        }
-        None
+        Ok(unsafe { File::from_raw_fd(pipe.read.into_raw_fd()) })
     }
 }
 
-impl Clipboard {
-    pub fn new(connection: Connection, loop_handle: LoopHandle<'static, ()>) -> Self {
-        Self {
-            connection,
-            loop_handle,
-            self_mime: format!("pid/{}", std::process::id()),
-
-            contents: None,
-            primary_contents: None,
-
-            cached_read: None,
-            current_offer: None,
-            cached_primary_read: None,
-            current_primary_offer: None,
+pub(crate) struct ReadRequest<T: ReceiveData> {
+    pub generation: u64,
+    pub cancel: Cancel,
+    pub deadline: Instant,
+    pub files: Vec<(String, File)>,
+    pub offer: DataOffer<T>,
+}
+impl<T: ReceiveData> ReadRequest<T> {
+    pub fn run(self) -> Result<ClipboardItem, ClipboardReadError> {
+        let mut representations = Vec::new();
+        let mut left = BYTE_LIMIT;
+        for (mime, file) in self.files {
+            let bytes = transfer::read(file, &self.cancel, self.deadline, left)?;
+            left -= bytes.len();
+            representations.push(MimeRepresentation::new(mime, bytes));
         }
+        transfer::check(&self.cancel, self.deadline)?;
+        transfer::decode(representations)
     }
+}
 
-    pub fn set(&mut self, item: ClipboardItem) {
+pub(crate) struct Selection<T: ReceiveData> {
+    pub generation: u64,
+    pub contents: Option<ClipboardItem>,
+    pub offer: Option<DataOffer<T>>,
+    pub cached: Option<ClipboardItem>,
+    pub cancel: Cancel,
+    pub marker: String,
+}
+impl<T: ReceiveData> Default for Selection<T> {
+    fn default() -> Self { Self { generation: 0, contents: None, offer: None, cached: None, cancel: transfer::cancelled(), marker: String::new() } }
+}
+impl<T: ReceiveData> Selection<T> {
+    fn advance(&mut self) {
+        self.cancel.store(true, Ordering::Release);
+        self.cancel = transfer::cancelled();
+        self.generation = self.generation.wrapping_add(1);
+        self.cached = None;
+    }
+    pub fn set(&mut self, item: ClipboardItem) -> u64 {
+        self.advance(); self.offer = None;
+        self.marker = format!("pid/{}/{}/{}", std::process::id(), self.generation, self as *const _ as usize);
         self.contents = Some(item);
+        self.generation
     }
-
-    pub fn set_primary(&mut self, item: ClipboardItem) {
-        self.primary_contents = Some(item);
+    pub fn set_offer(&mut self, offer: Option<DataOffer<T>>) {
+        if offer.as_ref().is_some_and(|offer| offer.mime_types.contains(&self.marker)) { self.offer = offer; return; }
+        self.advance(); self.contents = None; self.offer = offer;
     }
-
-    pub fn set_offer(&mut self, data_offer: Option<DataOffer<WlDataOffer>>) {
-        self.cached_read = None;
-        self.current_offer = data_offer;
+    pub fn ready(&self) -> Option<ClipboardItem> { self.contents.clone().or_else(|| self.cached.clone()) }
+    pub fn prepare(&self, connection: &Connection) -> Result<Option<ReadRequest<T>>, ClipboardReadError> {
+        let Some(offer) = self.offer.clone() else { return Ok(None); };
+        let types = transfer::selected_types(&offer.mime_types, true);
+        if types.is_empty() { return Err(ClipboardReadError::UnsupportedContent); }
+        let files = types.into_iter().map(|mime| offer.receive(&mime).map(|file| (mime, file))).collect::<Result<Vec<_>, _>>()?;
+        connection.flush().map_err(transfer::transport)?;
+        Ok(Some(ReadRequest { generation: self.generation, cancel: self.cancel.clone(), deadline: Instant::now() + TRANSFER_TIMEOUT, files, offer }))
     }
+}
 
-    pub fn set_primary_offer(&mut self, data_offer: Option<DataOffer<ZwpPrimarySelectionOfferV1>>) {
-        self.cached_primary_read = None;
-        self.current_primary_offer = data_offer;
-    }
+pub(crate) struct Clipboard {
+    pub connection: Connection,
+    pub selection: Selection<WlDataOffer>,
+    pub primary: Selection<ZwpPrimarySelectionOfferV1>,
+}
+impl Clipboard {
+    pub fn new(connection: Connection) -> Self { Self { connection, selection: Selection::default(), primary: Selection::default() } }
+    pub fn read(&self) -> Option<ClipboardItem> { self.selection.ready() }
+    pub fn read_primary(&self) -> Option<ClipboardItem> { self.primary.ready() }
+}
 
-    pub fn self_mime(&self) -> String {
-        self.self_mime.clone()
-    }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DataSourceKind { Clipboard, Primary, Drag }
 
-    pub fn send(&self, _mime_type: String, fd: OwnedFd) {
-        if let Some(text) = self.contents.as_ref().and_then(|contents| contents.text()) {
-            self.send_bytes(fd, text.as_bytes().to_owned());
-        }
-    }
-
-    pub fn send_primary(&self, _mime_type: String, fd: OwnedFd) {
-        if let Some(text) = self
-            .primary_contents
-            .as_ref()
-            .and_then(|contents| contents.text())
-        {
-            self.send_bytes(fd, text.as_bytes().to_owned());
-        }
-    }
-
-    pub fn read(&mut self) -> Option<ClipboardItem> {
-        let offer = self.current_offer.as_ref()?;
-        if let Some(cached) = self.cached_read.clone() {
-            return Some(cached);
-        }
-
-        if offer.has_mime_type(&self.self_mime) {
-            return self.contents.clone();
-        }
-
-        let item = offer
-            .read_text(&self.connection)
-            .or_else(|| offer.read_image(&self.connection))?;
-
-        self.cached_read = Some(item.clone());
-        Some(item)
-    }
-
-    pub fn read_primary(&mut self) -> Option<ClipboardItem> {
-        let offer = self.current_primary_offer.as_ref()?;
-        if let Some(cached) = self.cached_primary_read.clone() {
-            return Some(cached);
-        }
-
-        if offer.has_mime_type(&self.self_mime) {
-            return self.primary_contents.clone();
-        }
-
-        let item = offer
-            .read_text(&self.connection)
-            .or_else(|| offer.read_image(&self.connection))?;
-
-        self.cached_primary_read = Some(item.clone());
-        Some(item)
-    }
-
-    pub fn send_bytes(&self, fd: OwnedFd, bytes: Vec<u8>) {
-        let mut written = 0;
-        self.loop_handle
-            .insert_source(
-                calloop::generic::Generic::new(
-                    File::from(fd),
-                    calloop::Interest::WRITE,
-                    calloop::Mode::Level,
-                ),
-                move |_, file, _| {
-                    let file = unsafe { file.get_mut() };
-                    loop {
-                        match file.write(&bytes[written..]) {
-                            Ok(n) if written + n == bytes.len() => {
-                                written += n;
-                                break Ok(PostAction::Remove);
-                            }
-                            Ok(n) => written += n,
-                            Err(err) if err.kind() == ErrorKind::WouldBlock => {
-                                break Ok(PostAction::Continue);
-                            }
-                            Err(_) => break Ok(PostAction::Remove),
-                        }
-                    }
-                },
-            )
-            .unwrap();
+pub(crate) struct SourceData {
+    pub kind: DataSourceKind,
+    pub generation: u64,
+    pub payload: MimePayload,
+    pub cancel: Cancel,
+}
+impl SourceData {
+    pub fn send(&self, mime: &str, fd: OwnedFd, executor: &gpui::BackgroundExecutor) {
+        let Some(bytes) = self.payload.get(mime) else { return; };
+        let cancel = self.cancel.clone();
+        executor.spawn(async move {
+            if let Err(error) = transfer::write(File::from(fd), bytes, &cancel, Instant::now() + TRANSFER_TIMEOUT) {
+                log::debug!("native transfer send: {error}");
+            }
+        }).detach();
     }
 }

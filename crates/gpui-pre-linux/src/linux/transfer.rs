@@ -163,3 +163,38 @@ pub(crate) fn selected_types(offered: &[String], arbitrary: bool) -> Vec<String>
         (arbitrary && !mime.starts_with("pid/")) || TEXT_TYPES.contains(&mime.as_str()) || ImageFormat::iter().any(|format| format.mime_type() == mime.as_str())
     }).take(TYPE_LIMIT).cloned().collect()
 }
+
+pub(crate) fn notify_clipboard(common: &std::rc::Rc<std::cell::RefCell<super::LinuxCommon>>, event: gpui::ClipboardChange) {
+    let executor = common.borrow().foreground_executor.clone();
+    let common = common.clone();
+    executor.spawn(async move {
+        let callback = common.borrow_mut().callbacks.clipboard_change.take();
+        if let Some(mut callback) = callback {
+            callback(event);
+            let mut common = common.borrow_mut();
+            if common.callbacks.clipboard_change.is_none() { common.callbacks.clipboard_change = Some(callback); }
+        }
+    }).detach();
+}
+
+pub(crate) fn notify_drag(common: &std::rc::Rc<std::cell::RefCell<super::LinuxCommon>>, event: gpui::NativeDragEvent) {
+    let executor = common.borrow().foreground_executor.clone();
+    let common = common.clone();
+    executor.spawn(async move {
+        let callback = common.borrow_mut().callbacks.native_drag.take();
+        if let Some(mut callback) = callback {
+            callback(event);
+            let mut common = common.borrow_mut();
+            if common.callbacks.native_drag.is_none() { common.callbacks.native_drag = Some(callback); }
+        }
+    }).detach();
+}
+
+pub(crate) fn allow_drop(common: &std::rc::Rc<std::cell::RefCell<super::LinuxCommon>>, event: gpui::NativeDropEvent, has_paths: bool) -> bool {
+    let callback = common.borrow_mut().callbacks.native_drop.take();
+    let Some(mut callback) = callback else { return has_paths; };
+    let accepted = callback(event);
+    let mut common = common.borrow_mut();
+    if common.callbacks.native_drop.is_none() { common.callbacks.native_drop = Some(callback); }
+    accepted
+}

@@ -1,5 +1,6 @@
 mod client;
 mod clipboard;
+mod drag;
 mod cursor;
 mod display;
 mod popup;
