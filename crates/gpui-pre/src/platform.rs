@@ -1060,6 +1060,19 @@ pub struct RequestFrameOptions {
     pub signal_source: FrameRequestSource,
 }
 
+/// Frames a window committed and the compositor reported presented.
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Default)]
+pub struct PresentedFrames {
+    /// Frames whose present reached the compositor, numbered from 1 in commit order.
+    pub committed: u64,
+    /// Number of the newest committed frame the compositor reported presented, 0 before the first.
+    pub presented: u64,
+    /// When frame `presented` was first shown, on the presentation clock.
+    pub presented_at: Option<Duration>,
+    /// The `clockid_t` of the presentation clock, meaningful once `presented_at` is set.
+    pub clock_id: u32,
+}
+
 /// Preserves the first platform frame request time across coalesced notifications.
 ///
 /// Producers may record from a platform thread without waiting for the UI thread.
@@ -1303,6 +1316,12 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn on_button_layout_changed(&self, _callback: Box<dyn FnMut()>) {}
     fn draw(&self, scene: &Scene);
     fn schedule_frame(&self) {}
+    /// Presentation feedback, or `None` where the platform or compositor reports none.
+    fn presented_frames(&self) -> Option<PresentedFrames> {
+        None
+    }
+    /// Registers the callback invoked when [`Self::presented_frames`] advances.
+    fn on_frame_presented(&self, _callback: Box<dyn FnMut()>) {}
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas>;
     fn is_subpixel_rendering_supported(&self) -> bool;
 

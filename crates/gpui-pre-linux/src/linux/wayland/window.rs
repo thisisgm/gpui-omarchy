@@ -31,15 +31,19 @@ use wayland_protocols::{
 use wayland_protocols_plasma::blur::client::org_kde_kwin_blur;
 use wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1;
 
-use crate::linux::wayland::{display::WaylandDisplay, serial::SerialKind};
+use crate::linux::wayland::{
+    display::WaylandDisplay,
+    presentation::{FrameFeedback, FrameFeedbackData, PresentedFrameCounter},
+    serial::SerialKind,
+};
 use crate::linux::{Globals, Output, WaylandClientStatePtr, get_window};
 use gpui::{
     AnyWindowHandle, Bounds, Capslock, Decorations, DevicePixels, ExternalDragPayload,
     FrameRequestSource, GpuSpecs, Modifiers, Pixels, PlatformAtlas, PlatformDisplay,
-    PlatformFrameSignal, PlatformInput, PlatformInputHandler, PlatformWindow, Point, PromptButton,
-    PromptLevel, RequestFrameOptions, ResizeEdge, Scene, Size, Tiling, WindowAppearance,
-    WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowControls, WindowDecorations,
-    WindowKind, WindowParams, WindowVisibility,
+    PlatformFrameSignal, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
+    PresentedFrames, PromptButton, PromptLevel, RequestFrameOptions, ResizeEdge, Scene, Size,
+    Tiling, WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea,
+    WindowControls, WindowDecorations, WindowKind, WindowParams, WindowVisibility,
     layer_shell::{Anchor, LayerShellNotSupportedError},
     popup::PopupOptions,
     px, size,
@@ -60,6 +64,7 @@ pub(crate) struct Callbacks {
     close: Option<Box<dyn FnOnce()>>,
     appearance_changed: Option<Box<dyn FnMut()>>,
     button_layout_changed: Option<Box<dyn FnMut()>>,
+    frame_presented: Option<Box<dyn FnMut()>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -134,6 +139,7 @@ pub struct WaylandWindowState {
     redraw_requested: bool,
     presentation: PresentationState,
     pending_frame_callback: Option<wl_callback::WlCallback>,
+    presented_frames: PresentedFrameCounter,
     in_progress_configure: Option<InProgressConfigure>,
     resize_throttle: bool,
     in_progress_window_controls: Option<WindowControls>,
@@ -604,6 +610,7 @@ impl WaylandWindowState {
                 .set_max_size(max_texture_size, max_texture_size);
         }
 
+        let presented_frames = PresentedFrameCounter::new(globals.presentation.is_some());
         Ok(Self {
             surface_state,
             parent,
@@ -636,6 +643,7 @@ impl WaylandWindowState {
             redraw_requested: false,
             presentation: PresentationState::Unpresented,
             pending_frame_callback: None,
+            presented_frames,
             in_progress_window_controls: None,
             window_controls: WindowControls::default(),
             client_inset: None,
@@ -1012,6 +1020,19 @@ impl WaylandWindowStatePtr {
         self.state.borrow_mut().pending_frame_callback = None;
         if self.frame_loop.get() == FrameLoop::AwaitingCallback {
             self.frame(signal_at, FrameRequestSource::NativeCallback);
+        }
+    }
+
+    pub fn frame_feedback(&self, frame: u64, feedback: FrameFeedback, clock_id: u32) {
+        let advanced = self
+            .state
+            .borrow_mut()
+            .presented_frames
+            .feedback(frame, feedback, clock_id);
+        if advanced
+            && let Some(frame_presented) = self.callbacks.borrow_mut().frame_presented.as_mut()
+        {
+            frame_presented();
         }
     }
 
@@ -2043,7 +2064,22 @@ impl PlatformWindow for WaylandWindow {
             let callback = state.surface.frame(&state.globals.qh, state.surface.id());
             state.pending_frame_callback = Some(callback);
         }
-        if renderer.draw(scene) {
+        // The present's commit carries this feedback; it counts only if the present succeeds.
+        let frame_feedback = state.globals.presentation.as_ref().map(|presentation| {
+            presentation.feedback(
+                &state.surface,
+                &state.globals.qh,
+                FrameFeedbackData::new(state.surface.id()),
+            )
+        });
+        let presented = renderer.draw(scene);
+        state.presented_frames.finish_present(
+            presented,
+            frame_feedback
+                .as_ref()
+                .and_then(|feedback| feedback.data::<FrameFeedbackData>()),
+        );
+        if presented {
             state.presentation = PresentationState::Presented;
             self.0.frame_loop.set(FrameLoop::AwaitingCallback);
         } else {
@@ -2058,6 +2094,14 @@ impl PlatformWindow for WaylandWindow {
 
     fn schedule_frame(&self) {
         self.0.schedule_frame();
+    }
+
+    fn presented_frames(&self) -> Option<PresentedFrames> {
+        self.borrow().presented_frames.snapshot()
+    }
+
+    fn on_frame_presented(&self, callback: Box<dyn FnMut()>) {
+        self.0.callbacks.borrow_mut().frame_presented = Some(callback);
     }
 
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {

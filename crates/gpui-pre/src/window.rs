@@ -14,11 +14,11 @@ use crate::{
     Keystroke, KeystrokeEvent, LayoutId, LineLayout, LineLayoutIndex, Modifiers,
     ModifiersChangedEvent, MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent,
     Path, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler,
-    PlatformWindow, Point, PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render,
-    RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge,
-    SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow,
-    SharedString, Size, StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription,
-    SystemWindowTab, SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task,
+    PlatformWindow, Point, PolychromeSprite, PresentedFrames, Priority, PromptButton, PromptLevel,
+    Quad, Render, RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams, Replay,
+    ResizeEdge, SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels,
+    Scene, Shadow, SharedString, Size, StrikethroughStyle, Style, SubpixelSprite, SubscriberSet,
+    Subscription, SystemWindowTab, SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task,
     TextInputConfiguration, TextInputStateChange, TextRenderingMode, TextStyle,
     TextStyleRefinement, ThermalState, TransformationMatrix, Underline, UnderlineStyle,
     WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations,
@@ -1270,6 +1270,8 @@ pub struct Window {
     appearance: WindowAppearance,
     pub(crate) appearance_observers: SubscriberSet<(), AnyObserver>,
     pub(crate) button_layout_observers: SubscriberSet<(), AnyObserver>,
+    pub(crate) frame_presented_observers: SubscriberSet<(), AnyObserver>,
+    frame_presented_hooked: bool,
     active: Rc<Cell<bool>>,
     visibility: WindowVisibility,
     pub(crate) visibility_observers:
@@ -2170,6 +2172,8 @@ impl Window {
             appearance,
             appearance_observers: SubscriberSet::new(),
             button_layout_observers: SubscriberSet::new(),
+            frame_presented_observers: SubscriberSet::new(),
+            frame_presented_hooked: false,
             active,
             visibility,
             visibility_observers: SubscriberSet::new(),
@@ -3006,6 +3010,44 @@ impl Window {
         self.button_layout_observers
             .clone()
             .retain(&(), |callback| callback(self, cx));
+    }
+
+    pub(crate) fn frame_presented(&mut self, cx: &mut App) {
+        self.frame_presented_observers
+            .clone()
+            .retain(&(), |callback| callback(self, cx));
+    }
+
+    /// Returns committed and presented frames, or `None` without feedback (all but Wayland).
+    pub fn presented_frames(&self) -> Option<PresentedFrames> {
+        self.platform_window.presented_frames()
+    }
+
+    /// Registers a callback for when [`Self::presented_frames`] advances; free until used.
+    pub fn observe_frame_presented(
+        &mut self,
+        cx: &App,
+        mut callback: impl FnMut(&mut Window, &mut App) + 'static,
+    ) -> Subscription {
+        if !self.frame_presented_hooked {
+            self.frame_presented_hooked = true;
+            let handle = self.handle;
+            let mut cx = cx.to_async();
+            self.platform_window.on_frame_presented(Box::new(move || {
+                handle
+                    .update(&mut cx, |_, window, cx| window.frame_presented(cx))
+                    .log_err();
+            }));
+        }
+        let (subscription, activate) = self.frame_presented_observers.insert(
+            (),
+            Box::new(move |window, cx| {
+                callback(window, cx);
+                true
+            }),
+        );
+        activate();
+        subscription
     }
 
     /// Returns the appearance of the current window.
@@ -8771,6 +8813,32 @@ mod tests {
         cx.run_until_parked();
 
         assert_eq!(observed_appearance.get(), Some(WindowAppearance::Dark));
+    }
+
+    #[gpui::test]
+    fn test_frame_presented_reports_unsupported_and_notifies_observers(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| EmptyView);
+        let notified = Rc::new(Cell::new(0));
+        let _subscription = window
+            .update(cx, {
+                let notified = notified.clone();
+                move |_, window, cx| {
+                    // The test platform has no presentation feedback, so a caller can refuse.
+                    assert_eq!(window.presented_frames(), None);
+                    window.observe_frame_presented(cx, move |window, _| {
+                        assert_eq!(window.presented_frames(), None);
+                        notified.set(notified.get() + 1);
+                    })
+                }
+            })
+            .unwrap();
+        assert_eq!(notified.get(), 0);
+
+        window
+            .update(cx, |_, window, cx| window.frame_presented(cx))
+            .unwrap();
+
+        assert_eq!(notified.get(), 1);
     }
 
     #[gpui::test]

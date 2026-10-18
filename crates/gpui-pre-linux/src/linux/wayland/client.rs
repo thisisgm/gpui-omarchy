@@ -43,6 +43,7 @@ use wayland_client::{
 use wayland_protocols::wp::pointer_gestures::zv1::client::{
     zwp_pointer_gesture_pinch_v1, zwp_pointer_gestures_v1,
 };
+use wayland_protocols::wp::presentation_time::client::{wp_presentation, wp_presentation_feedback};
 use wayland_protocols::wp::primary_selection::zv1::client::zwp_primary_selection_offer_v1::{
     self, ZwpPrimarySelectionOfferV1,
 };
@@ -80,6 +81,7 @@ use xkbcommon::xkb::{self, KEYMAP_COMPILE_NO_FLAGS, Keycode};
 
 use super::{
     display::{WaylandDisplay, refresh_interval_from_millihertz},
+    presentation::{FrameFeedback, FrameFeedbackData, presentation_timestamp},
     window::{ImeInput, WaylandWindowStatePtr},
 };
 
@@ -249,6 +251,7 @@ pub struct Globals {
     pub shm: wl_shm::WlShm,
     pub seat: wl_seat::WlSeat,
     pub viewporter: Option<wp_viewporter::WpViewporter>,
+    pub presentation: Option<wp_presentation::WpPresentation>,
     pub fractional_scale_manager:
         Option<wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1>,
     pub decoration_manager: Option<zxdg_decoration_manager_v1::ZxdgDecorationManagerV1>,
@@ -300,6 +303,7 @@ impl Globals {
                 .bind(&qh, 1..=6, ())
                 .context("Wayland compositor does not provide xdg_wm_base")?,
             viewporter: globals.bind(&qh, 1..=1, ()).ok(),
+            presentation: globals.bind(&qh, 1..=2, ()).ok(),
             fractional_scale_manager: globals.bind(&qh, 1..=1, ()).ok(),
             decoration_manager: globals.bind(&qh, 1..=1, ()).ok(),
             layer_shell: globals.bind(&qh, 1..=5, ()).ok(),
@@ -414,6 +418,8 @@ pub(crate) struct WaylandClientState {
     registrations: Vec<RegistrationToken>,
     pub common: Rc<RefCell<LinuxCommon>>,
     ime_enabled: Option<bool>,
+    // The clockid_t of wp_presentation timestamps, sent once on bind.
+    presentation_clock_id: u32,
 }
 
 type DragState = super::drag::DragState<DataOffer<WlDataOffer>, WaylandWindowStatePtr>;
@@ -1121,6 +1127,7 @@ impl WaylandConnection {
             },
             registrations: Vec::new(),
             ime_enabled: None,
+            presentation_clock_id: libc::CLOCK_MONOTONIC as u32,
         }));
 
         // From here on, `Drop` removes whatever was registered if a later step fails.
@@ -1771,6 +1778,54 @@ delegate_noop!(WaylandClientStatePtr: ignore zwp_text_input_manager_v3::ZwpTextI
 delegate_noop!(WaylandClientStatePtr: ignore org_kde_kwin_blur::OrgKdeKwinBlur);
 delegate_noop!(WaylandClientStatePtr: ignore wp_viewporter::WpViewporter);
 delegate_noop!(WaylandClientStatePtr: ignore wp_viewport::WpViewport);
+
+impl Dispatch<wp_presentation::WpPresentation, ()> for WaylandClientStatePtr {
+    fn event(
+        this: &mut Self,
+        _: &wp_presentation::WpPresentation,
+        event: wp_presentation::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let wp_presentation::Event::ClockId { clk_id } = event {
+            this.get_client().borrow_mut().presentation_clock_id = clk_id;
+        }
+    }
+}
+
+impl Dispatch<wp_presentation_feedback::WpPresentationFeedback, FrameFeedbackData>
+    for WaylandClientStatePtr
+{
+    fn event(
+        this: &mut Self,
+        _: &wp_presentation_feedback::WpPresentationFeedback,
+        event: wp_presentation_feedback::Event,
+        data: &FrameFeedbackData,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        let feedback = match event {
+            wp_presentation_feedback::Event::Presented {
+                tv_sec_hi,
+                tv_sec_lo,
+                tv_nsec,
+                ..
+            } => FrameFeedback::Presented(presentation_timestamp(tv_sec_hi, tv_sec_lo, tv_nsec)),
+            wp_presentation_feedback::Event::Discarded => FrameFeedback::Discarded,
+            _ => return,
+        };
+        let client = this.get_client();
+        let mut state = client.borrow_mut();
+        let clock_id = state.presentation_clock_id;
+        let Some(window) = get_window(&mut state, &data.surface_id) else {
+            return;
+        };
+        drop(state);
+
+        window.frame_feedback(data.frame(), feedback, clock_id);
+    }
+}
 
 impl Dispatch<WlCallback, ObjectId> for WaylandClientStatePtr {
     fn event(

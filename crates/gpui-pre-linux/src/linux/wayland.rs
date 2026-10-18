@@ -4,6 +4,7 @@ mod cursor;
 mod display;
 mod drag;
 mod popup;
+mod presentation;
 mod serial;
 mod window;
 
