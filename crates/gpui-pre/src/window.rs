@@ -11,18 +11,19 @@ use crate::{
     DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity,
     EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
     Hsla, InputHandler, InputPreference, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent,
-    Keystroke, KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent,
-    MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels,
-    PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
-    PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams,
-    RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
-    SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
-    StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab,
-    SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextInputConfiguration,
-    TextInputStateChange, TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState,
-    TransformationMatrix, Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance,
-    WindowBounds, WindowControls, WindowDecorations, WindowOptions, WindowParams, WindowTextSystem,
-    WindowVisibility, point, prelude::*, px, rems, size, transparent_black,
+    Keystroke, KeystrokeEvent, LayoutId, LineLayout, LineLayoutIndex, Modifiers,
+    ModifiersChangedEvent, MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent,
+    Path, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler,
+    PlatformWindow, Point, PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render,
+    RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge,
+    SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow,
+    SharedString, Size, StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription,
+    SystemWindowTab, SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task,
+    TextInputConfiguration, TextInputStateChange, TextRenderingMode, TextStyle,
+    TextStyleRefinement, ThermalState, TransformationMatrix, Underline, UnderlineStyle,
+    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations,
+    WindowOptions, WindowParams, WindowTextSystem, WindowVisibility, point, prelude::*, px, rems,
+    size, transparent_black,
 };
 
 use crate::gestures::{GestureTuning, RecognizedTouchGesture, TouchGestureRecognizer};
@@ -66,6 +67,8 @@ use std::{
 use uuid::Uuid;
 
 pub(crate) mod a11y;
+#[cfg(test)]
+mod glyph_run_tests;
 mod prompts;
 
 pub use a11y::A11ySubtreeBuilder;
@@ -2214,6 +2217,92 @@ impl Window {
     ) -> (Subscription, impl FnOnce() + use<>) {
         self.focus_listeners.insert((), value)
     }
+}
+
+/// A shaped line whose glyph tiles a window looks up once and keeps between frames.
+///  [`Window::paint_glyph_run`] pushes exactly the sprites [`Window::paint_glyph`] and
+/// [`Window::paint_emoji`] push for the line's glyphs, but takes each glyph's raster bounds and
+/// atlas tile from the previous paint while nothing that selects them has changed: the origin's x,
+/// the scale factor, each run's rendering mode, the color's dilation and the atlas generation.
+/// Moving the origin vertically only moves the sprites, because glyphs have one vertical subpixel
+/// variant. A list that keeps one run per visible line paints a scrolled frame without a lookup per
+/// glyph.
+pub struct GlyphRun {
+    line: Arc<LineLayout>,
+    resolved: RefCell<ResolvedGlyphs>,
+    resolves: Cell<usize>,
+}
+
+impl GlyphRun {
+    /// Wraps a shaped line; its tiles are looked up on the first paint. The room for them is
+    /// reserved here, so painting the run never allocates.
+    pub fn new(line: Arc<LineLayout>) -> Self {
+        let glyphs = line.runs.iter().map(|run| run.glyphs.len()).sum();
+        let resolved = ResolvedGlyphs {
+            key: None,
+            subpixel_rendering: SmallVec::with_capacity(line.runs.len()),
+            sprites: Vec::with_capacity(glyphs),
+        };
+        Self {
+            line,
+            resolved: RefCell::new(resolved),
+            resolves: Cell::new(0),
+        }
+    }
+
+    /// The shaped line this run paints.
+    pub fn line(&self) -> &Arc<LineLayout> {
+        &self.line
+    }
+
+    /// How many paints of this run looked its tiles up: the first, then each one after a change to
+    /// what selects them. A run painted again under the same conditions adds nothing.
+    pub fn resolves(&self) -> usize {
+        self.resolves.get()
+    }
+}
+
+impl Debug for GlyphRun {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GlyphRun")
+            .field("line", &self.line)
+            .finish_non_exhaustive()
+    }
+}
+
+// Sprites are offset vertically by whole device pixels, which holds only while there is one
+// vertical variant.
+const _: () = assert!(SUBPIXEL_VARIANTS_Y == 1);
+
+struct ResolvedGlyphs {
+    key: Option<ResolvedKey>,
+    subpixel_rendering: SmallVec<[bool; 4]>,
+    sprites: Vec<ResolvedSprite>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+struct ResolvedKey {
+    origin_x: Pixels,
+    scale_factor: f32,
+    dilation: u8,
+    atlas_generation: u64,
+}
+
+#[derive(Clone, Copy)]
+enum ResolvedKind {
+    Monochrome,
+    Subpixel,
+    Polychrome,
+}
+
+#[derive(Clone, Copy)]
+struct ResolvedSprite {
+    kind: ResolvedKind,
+    x: ScaledPixels,
+    glyph_y: Pixels,
+    raster_y: ScaledPixels,
+    size: Size<ScaledPixels>,
+    tile: AtlasTile,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -4973,6 +5062,178 @@ impl Window {
                 tile,
                 opacity,
             });
+        }
+        Ok(())
+    }
+
+    /// Paints a glyph run with its baseline at `origin.y`: monochrome glyphs in `color` and emoji
+    /// in their own colors, the same sprites [`Self::paint_glyph`] and [`Self::paint_emoji`] would
+    /// push for each glyph.
+    ///  The run keeps the tiles it looked up, so painting it again with an unchanged x, scale
+    /// factor, rendering mode, dilation and atlas generation pushes its sprites without a raster
+    /// bounds or atlas lookup.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn paint_glyph_run(
+        &mut self,
+        origin: Point<Pixels>,
+        run: &GlyphRun,
+        color: Hsla,
+    ) -> Result<()> {
+        self.invalidator.debug_assert_paint();
+
+        let line = &run.line;
+        let scale_factor = self.scale_factor();
+        let key = self
+            .sprite_atlas
+            .generation()
+            .map(|atlas_generation| ResolvedKey {
+                origin_x: origin.x,
+                scale_factor,
+                dilation: self.text_system().glyph_dilation_for_color(color),
+                atlas_generation,
+            });
+        let mut resolved = run.resolved.borrow_mut();
+        let mut current = key.is_some() && resolved.key == key;
+        if current {
+            for (shaped, kept) in line.runs.iter().zip(&resolved.subpixel_rendering) {
+                if self.should_use_subpixel_rendering(shaped.font_id, line.font_size) != *kept {
+                    current = false;
+                    break;
+                }
+            }
+        }
+        if !current {
+            run.resolves.set(run.resolves.get() + 1);
+            resolved.key = None;
+            self.resolve_glyph_run(origin, line, color, &mut resolved)?;
+            resolved.key = key;
+        }
+
+        let content_mask = self.snapped_content_mask();
+        let opacity = self.element_opacity();
+        let color = color.opacity(opacity);
+        for sprite in &resolved.sprites {
+            let y = round_half_toward_zero((origin.y + sprite.glyph_y).0 * scale_factor);
+            let bounds = Bounds {
+                origin: point(sprite.x, ScaledPixels(y) + sprite.raster_y),
+                size: sprite.size,
+            };
+            match sprite.kind {
+                ResolvedKind::Monochrome => {
+                    self.next_frame.scene.insert_primitive(MonochromeSprite {
+                        order: 0,
+                        pad: 0,
+                        bounds,
+                        content_mask,
+                        color,
+                        tile: sprite.tile,
+                        transformation: TransformationMatrix::unit(),
+                    })
+                }
+                ResolvedKind::Subpixel => self.next_frame.scene.insert_primitive(SubpixelSprite {
+                    order: 0,
+                    pad: 0,
+                    bounds,
+                    content_mask,
+                    color,
+                    tile: sprite.tile,
+                    transformation: TransformationMatrix::unit(),
+                }),
+                ResolvedKind::Polychrome => {
+                    self.next_frame.scene.insert_primitive(PolychromeSprite {
+                        order: 0,
+                        pad: 0,
+                        grayscale: false.into(),
+                        bounds,
+                        corner_radii: Default::default(),
+                        content_mask,
+                        tile: sprite.tile,
+                        opacity,
+                    })
+                }
+            }
+        }
+        Ok(())
+    }
+
+    // Looks up every glyph's raster bounds and tile the way paint_glyph and paint_emoji do, keeping
+    // what they push.
+    fn resolve_glyph_run(
+        &mut self,
+        origin: Point<Pixels>,
+        line: &LineLayout,
+        color: Hsla,
+        resolved: &mut ResolvedGlyphs,
+    ) -> Result<()> {
+        let scale_factor = self.scale_factor();
+        let dilation = self.text_system().glyph_dilation_for_color(color);
+        resolved.subpixel_rendering.clear();
+        resolved.sprites.clear();
+        for shaped in &line.runs {
+            let subpixel_rendering =
+                self.should_use_subpixel_rendering(shaped.font_id, line.font_size);
+            resolved.subpixel_rendering.push(subpixel_rendering);
+            for glyph in &shaped.glyphs {
+                let glyph_origin = point(origin.x + glyph.position.x, origin.y + glyph.position.y)
+                    .scale(scale_factor);
+                let (params, x, kind) = if glyph.is_emoji {
+                    let params = RenderGlyphParams {
+                        font_id: shaped.font_id,
+                        glyph_id: glyph.id,
+                        font_size: line.font_size,
+                        subpixel_variant: Default::default(),
+                        scale_factor,
+                        is_emoji: true,
+                        subpixel_rendering: false,
+                        dilation: 0,
+                    };
+                    let x = ScaledPixels(round_half_toward_zero(glyph_origin.x.0));
+                    (params, x, ResolvedKind::Polychrome)
+                } else {
+                    let quantized_x =
+                        round_half_toward_zero(glyph_origin.x.0 * SUBPIXEL_VARIANTS_X as f32)
+                            / SUBPIXEL_VARIANTS_X as f32;
+                    let params = RenderGlyphParams {
+                        font_id: shaped.font_id,
+                        glyph_id: glyph.id,
+                        font_size: line.font_size,
+                        subpixel_variant: Point::new(
+                            (quantized_x.fract() * SUBPIXEL_VARIANTS_X as f32) as u8,
+                            0,
+                        ),
+                        scale_factor,
+                        is_emoji: false,
+                        subpixel_rendering,
+                        dilation,
+                    };
+                    let kind = if subpixel_rendering {
+                        ResolvedKind::Subpixel
+                    } else {
+                        ResolvedKind::Monochrome
+                    };
+                    (params, ScaledPixels(quantized_x.trunc()), kind)
+                };
+                let raster_bounds = self.text_system().raster_bounds(&params)?;
+                if raster_bounds.is_zero() {
+                    continue;
+                }
+                let tile = self
+                    .sprite_atlas
+                    .get_or_insert_with(params.clone().into(), &mut || {
+                        let (size, bytes) = self.text_system().rasterize_glyph(&params)?;
+                        Ok(Some((size, Cow::Owned(bytes))))
+                    })?
+                    .expect("Callback above only errors or returns Some");
+                resolved.sprites.push(ResolvedSprite {
+                    kind,
+                    x: x + ScaledPixels::from(raster_bounds.origin.x),
+                    glyph_y: glyph.position.y,
+                    raster_y: ScaledPixels::from(raster_bounds.origin.y),
+                    size: tile.bounds.size.map(Into::into),
+                    tile,
+                });
+            }
         }
         Ok(())
     }

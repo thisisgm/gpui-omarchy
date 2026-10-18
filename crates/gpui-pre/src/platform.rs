@@ -1749,6 +1749,14 @@ pub trait PlatformAtlas {
     ) -> Result<Option<AtlasTile>>;
     fn remove(&self, key: &AtlasKey);
 
+    /// Names the set of tiles this atlas hands out: unique among atlases and replaced each time the
+    /// atlas drops every tile at once, so a tile kept across frames is valid only while the
+    /// generation it came from is current. `None` means the atlas cannot say, and no tile may be
+    /// kept.
+    fn generation(&self) -> Option<u64> {
+        None
+    }
+
     #[cfg(any(test, feature = "test-support", feature = "bench-support"))]
     fn contains(&self, _key: &AtlasKey) -> bool {
         false
@@ -1770,13 +1778,22 @@ pub trait AtlasBackend {
 #[doc(hidden)]
 pub struct AtlasState<Backend> {
     tiles_by_key: FxHashMap<AtlasKey, AtlasTile>,
+    generation: u64,
     pub backend: Backend,
+}
+
+// One counter for every atlas, so no two atlases and no two clears of one atlas share a generation.
+static NEXT_ATLAS_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn next_atlas_generation() -> u64 {
+    NEXT_ATLAS_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 impl<Backend> AtlasState<Backend> {
     pub fn new(backend: Backend) -> Self {
         Self {
             tiles_by_key: FxHashMap::default(),
+            generation: next_atlas_generation(),
             backend,
         }
     }
@@ -1785,8 +1802,14 @@ impl<Backend> AtlasState<Backend> {
         self.tiles_by_key.contains_key(key)
     }
 
+    /// The generation of the tiles this state hands out; see [`PlatformAtlas::generation`].
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
     pub fn clear(&mut self, reset_backend: impl FnOnce(&mut Backend)) {
         self.tiles_by_key.clear();
+        self.generation = next_atlas_generation();
         reset_backend(&mut self.backend);
     }
 }
@@ -1877,6 +1900,10 @@ impl PlatformAtlas for HeadlessAtlas {
 
     fn remove(&self, key: &AtlasKey) {
         self.0.lock().remove(key);
+    }
+
+    fn generation(&self) -> Option<u64> {
+        Some(self.0.lock().generation())
     }
 
     #[cfg(any(test, feature = "test-support", feature = "bench-support"))]

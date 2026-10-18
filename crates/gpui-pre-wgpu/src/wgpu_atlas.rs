@@ -122,6 +122,10 @@ impl PlatformAtlas for WgpuAtlas {
     fn remove(&self, key: &AtlasKey) {
         self.0.lock().remove(key);
     }
+
+    fn generation(&self) -> Option<u64> {
+        Some(self.0.lock().generation())
+    }
 }
 
 impl AtlasBackend for WgpuAtlasTextures {
