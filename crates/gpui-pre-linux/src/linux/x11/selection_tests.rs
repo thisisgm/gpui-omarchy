@@ -1,9 +1,14 @@
 use super::*;
 use std::cell::{Cell, RefCell};
+use x11rb::protocol::xproto::{self, SelectionNotifyEvent};
 #[derive(Default)]
 struct FakeWire {
     next: Cell<u32>,
+    reply_delay: Cell<std::time::Duration>,
     owner: Cell<Window>,
+    reply_ready: Cell<Option<Instant>>,
+    owner_ready: Cell<Option<Instant>>,
+    owner_delay: Cell<std::time::Duration>,
     reads: RefCell<VecDeque<PropertyData>>,
     writes: RefCell<Vec<(Window, Atom, Atom, u8, Vec<u8>)>>,
     conversions: RefCell<Vec<(Window, Atom, Atom)>>,
@@ -30,6 +35,17 @@ impl SelectionWire for FakeWire {
         self.destroyed.borrow_mut().push(window);
     }
     fn owner(&self, _: Atom) -> anyhow::Result<Window> {
+        if !self.owner_delay.get().is_zero() {
+            let ready = self.owner_ready.get().unwrap_or_else(|| {
+                let ready = Instant::now() + self.owner_delay.get();
+                self.owner_ready.set(Some(ready));
+                ready
+            });
+            if Instant::now() < ready {
+                return Err(super::super::selection_wire::Pending.into());
+            }
+        }
+        self.owner_ready.set(None);
         Ok(self.owner.get())
     }
     fn own(&self, window: Window, _: Atom) -> anyhow::Result<()> {
@@ -49,6 +65,17 @@ impl SelectionWire for FakeWire {
         Ok(())
     }
     fn property(&self, _: Window, _: Atom, _: u32) -> anyhow::Result<PropertyData> {
+        if !self.reply_delay.get().is_zero() {
+            let ready = self.reply_ready.get().unwrap_or_else(|| {
+                let ready = Instant::now() + self.reply_delay.get();
+                self.reply_ready.set(Some(ready));
+                ready
+            });
+            if Instant::now() < ready {
+                return Err(super::super::selection_wire::Pending.into());
+            }
+        }
+        self.reply_ready.set(None);
         Ok(self
             .reads
             .borrow_mut()
@@ -97,7 +124,41 @@ fn clipboard() -> Clipboard<FakeWire> {
         changes: Vec::new(),
         decode_jobs: Vec::new(),
         handover: None,
+        handover_sent: false,
+        handover_checked: false,
+        initialized: true,
+        queued_events: VecDeque::new(),
+        queued_sets: [None, None],
+        clear_pending: None,
     }
+}
+#[test]
+fn review_x11_handover_waits_for_pending_ownership_setup() {
+    let mut clipboard = clipboard();
+    clipboard.initialized = false;
+    clipboard
+        .set(false, ClipboardItem::new_string("queued owner".into()))
+        .unwrap();
+    let receiver = clipboard.begin_handover().unwrap().unwrap();
+    assert!(!clipboard.handover_sent);
+    clipboard.tick();
+    assert!(clipboard.handover_sent);
+    assert_eq!(
+        clipboard.cached(false).unwrap().text().as_deref(),
+        Some("queued owner")
+    );
+    let manager = clipboard.wire.atom("CLIPBOARD_MANAGER").unwrap();
+    let target = clipboard.wire.atom("SAVE_TARGETS").unwrap();
+    clipboard
+        .handle_event(&Event::SelectionNotify(SelectionNotifyEvent {
+            requestor: clipboard.window,
+            selection: manager,
+            target,
+            ..Default::default()
+        }))
+        .unwrap();
+    futures::executor::block_on(receiver).unwrap();
+    assert!(!clipboard.handover_pending());
 }
 fn request(clipboard: &Clipboard<FakeWire>, target: Atom) -> SelectionRequestEvent {
     SelectionRequestEvent {
@@ -571,4 +632,180 @@ fn same_foreign_owner_replacing_its_selection_invalidates_the_cached_bytes() {
     assert!(clipboard.cached(false).is_none());
     assert!(clipboard.selections[0].generation > generation);
     assert!(clipboard.selections[0].pending.is_some());
+}
+
+#[test]
+fn review_x11_slow_reply_does_not_block_or_outrun_deadline() {
+    let mut clipboard = clipboard();
+    clipboard.replaced(false, 88);
+    let receiver = clipboard.read(false);
+    let window = clipboard.selections[0].pending.unwrap();
+    let target = clipboard.atoms.UTF8_STRING;
+    let targets = clipboard.atoms.TARGETS;
+    notify(
+        &mut clipboard,
+        window,
+        targets,
+        target.to_ne_bytes().to_vec(),
+        32,
+        AtomEnum::ATOM.into(),
+    );
+    clipboard.incoming.get_mut(&window).unwrap().deadline =
+        Instant::now() + std::time::Duration::from_millis(20);
+    clipboard
+        .wire
+        .reply_delay
+        .set(std::time::Duration::from_millis(80));
+    let start = Instant::now();
+    notify(&mut clipboard, window, target, b"late".to_vec(), 8, target);
+    println!("review: event handler returned in {:?}", start.elapsed());
+    assert!(start.elapsed() < std::time::Duration::from_millis(20));
+    std::thread::sleep(std::time::Duration::from_millis(30));
+    clipboard.tick();
+    assert_eq!(
+        futures::executor::block_on(receiver).unwrap(),
+        Err(ClipboardReadError::TimedOut)
+    );
+}
+
+#[test]
+fn review_x11_replaced_selections_cannot_accumulate_unbounded_decode_jobs() {
+    let mut clipboard = clipboard();
+    for _ in 0..MAX_TRANSFERS + 1 {
+        clipboard.replaced(false, 88);
+        let _receiver = clipboard.read(false);
+        let window = clipboard.selections[0].pending.unwrap();
+        let target = clipboard.atoms.UTF8_STRING;
+        let targets = clipboard.atoms.TARGETS;
+        notify(
+            &mut clipboard,
+            window,
+            targets,
+            target.to_ne_bytes().to_vec(),
+            32,
+            AtomEnum::ATOM.into(),
+        );
+        clipboard.wire.reads.borrow_mut().push_back(PropertyData {
+            type_: target,
+            format: 8,
+            bytes: b"queued data".to_vec(),
+            remaining: 0,
+        });
+        clipboard.receive(window, true).unwrap();
+        assert!(
+            clipboard.decode_jobs.len() <= MAX_TRANSFERS,
+            "outstanding jobs exceeded transfer bound: {}",
+            clipboard.decode_jobs.len()
+        );
+        // The real client drains these jobs into background tasks without admission or cancellation.
+        // Keep the jobs here until the final assertion rather than completing that background work.
+        let jobs = std::mem::take(&mut clipboard.decode_jobs);
+        REVIEW_JOBS.with(|pending| pending.borrow_mut().extend(jobs));
+    }
+    REVIEW_JOBS.with(|pending| {
+        assert!(
+            pending.borrow().len() <= MAX_TRANSFERS,
+            "outstanding jobs exceeded transfer bound: {}",
+            pending.borrow().len()
+        )
+    });
+}
+thread_local! {
+    static REVIEW_JOBS: RefCell<Vec<(bool, u64, Vec<MimeRepresentation>)>> = const { RefCell::new(Vec::new()) };
+}
+
+#[test]
+fn review_x11_foreign_custom_mime_survives_public_payload_roundtrip() {
+    let mut clipboard = clipboard();
+    clipboard.replaced(false, 88);
+    let receiver = clipboard.read(false);
+    let window = clipboard.selections[0].pending.unwrap();
+    let mime = "application/x-test-token";
+    let target = clipboard.wire.atom(mime).unwrap();
+    let targets = clipboard.atoms.TARGETS;
+    notify(
+        &mut clipboard,
+        window,
+        targets,
+        target.to_ne_bytes().to_vec(),
+        32,
+        AtomEnum::ATOM.into(),
+    );
+    let result = futures::executor::block_on(receiver).unwrap();
+    assert!(
+        result.is_ok(),
+        "public MIME representation was rejected before requesting its bytes: {result:?}"
+    );
+}
+
+#[test]
+fn review_x11_text_target_accepts_supported_actual_string_encoding() {
+    let mut clipboard = clipboard();
+    clipboard.replaced(false, 88);
+    let receiver = clipboard.read(false);
+    let window = clipboard.selections[0].pending.unwrap();
+    let target = clipboard.wire.atom("TEXT").unwrap();
+    let encoding = clipboard.wire.atom("STRING").unwrap();
+    let targets = clipboard.atoms.TARGETS;
+    notify(
+        &mut clipboard,
+        window,
+        targets,
+        target.to_ne_bytes().to_vec(),
+        32,
+        AtomEnum::ATOM.into(),
+    );
+    notify(
+        &mut clipboard,
+        window,
+        target,
+        vec![b'c', 0xe9],
+        8,
+        encoding,
+    );
+    let result = futures::executor::block_on(receiver).unwrap();
+    assert!(
+        result.is_ok(),
+        "valid TEXT conversion in supported STRING encoding rejected: {result:?}"
+    );
+    assert_eq!(result.unwrap().unwrap().text().as_deref(), Some("c\u{e9}"));
+}
+
+#[test]
+fn review_x11_handover_setup_is_inside_the_absolute_deadline() {
+    let mut clipboard = clipboard();
+    clipboard
+        .set(false, ClipboardItem::new_string("saved".into()))
+        .unwrap();
+    clipboard
+        .wire
+        .owner_delay
+        .set(std::time::Duration::from_millis(80));
+    let start = Instant::now();
+    let receiver = clipboard.begin_handover().unwrap().unwrap();
+    assert!(start.elapsed() < std::time::Duration::from_millis(20));
+    assert!(!clipboard.handover_sent);
+    clipboard.handover.as_mut().unwrap().0 = Instant::now();
+    clipboard.tick();
+    futures::executor::block_on(receiver).unwrap();
+    assert!(!clipboard.handover_pending());
+    assert!(clipboard.wire.conversions.borrow().is_empty());
+}
+#[test]
+fn review_x11_decode_completion_rechecks_absolute_deadline() {
+    let mut clipboard = clipboard();
+    clipboard.replaced(false, 88);
+    let receiver = clipboard.read(false);
+    let generation = clipboard.selections[0].generation;
+    clipboard.selections[0].decode_deadline = Some(Instant::now());
+    clipboard.finish_decode(
+        false,
+        generation,
+        Ok(ClipboardItem::new_string("late decode".into())),
+    );
+    assert_eq!(
+        futures::executor::block_on(receiver).unwrap(),
+        Err(ClipboardReadError::TimedOut)
+    );
+    assert!(clipboard.cached(false).is_none());
 }

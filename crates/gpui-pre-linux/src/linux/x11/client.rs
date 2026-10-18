@@ -17,6 +17,7 @@ use std::{
     ops::Deref,
     path::PathBuf,
     rc::{Rc, Weak},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -199,7 +200,7 @@ pub struct X11ClientState {
     pub(crate) scale_factor: f32,
 
     xkb_context: xkbc::Context,
-    pub(crate) xcb_connection: Rc<XCBConnection>,
+    pub(crate) xcb_connection: Arc<XCBConnection>,
     xkb_device_id: i32,
     client_side_decorations_supported: bool,
     pub(crate) x_root_index: usize,
@@ -210,7 +211,7 @@ pub struct X11ClientState {
     pub(crate) keyboard_focused_window: Option<xproto::Window>,
     pub(crate) xkb: xkbc::State,
     keyboard_layout: LinuxKeyboardLayout,
-    pub(crate) ximc: Option<X11rbClient<Rc<XCBConnection>>>,
+    pub(crate) ximc: Option<X11rbClient<Arc<XCBConnection>>>,
     pub(crate) xim_handler: Option<XimHandler>,
     pub modifiers: Modifiers,
     pub capslock: Capslock,
@@ -382,6 +383,8 @@ impl X11Connection {
             std::ffi::CString::new(display).context("X display name contains a NUL byte")?;
         let (xcb_connection, x_root_index) = XCBConnection::connect(Some(&display_name))
             .with_context(|| format!("failed to connect to X server {display:?}"))?;
+        xcb_connection
+            .prefetch_extension_information(x11rb::protocol::xfixes::X11_EXTENSION_NAME)?;
         xcb_connection.prefetch_extension_information(xkb::X11_EXTENSION_NAME)?;
         xcb_connection.prefetch_extension_information(randr::X11_EXTENSION_NAME)?;
         xcb_connection.prefetch_extension_information(render::X11_EXTENSION_NAME)?;
@@ -487,7 +490,7 @@ impl X11Connection {
         let screen = &xcb_connection.setup().roots[x_root_index];
         let compositor_gpu = detect_compositor_gpu(&xcb_connection, screen);
 
-        let xcb_connection = Rc::new(xcb_connection);
+        let xcb_connection = Arc::new(xcb_connection);
 
         let clipboard = Clipboard::new(
             xcb_connection.clone(),
@@ -495,7 +498,7 @@ impl X11Connection {
         )
         .context("Failed to initialize clipboard")?;
 
-        let ximc = X11rbClient::init(Rc::clone(&xcb_connection), x_root_index, None).ok();
+        let ximc = X11rbClient::init(Arc::clone(&xcb_connection), x_root_index, None).ok();
         let xim_handler = if ximc.is_some() {
             Some(XimHandler::new())
         } else {
@@ -563,6 +566,7 @@ impl X11Connection {
         })));
         // From here on, `Drop` removes whatever was registered if a later step fails.
         connection.register_sources(&handle, background_executor)?;
+        connection.0.clipboard_progress();
         let xcb_connection = connection.0.0.borrow().xcb_connection.clone();
         xcb_flush(&xcb_connection);
         Ok(connection)
@@ -582,7 +586,7 @@ impl X11Client {
         let xcb_connection = self.0.borrow().xcb_connection.clone();
 
         // Safety: Safe if xcb::Connection always returns a valid fd
-        let fd = unsafe { FdWrapper::new(Rc::clone(&xcb_connection)) };
+        let fd = unsafe { FdWrapper::new(Arc::clone(&xcb_connection)) };
         let token = handle
             .insert_source(
                 Generic::new_with_error::<EventHandlerError>(
@@ -2029,7 +2033,7 @@ impl X11ClientState {
         self.ximc.is_some() && self.xim_handler.is_some()
     }
 
-    fn take_xim(&mut self) -> Option<(X11rbClient<Rc<XCBConnection>>, XimHandler)> {
+    fn take_xim(&mut self) -> Option<(X11rbClient<Arc<XCBConnection>>, XimHandler)> {
         let ximc = self
             .ximc
             .take()
@@ -2044,7 +2048,7 @@ impl X11ClientState {
         }
     }
 
-    fn restore_xim(&mut self, ximc: X11rbClient<Rc<XCBConnection>>, xim_handler: XimHandler) {
+    fn restore_xim(&mut self, ximc: X11rbClient<Arc<XCBConnection>>, xim_handler: XimHandler) {
         self.ximc = Some(ximc);
         self.xim_handler = Some(xim_handler);
     }

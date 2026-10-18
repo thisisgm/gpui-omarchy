@@ -88,7 +88,7 @@ x11rb::atom_manager! {
 }
 
 fn query_render_extent(
-    xcb: &Rc<XCBConnection>,
+    xcb: &Arc<XCBConnection>,
     x_window: xproto::Window,
 ) -> anyhow::Result<Size<DevicePixels>> {
     let reply = get_reply(|| "X11 GetGeometry failed.", xcb.get_geometry(x_window))?;
@@ -311,7 +311,7 @@ impl X11WindowState {
 pub(crate) struct X11WindowStatePtr {
     pub state: Rc<RefCell<X11WindowState>>,
     pub(crate) callbacks: Rc<RefCell<Callbacks>>,
-    xcb: Rc<XCBConnection>,
+    xcb: Arc<XCBConnection>,
     pub(crate) x_window: xproto::Window,
 }
 
@@ -463,7 +463,7 @@ impl X11WindowState {
         gpu_context: gpui_wgpu::GpuContext,
         compositor_gpu: Option<CompositorGpuHint>,
         params: WindowParams,
-        xcb: &Rc<XCBConnection>,
+        xcb: &Arc<XCBConnection>,
         client_side_decorations_supported: bool,
         x_main_screen_index: usize,
         x_window: xproto::Window,
@@ -925,7 +925,7 @@ impl X11Window {
         gpu_context: gpui_wgpu::GpuContext,
         compositor_gpu: Option<CompositorGpuHint>,
         params: WindowParams,
-        xcb: &Rc<XCBConnection>,
+        xcb: &Arc<XCBConnection>,
         client_side_decorations_supported: bool,
         x_main_screen_index: usize,
         x_window: xproto::Window,

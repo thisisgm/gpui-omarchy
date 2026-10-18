@@ -2,6 +2,7 @@ mod client;
 mod display;
 mod event;
 mod selection;
+mod selection_wire;
 mod window;
 mod xim_handler;
 

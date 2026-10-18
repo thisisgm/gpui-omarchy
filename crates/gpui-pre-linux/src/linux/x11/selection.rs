@@ -3,26 +3,19 @@ use futures::channel::oneshot;
 use gpui::{ClipboardChange, ClipboardItem, ClipboardReadError, MimePayload, MimeRepresentation};
 use std::{
     collections::{HashMap, VecDeque},
-    rc::Rc,
     sync::Arc,
     time::Instant,
 };
 use x11rb::{
-    COPY_DEPTH_FROM_PARENT, CURRENT_TIME, NONE,
-    connection::Connection,
+    NONE,
     protocol::{
         Event,
-        xfixes::{ConnectionExt as _, SelectionEventMask},
-        xproto::{
-            self, Atom, AtomEnum, ConnectionExt as _, CreateWindowAux, EventMask, PropMode,
-            Property, SelectionNotifyEvent, SelectionRequestEvent, Window,
-        },
+        xproto::{Atom, AtomEnum, Property, SelectionRequestEvent, Window},
     },
-    wrapper::ConnectionExt as _,
     xcb_ffi::XCBConnection,
 };
 
-const CHUNK: usize = 64 * 1024;
+pub(super) const CHUNK: usize = 64 * 1024;
 const INCR_THRESHOLD: usize = 256 * 1024;
 const MAX_TRANSFERS: usize = 16;
 fn preferred_mime_types() -> Vec<String> {
@@ -60,6 +53,9 @@ pub(crate) struct PropertyData {
 }
 
 pub(crate) trait SelectionWire {
+    fn watch_selection(&self, _window: Window, _selection: Atom) -> anyhow::Result<()> {
+        Ok(())
+    }
     fn atom(&self, name: &str) -> anyhow::Result<Atom>;
     fn window(&self) -> anyhow::Result<Window>;
     fn destroy(&self, window: Window);
@@ -87,146 +83,12 @@ pub(crate) trait SelectionWire {
     fn watch_property(&self, window: Window) -> anyhow::Result<()>;
 }
 
-pub(crate) struct Server {
-    connection: Rc<XCBConnection>,
-    root: Window,
+use super::selection_wire::{Server, pending};
+fn wire_error(error: anyhow::Error) -> ClipboardReadError {
+    error
+        .downcast::<ClipboardReadError>()
+        .unwrap_or_else(transfer::transport)
 }
-impl SelectionWire for Server {
-    fn atom(&self, name: &str) -> anyhow::Result<Atom> {
-        Ok(self
-            .connection
-            .intern_atom(false, name.as_bytes())?
-            .reply()?
-            .atom)
-    }
-    fn window(&self) -> anyhow::Result<Window> {
-        let window = self.connection.generate_id()?;
-        self.connection
-            .create_window(
-                COPY_DEPTH_FROM_PARENT,
-                window,
-                self.root,
-                0,
-                0,
-                1,
-                1,
-                0,
-                xproto::WindowClass::INPUT_OUTPUT,
-                0,
-                &CreateWindowAux::new().event_mask(EventMask::PROPERTY_CHANGE),
-            )?
-            .check()?;
-        Ok(window)
-    }
-    fn destroy(&self, window: Window) {
-        let _ = self.connection.destroy_window(window);
-        let _ = self.connection.flush();
-    }
-    fn owner(&self, selection: Atom) -> anyhow::Result<Window> {
-        Ok(self
-            .connection
-            .get_selection_owner(selection)?
-            .reply()?
-            .owner)
-    }
-    fn own(&self, owner: Window, selection: Atom) -> anyhow::Result<()> {
-        self.connection
-            .set_selection_owner(owner, selection, CURRENT_TIME)?;
-        self.connection.flush()?;
-        Ok(())
-    }
-    fn convert(
-        &self,
-        window: Window,
-        selection: Atom,
-        target: Atom,
-        property: Atom,
-    ) -> anyhow::Result<()> {
-        self.connection
-            .convert_selection(window, selection, target, property, CURRENT_TIME)?;
-        self.connection.flush()?;
-        Ok(())
-    }
-    fn property(
-        &self,
-        window: Window,
-        property: Atom,
-        offset: u32,
-    ) -> anyhow::Result<PropertyData> {
-        let reply = self
-            .connection
-            .get_property(
-                false,
-                window,
-                property,
-                AtomEnum::ANY,
-                offset,
-                (CHUNK / 4) as u32,
-            )?
-            .reply()?;
-        Ok(PropertyData {
-            type_: reply.type_,
-            format: reply.format,
-            bytes: reply.value,
-            remaining: reply.bytes_after,
-        })
-    }
-    fn delete(&self, window: Window, property: Atom) -> anyhow::Result<()> {
-        self.connection.delete_property(window, property)?;
-        self.connection.flush()?;
-        Ok(())
-    }
-    fn put(
-        &self,
-        window: Window,
-        property: Atom,
-        type_: Atom,
-        format: u8,
-        bytes: &[u8],
-    ) -> anyhow::Result<()> {
-        if format == 32 {
-            let words: Vec<_> = bytes
-                .chunks_exact(4)
-                .map(|bytes| u32::from_ne_bytes(bytes.try_into().unwrap()))
-                .collect();
-            self.connection.change_property32(
-                PropMode::REPLACE,
-                window,
-                property,
-                type_,
-                &words,
-            )?;
-        } else {
-            self.connection
-                .change_property8(PropMode::REPLACE, window, property, type_, bytes)?;
-        }
-        self.connection.flush()?;
-        Ok(())
-    }
-    fn notify(&self, request: &SelectionRequestEvent, property: Atom) -> anyhow::Result<()> {
-        let event = SelectionNotifyEvent {
-            response_type: xproto::SELECTION_NOTIFY_EVENT,
-            sequence: 0,
-            time: request.time,
-            requestor: request.requestor,
-            selection: request.selection,
-            target: request.target,
-            property,
-        };
-        self.connection
-            .send_event(false, request.requestor, EventMask::NO_EVENT, event)?;
-        self.connection.flush()?;
-        Ok(())
-    }
-    fn watch_property(&self, window: Window) -> anyhow::Result<()> {
-        self.connection.change_window_attributes(
-            window,
-            &xproto::ChangeWindowAttributesAux::new().event_mask(EventMask::PROPERTY_CHANGE),
-        )?;
-        Ok(())
-    }
-}
-
 #[derive(Default)]
 struct Selection {
     owner: Window,
@@ -237,6 +99,8 @@ struct Selection {
     pending: Option<Window>,
     decoding: bool,
     waiters: Vec<oneshot::Sender<ReadResult>>,
+    requested: Option<Instant>,
+    decode_deadline: Option<Instant>,
 }
 struct Outgoing {
     target: Atom,
@@ -259,6 +123,7 @@ struct Incoming {
     offset: u32,
     draining: bool,
     probing: bool,
+    waiting: Option<bool>,
 }
 
 pub(crate) struct Clipboard<W: SelectionWire = Server> {
@@ -271,39 +136,38 @@ pub(crate) struct Clipboard<W: SelectionWire = Server> {
     pub changes: Vec<ClipboardChange>,
     pub decode_jobs: Vec<(bool, u64, Vec<MimeRepresentation>)>,
     handover: Option<(Instant, Vec<oneshot::Sender<()>>)>,
+    handover_sent: bool,
+    handover_checked: bool,
+    initialized: bool,
+    queued_events: VecDeque<(Instant, Event)>,
+    queued_sets: [Option<(Instant, ClipboardItem)>; 2],
+    clear_pending: Option<Instant>,
 }
 impl Clipboard<Server> {
-    pub fn new(connection: Rc<XCBConnection>, root: Window) -> anyhow::Result<Self> {
-        let atoms = Atoms::new(&*connection)?.reply()?;
-        connection.xfixes_query_version(5, 0)?.reply()?;
-        let server = Server { connection, root };
-        let window = server.window()?;
-        for selection in [atoms.CLIPBOARD, atoms.PRIMARY] {
-            server
-                .connection
-                .xfixes_select_selection_input(
-                    window,
-                    selection,
-                    SelectionEventMask::SET_SELECTION_OWNER
-                        | SelectionEventMask::SELECTION_WINDOW_DESTROY
-                        | SelectionEventMask::SELECTION_CLIENT_CLOSE,
-                )?
-                .check()?;
-        }
-        let mut selections = [Selection::default(), Selection::default()];
-        for (index, selection) in [atoms.CLIPBOARD, atoms.PRIMARY].into_iter().enumerate() {
-            selections[index].owner = server.owner(selection)?;
-        }
+    pub fn new(connection: Arc<XCBConnection>, root: Window) -> anyhow::Result<Self> {
         Ok(Self {
-            wire: server,
-            window,
-            atoms,
-            selections,
+            wire: Server::new(connection, root)?,
+            window: NONE,
+            atoms: Atoms {
+                CLIPBOARD: NONE,
+                PRIMARY: NONE,
+                TARGETS: NONE,
+                INCR: NONE,
+                UTF8_STRING: NONE,
+                GPUI_SELECTION: NONE,
+            },
+            selections: [Selection::default(), Selection::default()],
             outgoing: HashMap::new(),
             incoming: HashMap::new(),
             changes: Vec::new(),
             decode_jobs: Vec::new(),
             handover: None,
+            handover_sent: false,
+            handover_checked: false,
+            initialized: false,
+            queued_events: VecDeque::new(),
+            queued_sets: [None, None],
+            clear_pending: None,
         })
     }
 }
@@ -328,22 +192,80 @@ impl<W: SelectionWire> Clipboard<W> {
         let selection = &self.selections[primary as usize];
         selection.item.clone().or_else(|| selection.cached.clone())
     }
+    fn initialize(&mut self) -> anyhow::Result<()> {
+        let names = [
+            "CLIPBOARD",
+            "PRIMARY",
+            "TARGETS",
+            "INCR",
+            "UTF8_STRING",
+            "GPUI_SELECTION",
+        ];
+        let atoms: Vec<_> = names
+            .iter()
+            .map(|name| self.wire.atom(name))
+            .collect::<Result<_, _>>()?;
+        for name in preferred_mime_types().iter().chain(
+            ["CLIPBOARD_MANAGER", "SAVE_TARGETS"]
+                .map(str::to_owned)
+                .iter(),
+        ) {
+            self.wire.atom(name)?;
+        }
+        if self.window == NONE {
+            self.window = self.wire.window()?;
+        }
+        self.atoms = Atoms {
+            CLIPBOARD: atoms[0],
+            PRIMARY: atoms[1],
+            TARGETS: atoms[2],
+            INCR: atoms[3],
+            UTF8_STRING: atoms[4],
+            GPUI_SELECTION: atoms[5],
+        };
+        for atom in [self.atoms.CLIPBOARD, self.atoms.PRIMARY] {
+            self.wire.watch_selection(self.window, atom)?;
+        }
+        self.initialized = true;
+        Ok(())
+    }
     pub fn clear_if_owned(&mut self) -> Result<bool, ClipboardReadError> {
-        if self
-            .wire
-            .owner(self.atoms.CLIPBOARD)
-            .map_err(transfer::transport)?
-            != self.window
-        {
+        if self.selections[0].owner != self.window || self.window == NONE {
             return Ok(false);
         }
-        self.wire
-            .own(NONE, self.atoms.CLIPBOARD)
-            .map_err(transfer::transport)?;
-        self.replaced(false, NONE);
-        Ok(true)
+        self.clear_pending = Some(Instant::now() + TRANSFER_TIMEOUT);
+        match self.try_clear() {
+            Ok(()) => Ok(true),
+            Err(error) if pending(&error) => Ok(true),
+            Err(error) => Err(wire_error(error)),
+        }
+    }
+    fn try_clear(&mut self) -> anyhow::Result<()> {
+        if self.wire.owner(self.atoms.CLIPBOARD)? == self.window {
+            self.wire.own(NONE, self.atoms.CLIPBOARD)?;
+            self.replaced(false, NONE);
+        }
+        self.clear_pending = None;
+        Ok(())
     }
     pub fn set(&mut self, primary: bool, item: ClipboardItem) -> Result<(), ClipboardReadError> {
+        self.queued_sets[primary as usize] = Some((Instant::now() + TRANSFER_TIMEOUT, item));
+        match self.try_set(primary) {
+            Ok(()) => Ok(()),
+            Err(error) if pending(&error) => Ok(()),
+            Err(error) => {
+                self.queued_sets[primary as usize] = None;
+                Err(wire_error(error))
+            }
+        }
+    }
+    fn try_set(&mut self, primary: bool) -> anyhow::Result<()> {
+        if !self.initialized {
+            return Err(super::selection_wire::Pending.into());
+        }
+        let (deadline, item) = self.queued_sets[primary as usize].as_ref().unwrap();
+        let deadline = *deadline;
+        let item = item.clone();
         let mut payload = transfer::snapshot(&item)?;
         if let Some(text) = item.text() {
             let mut representations = payload.representations().to_vec();
@@ -363,6 +285,9 @@ impl<W: SelectionWire> Clipboard<W> {
             payload = MimePayload::new(representations, payload.intent());
         }
         let representations = self.intern(&payload)?;
+        if Instant::now() >= deadline {
+            return Err(ClipboardReadError::TimedOut.into());
+        }
         self.wire
             .own(self.window, self.selection_atom(primary))
             .map_err(transfer::transport)?;
@@ -370,9 +295,10 @@ impl<W: SelectionWire> Clipboard<W> {
         let selection = &mut self.selections[primary as usize];
         selection.item = Some(item);
         selection.snapshot = Some(representations);
+        self.queued_sets[primary as usize] = None;
         Ok(())
     }
-    fn intern(&self, payload: &MimePayload) -> Result<Vec<(Atom, Arc<[u8]>)>, ClipboardReadError> {
+    fn intern(&self, payload: &MimePayload) -> anyhow::Result<Vec<(Atom, Arc<[u8]>)>> {
         payload
             .representations()
             .iter()
@@ -380,13 +306,14 @@ impl<W: SelectionWire> Clipboard<W> {
                 self.wire
                     .atom(representation.mime_type())
                     .map(|atom| (atom, representation.bytes().clone()))
-                    .map_err(transfer::transport)
             })
             .collect()
     }
     fn replaced(&mut self, primary: bool, owner: Window) {
         let selection = &mut self.selections[primary as usize];
         selection.decoding = false;
+        selection.decode_deadline = None;
+        selection.requested = None;
         if let Some(window) = selection.pending.take() {
             self.incoming.remove(&window);
             self.wire.destroy(window);
@@ -413,30 +340,43 @@ impl<W: SelectionWire> Clipboard<W> {
             let _ = sender.send(Ok(Some(item)));
             return receiver;
         }
-        if self.selections[primary as usize].owner == NONE {
+        if self.initialized && self.selections[primary as usize].owner == NONE {
             let _ = sender.send(Ok(None));
             return receiver;
         }
         self.selections[primary as usize].waiters.push(sender);
-        if self.selections[primary as usize].pending.is_none()
-            && !self.selections[primary as usize].decoding
-            && let Err(error) = self.begin(primary)
-        {
-            self.complete_selection(primary, Err(error));
-        }
+        self.selections[primary as usize]
+            .requested
+            .get_or_insert(Instant::now() + TRANSFER_TIMEOUT);
+        self.drive_read(primary);
         receiver
     }
-    fn begin(&mut self, primary: bool) -> Result<(), ClipboardReadError> {
-        if self.incoming.len() >= MAX_TRANSFERS {
-            return Err(ClipboardReadError::Unavailable);
+    fn drive_read(&mut self, primary: bool) {
+        let selection = &self.selections[primary as usize];
+        if !self.initialized
+            || selection.requested.is_none()
+            || selection.pending.is_some()
+            || selection.decoding
+        {
+            return;
         }
-        let window = self.wire.window().map_err(transfer::transport)?;
+        if let Err(error) = self.begin(primary) {
+            if !pending(&error) {
+                self.complete_selection(primary, Err(wire_error(error)));
+            }
+        }
+    }
+    fn begin(&mut self, primary: bool) -> anyhow::Result<()> {
+        if self.incoming.len() >= MAX_TRANSFERS {
+            return Err(ClipboardReadError::Unavailable.into());
+        }
+        let window = self.wire.window()?;
         let selection = &self.selections[primary as usize];
         let incoming = Incoming {
             primary,
             generation: selection.generation,
             owner: selection.owner,
-            deadline: Instant::now() + TRANSFER_TIMEOUT,
+            deadline: selection.requested.unwrap(),
             target: self.atoms.TARGETS,
             mime: None,
             types: VecDeque::new(),
@@ -447,21 +387,22 @@ impl<W: SelectionWire> Clipboard<W> {
             offset: 0,
             draining: false,
             probing: false,
+            waiting: None,
         };
         self.incoming.insert(window, incoming);
         self.selections[primary as usize].pending = Some(window);
-        self.wire
-            .convert(
-                window,
-                self.selection_atom(primary),
-                self.atoms.TARGETS,
-                self.atoms.GPUI_SELECTION,
-            )
-            .map_err(transfer::transport)
+        self.wire.convert(
+            window,
+            self.selection_atom(primary),
+            self.atoms.TARGETS,
+            self.atoms.GPUI_SELECTION,
+        )
     }
     fn complete_selection(&mut self, primary: bool, result: ReadResult) {
         let selection = &mut self.selections[primary as usize];
         selection.decoding = false;
+        selection.decode_deadline = None;
+        selection.requested = None;
         if let Some(window) = selection.pending.take() {
             self.incoming.remove(&window);
             self.wire.destroy(window);
@@ -488,15 +429,19 @@ impl<W: SelectionWire> Clipboard<W> {
         result: Result<ClipboardItem, ClipboardReadError>,
     ) {
         if self.selections[primary as usize].generation == generation {
+            let result = if self.selections[primary as usize]
+                .decode_deadline
+                .is_some_and(|deadline| Instant::now() >= deadline)
+            {
+                Err(ClipboardReadError::TimedOut)
+            } else {
+                result
+            };
             self.complete_selection(primary, result.map(Some));
         }
     }
     pub fn begin_handover(&mut self) -> anyhow::Result<Option<oneshot::Receiver<()>>> {
-        if self.wire.owner(self.atoms.CLIPBOARD)? != self.window {
-            return Ok(None);
-        }
-        let manager = self.wire.atom("CLIPBOARD_MANAGER")?;
-        if self.wire.owner(manager)? == NONE {
+        if self.selections[0].item.is_none() && self.queued_sets[0].is_none() {
             return Ok(None);
         }
         let (sender, receiver) = oneshot::channel();
@@ -506,10 +451,45 @@ impl<W: SelectionWire> Clipboard<W> {
             }
             return Ok(Some(receiver));
         }
-        let target = self.wire.atom("SAVE_TARGETS")?;
-        self.wire.convert(self.window, manager, target, NONE)?;
         self.handover = Some((Instant::now() + TRANSFER_TIMEOUT, vec![sender]));
+        self.handover_sent = false;
+        self.handover_checked = false;
+        if let Err(error) = self.setup_handover() {
+            if !pending(&error) {
+                self.finish_handover();
+                return Err(error);
+            }
+        }
         Ok(Some(receiver))
+    }
+    fn setup_handover(&mut self) -> anyhow::Result<()> {
+        if !self.initialized || self.queued_sets[0].is_some() {
+            return Err(super::selection_wire::Pending.into());
+        }
+        if !self.handover_checked {
+            if self.wire.owner(self.atoms.CLIPBOARD)? != self.window {
+                self.finish_handover();
+                return Ok(());
+            }
+            self.handover_checked = true;
+        }
+        let manager = self.wire.atom("CLIPBOARD_MANAGER")?;
+        let target = self.wire.atom("SAVE_TARGETS")?;
+        if self.wire.owner(manager)? == NONE {
+            self.finish_handover();
+            return Ok(());
+        }
+        if self
+            .handover
+            .as_ref()
+            .is_some_and(|(deadline, _)| Instant::now() >= *deadline)
+        {
+            self.finish_handover();
+            return Ok(());
+        }
+        self.wire.convert(self.window, manager, target, NONE)?;
+        self.handover_sent = true;
+        Ok(())
     }
     pub fn handover_pending(&self) -> bool {
         self.handover.is_some()
@@ -522,6 +502,19 @@ impl<W: SelectionWire> Clipboard<W> {
         }
     }
     pub fn handle_event(&mut self, event: &Event) -> anyhow::Result<bool> {
+        match self.try_event(event) {
+            Err(error) if pending(&error) => {
+                if self.queued_events.len() >= 128 {
+                    self.queued_events.pop_front();
+                }
+                self.queued_events
+                    .push_back((Instant::now() + TRANSFER_TIMEOUT, event.clone()));
+                Ok(true)
+            }
+            result => result,
+        }
+    }
+    fn try_event(&mut self, event: &Event) -> anyhow::Result<bool> {
         match event {
             Event::SelectionNotify(event)
                 if event.requestor == self.window && self.handover.is_some() =>
@@ -690,6 +683,7 @@ impl<W: SelectionWire> Clipboard<W> {
     }
     fn receive(&mut self, window: Window, initial: bool) -> Result<(), ClipboardReadError> {
         let incoming = self.incoming.get_mut(&window).unwrap();
+        incoming.waiting = Some(initial);
         if Instant::now() >= incoming.deadline {
             return Err(ClipboardReadError::TimedOut);
         }
@@ -697,10 +691,18 @@ impl<W: SelectionWire> Clipboard<W> {
         if selection.generation != incoming.generation || selection.owner != incoming.owner {
             return Err(ClipboardReadError::Cancelled);
         }
-        let property = self
+        let property = match self
             .wire
             .property(window, self.atoms.GPUI_SELECTION, incoming.offset)
-            .map_err(transfer::transport)?;
+        {
+            Ok(property) => property,
+            Err(error) if pending(&error) => return Ok(()),
+            Err(error) => return Err(wire_error(error)),
+        };
+        incoming.waiting = None;
+        if Instant::now() >= incoming.deadline {
+            return Err(ClipboardReadError::TimedOut);
+        }
         if initial && property.type_ == self.atoms.INCR {
             if property.format != 32 || property.bytes.len() != 4 {
                 return Err(ClipboardReadError::UnsupportedContent);
@@ -798,11 +800,13 @@ impl<W: SelectionWire> Clipboard<W> {
             } else {
                 let generation = incoming.generation;
                 let representations = std::mem::take(&mut incoming.representations);
+                let deadline = incoming.deadline;
                 self.incoming.remove(&window);
                 self.wire.destroy(window);
                 let selection = &mut self.selections[primary as usize];
                 selection.pending = None;
                 selection.decoding = true;
+                selection.decode_deadline = Some(deadline);
                 self.decode_jobs
                     .push((primary, generation, representations));
             }
@@ -834,9 +838,73 @@ impl<W: SelectionWire> Clipboard<W> {
             .map_err(transfer::transport)
     }
     pub fn active(&self) -> bool {
-        !self.incoming.is_empty() || !self.outgoing.is_empty() || self.handover.is_some()
+        !self.initialized
+            || !self.queued_events.is_empty()
+            || self.queued_sets.iter().any(Option::is_some)
+            || self.clear_pending.is_some()
+            || self
+                .selections
+                .iter()
+                .any(|selection| selection.requested.is_some())
+            || !self.incoming.is_empty()
+            || !self.outgoing.is_empty()
+            || self.handover.is_some()
     }
     pub fn tick(&mut self) {
+        if !self.initialized {
+            if let Err(error) = self.initialize() {
+                if !pending(&error) {
+                    log::error!("X11 clipboard initialization: {error}");
+                }
+            }
+            if !self.initialized {
+                return;
+            }
+        }
+        for primary in [false, true] {
+            if let Some((deadline, _)) = self.queued_sets[primary as usize] {
+                if Instant::now() >= deadline {
+                    self.queued_sets[primary as usize] = None;
+                } else if let Err(error) = self.try_set(primary) {
+                    if !pending(&error) {
+                        self.queued_sets[primary as usize] = None;
+                    }
+                }
+            }
+            if self.selections[primary as usize]
+                .requested
+                .is_some_and(|deadline| Instant::now() >= deadline)
+            {
+                self.complete_selection(primary, Err(ClipboardReadError::TimedOut));
+            } else {
+                self.drive_read(primary);
+            }
+        }
+        if let Some(deadline) = self.clear_pending {
+            if Instant::now() >= deadline {
+                self.clear_pending = None;
+            } else {
+                let _ = self.try_clear();
+            }
+        }
+        let events = std::mem::take(&mut self.queued_events);
+        for (deadline, event) in events {
+            if Instant::now() < deadline {
+                if let Err(error) = self.try_event(&event) {
+                    if pending(&error) {
+                        self.queued_events.push_back((deadline, event));
+                    }
+                }
+            }
+        }
+        if self.handover.is_some() && !self.handover_sent {
+            if let Err(error) = self.setup_handover() {
+                if !pending(&error) {
+                    self.finish_handover();
+                }
+            }
+        }
+
         if self
             .handover
             .as_ref()
@@ -854,8 +922,8 @@ impl<W: SelectionWire> Clipboard<W> {
             let primary = incoming.primary;
             if Instant::now() >= incoming.deadline {
                 self.complete_selection(primary, Err(ClipboardReadError::TimedOut));
-            } else if incoming.draining
-                && let Err(error) = self.receive(window, false)
+            } else if (incoming.draining || incoming.waiting.is_some())
+                && let Err(error) = self.receive(window, incoming.waiting.unwrap_or(false))
             {
                 self.complete_selection(primary, Err(error));
             }
