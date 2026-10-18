@@ -18,7 +18,7 @@ Start one branch per change unit from `main`, with one named change per commit.
 Commit as `GM <gianmarcomorales@icloud.com>`, explaining why the change is needed
 and recording measurement ranges and evidence when available. Independently review
 each unit before integration. Only the integration owner merges to `main`, after
-review and CI failures have been resolved or explicitly accepted.
+independent review and green fork CI.
 
 Consumers use `git = "https://github.com/thisisgm/gpui-omarchy"` with a full commit
 SHA in `rev`. Advance a consumer pin only after that commit is published on `main`.
