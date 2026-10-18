@@ -272,7 +272,12 @@ pub(crate) fn decode(
     let mut entries = vec![ClipboardEntry::Mime(payload.clone())];
     if payload.get(GNOME_FILES).is_some() || payload.get(URI_LIST).is_some() {
         entries.push(ClipboardEntry::ExternalPaths(paths(&payload)?));
-    } else if let Some(bytes) = TEXT_TYPES.iter().find_map(|mime| payload.get(mime)) {
+    } else if let Some(bytes) = TEXT_TYPES
+        .iter()
+        .copied()
+        .chain(["text/plain;charset=UTF-8", "TEXT"])
+        .find_map(|mime| payload.get(mime))
+    {
         let text = std::str::from_utf8(&bytes)
             .map_err(transport)?
             .replace("\r\n", "\n");

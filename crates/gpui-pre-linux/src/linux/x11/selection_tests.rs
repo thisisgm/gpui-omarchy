@@ -125,7 +125,7 @@ fn notify(
     });
     let event = Event::SelectionNotify(SelectionNotifyEvent {
         requestor: window,
-        selection: clipboard.atoms.CLIPBOARD,
+        selection: clipboard.selection_atom(clipboard.incoming[&window].primary),
         target,
         property: clipboard.atoms.GPUI_SELECTION,
         ..Default::default()
@@ -209,6 +209,9 @@ fn foreign_owner_serves_each_file_mime_and_utf8() {
         (transfer::URI_LIST, b"file:///fixture/a\r\n".to_vec()),
         (transfer::GNOME_FILES, b"cut\nfile:///fixture/a\n".to_vec()),
         ("UTF8_STRING", b"plain text".to_vec()),
+        ("text/plain;charset=UTF-8", b"upper charset".to_vec()),
+        ("TEXT", b"legacy text".to_vec()),
+        ("STRING", vec![b'c', 0xe9]),
     ] {
         let mut clipboard = clipboard();
         clipboard.replaced(false, 88);
@@ -478,4 +481,75 @@ fn clearing_a_foreign_clipboard_is_refused() {
         .unwrap();
     assert!(clipboard.clear_if_owned().unwrap());
     assert!(clipboard.cached(false).is_none());
+}
+
+#[test]
+fn foreign_primary_file_selection_uses_the_same_mime_reader() {
+    let mut clipboard = clipboard();
+    clipboard.replaced(true, 88);
+    let receiver = clipboard.read(true);
+    let window = clipboard.selections[1].pending.unwrap();
+    let mime = clipboard.wire.atom(transfer::GNOME_FILES).unwrap();
+    let targets = clipboard.atoms.TARGETS;
+    notify(
+        &mut clipboard,
+        window,
+        targets,
+        mime.to_ne_bytes().to_vec(),
+        32,
+        AtomEnum::ATOM.into(),
+    );
+    notify(
+        &mut clipboard,
+        window,
+        mime,
+        b"cut\nfile:///fixture/a\n".to_vec(),
+        8,
+        mime,
+    );
+    let item = futures::executor::block_on(receiver)
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        item.mime_payload().unwrap().intent(),
+        gpui::SelectionIntent::Cut
+    );
+    assert!(clipboard.cached(false).is_none());
+}
+#[test]
+fn owner_without_targets_can_still_convert_utf8_text() {
+    let mut clipboard = clipboard();
+    clipboard.replaced(false, 88);
+    let receiver = clipboard.read(false);
+    let window = clipboard.selections[0].pending.unwrap();
+    loop {
+        let target = clipboard.incoming[&window].target;
+        if target == clipboard.atoms.UTF8_STRING {
+            break;
+        }
+        clipboard
+            .handle_event(&Event::SelectionNotify(SelectionNotifyEvent {
+                requestor: window,
+                selection: clipboard.atoms.CLIPBOARD,
+                target,
+                property: NONE,
+                ..Default::default()
+            }))
+            .unwrap();
+    }
+    let target = clipboard.atoms.UTF8_STRING;
+    notify(
+        &mut clipboard,
+        window,
+        target,
+        b"legacy owner".to_vec(),
+        8,
+        target,
+    );
+    let item = futures::executor::block_on(receiver)
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(item.text().unwrap(), "legacy owner");
 }

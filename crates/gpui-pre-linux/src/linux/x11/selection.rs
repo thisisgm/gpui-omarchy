@@ -25,6 +25,27 @@ use x11rb::{
 const CHUNK: usize = 64 * 1024;
 const INCR_THRESHOLD: usize = 256 * 1024;
 const MAX_TRANSFERS: usize = 16;
+fn preferred_mime_types() -> Vec<String> {
+    use strum::IntoEnumIterator;
+    let mut names = vec![
+        transfer::GNOME_FILES.to_owned(),
+        transfer::URI_LIST.to_owned(),
+    ];
+    names.extend(gpui::ImageFormat::iter().map(|format| format.mime_type().to_owned()));
+    names.extend(
+        [
+            "UTF8_STRING",
+            "text/plain;charset=utf-8",
+            "text/plain;charset=UTF-8",
+            "STRING",
+            "TEXT",
+            "text/plain",
+        ]
+        .map(str::to_owned),
+    );
+    names
+}
+
 type ReadResult = Result<Option<ClipboardItem>, ClipboardReadError>;
 
 x11rb::atom_manager! {
@@ -237,6 +258,7 @@ struct Incoming {
     incr: bool,
     offset: u32,
     draining: bool,
+    probing: bool,
 }
 
 pub(crate) struct Clipboard<W: SelectionWire = Server> {
@@ -322,7 +344,24 @@ impl<W: SelectionWire> Clipboard<W> {
         Ok(true)
     }
     pub fn set(&mut self, primary: bool, item: ClipboardItem) -> Result<(), ClipboardReadError> {
-        let payload = transfer::snapshot(&item)?;
+        let mut payload = transfer::snapshot(&item)?;
+        if let Some(text) = item.text() {
+            let mut representations = payload.representations().to_vec();
+            let bytes: Arc<[u8]> = text.as_bytes().into();
+            representations.push(MimeRepresentation::new(
+                "text/plain;charset=UTF-8",
+                bytes.clone(),
+            ));
+            representations.push(MimeRepresentation::new("TEXT", bytes));
+            if let Some(bytes) = text
+                .chars()
+                .map(|character| u8::try_from(character as u32).ok())
+                .collect::<Option<Vec<_>>>()
+            {
+                representations.push(MimeRepresentation::new("STRING", bytes));
+            }
+            payload = MimePayload::new(representations, payload.intent());
+        }
         let representations = self.intern(&payload)?;
         self.wire
             .own(self.window, self.selection_atom(primary))
@@ -407,6 +446,7 @@ impl<W: SelectionWire> Clipboard<W> {
             incr: false,
             offset: 0,
             draining: false,
+            probing: false,
         };
         self.incoming.insert(window, incoming);
         self.selections[primary as usize].pending = Some(window);
@@ -526,7 +566,22 @@ impl<W: SelectionWire> Clipboard<W> {
                 }
                 let primary = incoming.primary;
                 if event.property == NONE {
-                    self.complete_selection(primary, Err(ClipboardReadError::UnsupportedContent));
+                    if incoming.target == self.atoms.TARGETS {
+                        let types = self.desired_types().map_err(transfer::transport)?;
+                        let incoming = self.incoming.get_mut(&window).unwrap();
+                        incoming.types = types.into();
+                        incoming.probing = true;
+                    }
+                    if self.incoming[&window].probing {
+                        if let Err(error) = self.next_type(window) {
+                            self.complete_selection(primary, Err(error));
+                        }
+                    } else {
+                        self.complete_selection(
+                            primary,
+                            Err(ClipboardReadError::UnsupportedContent),
+                        );
+                    }
                 } else if event.property == self.atoms.GPUI_SELECTION {
                     if let Err(error) = self.receive(window, true) {
                         self.complete_selection(primary, Err(error));
@@ -704,14 +759,7 @@ impl<W: SelectionWire> Clipboard<W> {
                 available.push(atom);
             }
             incoming.chunk.clear();
-            let mut desired = vec![
-                transfer::GNOME_FILES.to_owned(),
-                transfer::URI_LIST.to_owned(),
-            ];
-            use strum::IntoEnumIterator;
-            desired.extend(gpui::ImageFormat::iter().map(|format| format.mime_type().to_owned()));
-            desired.extend(transfer::TEXT_TYPES.map(str::to_owned));
-            desired.push("STRING".to_owned());
+            let desired = preferred_mime_types();
             for mime in desired {
                 let atom = self.wire.atom(&mime).map_err(transfer::transport)?;
                 if available.contains(&atom) {
@@ -720,6 +768,9 @@ impl<W: SelectionWire> Clipboard<W> {
                 }
             }
         } else {
+            if incoming.probing {
+                incoming.types.clear();
+            }
             incoming.total += incoming.chunk.len();
             incoming.representations.push(MimeRepresentation::new(
                 incoming.mime.take().unwrap(),
@@ -755,6 +806,30 @@ impl<W: SelectionWire> Clipboard<W> {
             }
         }
         Ok(())
+    }
+    fn desired_types(&self) -> anyhow::Result<Vec<(Atom, String)>> {
+        let names = preferred_mime_types();
+        names
+            .into_iter()
+            .map(|name| self.wire.atom(&name).map(|atom| (atom, name)))
+            .collect()
+    }
+    fn next_type(&mut self, window: Window) -> Result<(), ClipboardReadError> {
+        let incoming = self.incoming.get_mut(&window).unwrap();
+        let Some((target, mime)) = incoming.types.pop_front() else {
+            return Err(ClipboardReadError::UnsupportedContent);
+        };
+        incoming.target = target;
+        incoming.mime = Some(mime);
+        let primary = incoming.primary;
+        self.wire
+            .convert(
+                window,
+                self.selection_atom(primary),
+                target,
+                self.atoms.GPUI_SELECTION,
+            )
+            .map_err(transfer::transport)
     }
     pub fn active(&self) -> bool {
         !self.incoming.is_empty() || !self.outgoing.is_empty() || self.handover.is_some()
