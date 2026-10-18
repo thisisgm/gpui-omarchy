@@ -32,6 +32,10 @@ zed-version = "0.1.0"
 zed-rev = "93d745668805029476e6d7fbb19652116fed51de"
 
 [features]
+ci-exclude-bundled-font-tests = []
+ci-exclude-naga-tests = []
+# The imported benchmark lacks criterion and its bundled font fixtures.
+imported-layout-line-bench = []
 bench-support = [
     "gpui/bench-support",
     "dep:image",
@@ -52,6 +56,7 @@ doctest = false
 name = "layout_line"
 path = "benches/layout_line.rs"
 harness = false
+required-features = ["imported-layout-line-bench"]
 
 [dependencies.anyhow]
 version = "1.0.86"

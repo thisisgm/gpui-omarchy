@@ -1393,9 +1393,11 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(not(feature = "ci-exclude-random-test"))]
     use rand::{distr::StandardUniform, prelude::*};
     use std::cmp;
 
+    #[cfg(not(feature = "ci-exclude-random-test"))]
     #[ctor::ctor(unsafe)]
     fn init_logger() {
         zlog::init_test();
@@ -1413,6 +1415,7 @@ mod tests {
         assert_eq!(tree1.items(()), (0..20).chain(50..100).collect::<Vec<u8>>());
     }
 
+    #[cfg(not(feature = "ci-exclude-random-test"))]
     #[test]
     fn test_random() {
         let mut starting_seed = 0;
@@ -1828,6 +1831,7 @@ mod tests {
     #[derive(Ord, PartialOrd, Default, Eq, PartialEq, Clone, Debug)]
     struct Count(usize);
 
+    #[cfg(not(feature = "ci-exclude-random-test"))]
     #[derive(Ord, PartialOrd, Default, Eq, PartialEq, Clone, Debug)]
     struct Sum(usize);
 
@@ -1891,6 +1895,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(feature = "ci-exclude-random-test"))]
     impl Dimension<'_, IntegersSummary> for Sum {
         fn zero(_cx: ()) -> Self {
             Default::default()

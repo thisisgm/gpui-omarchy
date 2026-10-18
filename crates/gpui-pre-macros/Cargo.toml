@@ -32,6 +32,8 @@ zed-version = "0.1.0"
 zed-rev = "93d745668805029476e6d7fbb19652116fed51de"
 
 [features]
+# The imported integration tests lack a declared gpui dependency.
+imported-integration-tests = []
 inspector = []
 
 [lib]
@@ -44,14 +46,17 @@ proc-macro = true
 [[test]]
 name = "derive_context"
 path = "tests/derive_context.rs"
+required-features = ["imported-integration-tests"]
 
 [[test]]
 name = "derive_inspector_reflection"
 path = "tests/derive_inspector_reflection.rs"
+required-features = ["imported-integration-tests"]
 
 [[test]]
 name = "render_test"
 path = "tests/render_test.rs"
+required-features = ["imported-integration-tests"]
 
 [dependencies.heck]
 version = "0.5"

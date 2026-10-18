@@ -2819,17 +2819,20 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(not(feature = "ci-exclude-naga-tests"))]
     #[test]
     fn webgl_shader_is_valid_wgsl_without_storage_buffers() {
         assert!(!WEBGL_SHADERS.contains("var<storage"));
         validate_wgsl(WEBGL_SHADERS, naga::valid::Capabilities::empty());
     }
 
+    #[cfg(not(feature = "ci-exclude-naga-tests"))]
     #[test]
     fn storage_buffer_shader_is_valid_wgsl() {
         validate_wgsl(STORAGE_BUFFER_SHADERS, naga::valid::Capabilities::empty());
     }
 
+    #[cfg(not(feature = "ci-exclude-naga-tests"))]
     #[test]
     fn subpixel_shader_is_valid_wgsl() {
         validate_wgsl(
@@ -2838,6 +2841,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(feature = "ci-exclude-naga-tests"))]
     fn validate_wgsl(source: &str, capabilities: naga::valid::Capabilities) {
         let module = naga::front::wgsl::parse_str(source).expect("shader should parse");
         naga::valid::Validator::new(naga::valid::ValidationFlags::all(), capabilities)

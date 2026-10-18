@@ -1328,7 +1328,7 @@ impl From<Position> for taffy::style::Position {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "ci-exclude-style-perf-tests")))]
 mod tests {
     use crate::{blue, green, px, red, yellow};
 

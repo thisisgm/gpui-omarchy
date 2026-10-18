@@ -356,10 +356,13 @@ fn fix_generic_font_families(db: &mut usvg::fontdb::Database) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(not(feature = "ci-exclude-bundled-font-tests"))]
     use usvg::fontdb::{Database, Family, Query};
 
+    #[cfg(not(feature = "ci-exclude-bundled-font-tests"))]
     const IBM_PLEX_REGULAR: &[u8] =
         include_bytes!("../../../assets/fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf");
+    #[cfg(not(feature = "ci-exclude-bundled-font-tests"))]
     const LILEX_REGULAR: &[u8] = include_bytes!("../../../assets/fonts/lilex/Lilex-Regular.ttf");
 
     #[test]
@@ -390,6 +393,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(not(feature = "ci-exclude-bundled-font-tests"))]
     fn db_with_bundled_fonts() -> Database {
         let mut db = Database::new();
         db.load_font_data(IBM_PLEX_REGULAR.to_vec());
@@ -397,6 +401,7 @@ mod tests {
         db
     }
 
+    #[cfg(not(feature = "ci-exclude-bundled-font-tests"))]
     #[test]
     fn text_with_split_glyph_clusters_in_mixed_fonts_does_not_panic() {
         let mut db = Database::new();
@@ -453,6 +458,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(feature = "ci-exclude-bundled-font-tests"))]
     #[test]
     fn fix_generic_font_families_sets_all_families() {
         let mut db = db_with_bundled_fonts();
@@ -478,6 +484,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(feature = "ci-exclude-bundled-font-tests"))]
     #[test]
     fn test_select_emoji_font_skips_family_without_glyph() {
         let mut db = db_with_bundled_fonts();
@@ -505,6 +512,7 @@ mod tests {
         assert!(font_has_char(&db, selected, '│'));
     }
 
+    #[cfg(not(feature = "ci-exclude-bundled-font-tests"))]
     #[test]
     fn fix_generic_font_families_monospace_resolves_to_lilex() {
         let mut db = db_with_bundled_fonts();

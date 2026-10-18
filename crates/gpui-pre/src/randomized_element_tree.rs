@@ -1418,10 +1418,12 @@ mod tests {
         AnyWindowHandle, Background, BorderStyle, Bounds, ContentMask, Corners, Edges, Pixels,
         ScaledPixels, Size, TestAppContext, size,
     };
+    #[cfg(not(feature = "ci-exclude-random-tree-property-test"))]
     use proptest::prelude::*;
     use std::collections::BTreeSet;
 
     const ELEMENT_COUNT: usize = 64;
+    #[cfg(not(feature = "ci-exclude-random-tree-property-test"))]
     const MUTATION_COUNT: usize = 32;
     const WINDOW_SIZE: Size<Pixels> = size(px(1200.0), px(900.0));
 
@@ -1645,6 +1647,7 @@ mod tests {
             .expect("randomized tree window should remain open until the case completes");
     }
 
+    #[cfg(not(feature = "ci-exclude-random-tree-property-test"))]
     #[gpui::property_test(config = ProptestConfig {
         cases: 4,
         ..Default::default()
@@ -1665,6 +1668,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(feature = "ci-exclude-random-tree-property-test"))]
     fn run_render_equivalence_case(cx: &mut TestAppContext, config: RandomizedElementTreeConfig) {
         let persistent_window = cx.open_window(WINDOW_SIZE, move |_, cx| {
             RandomizedElementTree::new_with_config(config, cx)
@@ -1696,6 +1700,7 @@ mod tests {
             .expect("persistent window should remain open until the case completes");
     }
 
+    #[cfg(not(feature = "ci-exclude-random-tree-property-test"))]
     fn assert_matches_reference(
         persistent_root: &crate::Entity<RandomizedElementTree>,
         persistent_window: AnyWindowHandle,
@@ -1719,6 +1724,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(feature = "ci-exclude-random-tree-property-test"))]
     fn draw_fresh_reference(
         snapshot: RandomizedElementTreeSnapshot,
         cx: &mut TestAppContext,

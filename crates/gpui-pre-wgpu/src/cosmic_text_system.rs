@@ -1303,8 +1303,10 @@ fn check_is_known_emoji_font(postscript_name: &str) -> bool {
 mod tests {
     use super::*;
     #[cfg(feature = "test-support")]
+    #[cfg(not(feature = "ci-exclude-bundled-font-tests"))]
     use std::{cell::RefCell, rc::Rc};
 
+    #[cfg(not(feature = "ci-exclude-bundled-font-tests"))]
     #[test]
     fn all_font_names_tracks_available_families() -> Result<()> {
         let text_system = gpui::TextSystem::new(Arc::new(
@@ -1344,8 +1346,10 @@ mod tests {
         }
     }
 
+    #[cfg(not(feature = "ci-exclude-bundled-font-tests"))]
     const IBM_PLEX: &[u8] =
         include_bytes!("../../../assets/fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf");
+    #[cfg(not(feature = "ci-exclude-bundled-font-tests"))]
     const LILEX: &[u8] = include_bytes!("../../../assets/fonts/lilex/Lilex-Regular.ttf");
 
     /// Every code point of `Bidi_Class=B`, each of which starts a new bidi
@@ -1354,12 +1358,14 @@ mod tests {
         '\u{000a}', '\u{000d}', '\u{001c}', '\u{001d}', '\u{001e}', '\u{0085}', '\u{2029}',
     ];
 
+    #[cfg(not(feature = "ci-exclude-bundled-font-tests"))]
     fn text_system() -> Result<CosmicTextSystem> {
         let text_system = CosmicTextSystem::new_without_system_fonts("IBM Plex Sans");
         text_system.add_fonts(vec![Cow::Borrowed(IBM_PLEX)])?;
         Ok(text_system)
     }
 
+    #[cfg(not(feature = "ci-exclude-bundled-font-tests"))]
     #[test]
     fn font_properties_describe_the_selected_face() -> Result<()> {
         let text_system = text_system()?;
@@ -1385,6 +1391,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(not(feature = "ci-exclude-bundled-font-tests"))]
     fn layout_text(text_system: &CosmicTextSystem, text: &str) -> Result<LineLayout> {
         let font_id = text_system.font_id(&gpui::font("IBM Plex Sans"))?;
         let runs = [FontRun {
@@ -1396,6 +1403,7 @@ mod tests {
 
     /// Mirrors the original crash: mixed-direction text reaching the shaper
     /// through `shape_text`, which only splits lines on `\n`.
+    #[cfg(not(feature = "ci-exclude-bundled-font-tests"))]
     #[test]
     fn shape_text_with_mixed_direction_paragraphs() -> Result<()> {
         let platform_text_system = Arc::new(text_system()?);
@@ -1418,6 +1426,7 @@ mod tests {
     }
 
     #[cfg(feature = "test-support")]
+    #[cfg(not(feature = "ci-exclude-bundled-font-tests"))]
     #[test]
     fn reports_graphemes_that_exhaust_font_fallback() -> Result<()> {
         let platform_text_system = Arc::new(text_system()?);
@@ -1454,6 +1463,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(not(feature = "ci-exclude-bundled-font-tests"))]
     #[test]
     fn combines_missing_glyphs_from_one_grapheme() -> Result<()> {
         let text_system = text_system()?;
@@ -1474,6 +1484,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(not(feature = "ci-exclude-bundled-font-tests"))]
     #[test]
     fn adding_fonts_invalidates_cached_line_layouts() -> Result<()> {
         let platform_text_system = Arc::new(text_system()?);
@@ -1509,6 +1520,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(not(feature = "ci-exclude-bundled-font-tests"))]
     #[test]
     fn layout_line_with_mixed_direction_paragraphs() -> Result<()> {
         let text_system = text_system()?;
@@ -1532,6 +1544,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(not(feature = "ci-exclude-bundled-font-tests"))]
     #[test]
     fn layout_line_with_separators_at_line_edges() -> Result<()> {
         let text_system = text_system()?;
@@ -1554,6 +1567,7 @@ mod tests {
     /// Glyph indices must stay absolute and positions ordered across segment
     /// boundaries, otherwise cursor placement and hit testing desync. Uses
     /// single-direction text so visual order matches logical order.
+    #[cfg(not(feature = "ci-exclude-bundled-font-tests"))]
     #[test]
     fn layout_line_keeps_indices_and_positions_ordered_across_paragraphs() -> Result<()> {
         let text_system = text_system()?;
@@ -1580,6 +1594,7 @@ mod tests {
 
     /// A font run boundary that does not line up with a paragraph boundary must
     /// still be clipped to the right segments.
+    #[cfg(not(feature = "ci-exclude-bundled-font-tests"))]
     #[test]
     fn layout_line_with_font_run_straddling_a_separator() -> Result<()> {
         let text_system = text_system()?;
@@ -1606,6 +1621,7 @@ mod tests {
 
     /// Lines with no separator take the fast path and must be shaped exactly as
     /// they were before paragraph splitting existed.
+    #[cfg(not(feature = "ci-exclude-bundled-font-tests"))]
     #[test]
     fn layout_line_without_separators_takes_fast_path() -> Result<()> {
         let text_system = text_system()?;
@@ -1629,6 +1645,7 @@ mod tests {
     /// zero-width space) can land a few ulps past the width. When that glyph is a
     /// wrap boundary, the row before it extends past the line's width, and hit
     /// testing in that sliver used to panic (ZED-BW8, ZED-75K, ZED-81Z).
+    #[cfg(not(feature = "ci-exclude-bundled-font-tests"))]
     #[test]
     fn index_for_position_past_line_width() -> Result<()> {
         let text_system = Arc::new(gpui::TextSystem::new(Arc::new(text_system()?)));
