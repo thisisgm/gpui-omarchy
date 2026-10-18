@@ -166,6 +166,57 @@ remain enabled.
 - `layout_line_without_separators_takes_fast_path`
 - `index_for_position_past_line_width`
 
+## Logging target-name assertion
+
+Parent `../35-parent-logging-test.log` reproduces
+`logging_tests::logging_preserves_diagnostics_and_callers` failing because the
+published package reports `gpui-pre-util::lib` while the imported assertion
+expects `gpui_util::lib`. CI passes that exact test name through `--skip`.
+The logger test and all its assertions are unchanged; the other util test stays
+active. The runtime exclusion is printed explicitly before the workspace run.
+
+## Documentation examples with an undeclared platform crate
+
+Parent `../38-parent-doctests.log` reproduces exactly the same six failed
+examples as the candidate `../37-workspace-tests-final.log`. Each refers to the
+undeclared `gpui_platform` dependency. CI skips only the following full rustdoc
+test names. All remaining doctests still compile and execute.
+
+- `crates/gpui-pre/src/../README.md - (line 17)`
+- `crates/gpui-pre/src/_ownership_and_data_flow.rs - _ownership_and_data_flow (line 108)`
+- `crates/gpui-pre/src/_ownership_and_data_flow.rs - _ownership_and_data_flow (line 20)`
+- `crates/gpui-pre/src/_ownership_and_data_flow.rs - _ownership_and_data_flow (line 40)`
+- `crates/gpui-pre/src/_ownership_and_data_flow.rs - _ownership_and_data_flow (line 5)`
+- `crates/gpui-pre/src/_ownership_and_data_flow.rs - _ownership_and_data_flow (line 58)`
+
+## Macro documentation examples
+
+Parent `../42-parent-macro-doctests.log` reproduces the same missing `gpui`
+references and missing `TestAppContext` binding as candidate
+`../41-workspace-tests-final.log`. CI skips only:
+
+- `crates/gpui-pre-macros/src/gpui_macros.rs - property_test (line 300)`
+- `crates/gpui-pre-macros/src/gpui_macros.rs - property_test (line 343)`
+- `crates/gpui-pre-macros/src/gpui_macros.rs - test (line 220)`
+
+The three compiling macro doctests remain enabled; two pre-existing ignored
+examples retain their original status.
+
+## Preserve every compiling doctest
+
+This rustdoc splits test arguments on whitespace, so a full test name passed to
+`--skip` would also remove compiling examples from its source file. CI instead
+runs the native targets separately and uses three whitespace-free doctest runs:
+all unaffected items, the ownership/README items, and the macro items. Their union
+covers every non-excluded example, including the passing ownership example and
+all three passing macro examples.
+
+`check-doctest-exclusions.py` checks the complete rustdoc inventory before these
+runs. It requires that the filters remove exactly the nine names listed above.
+A new example colliding with a filter fails this check instead of being silently
+skipped. Test bodies, code-fence annotations, and existing ignore statuses are
+unchanged.
+
 ## Removal policy
 
 These opt-in features guard test declarations and helper imports. Test bodies
