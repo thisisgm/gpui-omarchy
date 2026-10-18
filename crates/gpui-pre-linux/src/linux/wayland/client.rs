@@ -3218,11 +3218,7 @@ impl Dispatch<wl_data_source::WlDataSource, SourceData> for WaylandClientStatePt
                 source.send(&mime_type, fd, &state.common.borrow().background_executor);
             }
             (DataSourceKind::Clipboard, wl_data_source::Event::Cancelled) => {
-                source
-                    .cancel
-                    .store(true, std::sync::atomic::Ordering::Release);
-                if state.clipboard.selection.generation == source.generation {
-                    state.clipboard.selection.set_offer(None);
+                if state.clipboard.selection.cancel_source(source) {
                     crate::linux::transfer::notify_clipboard(
                         &state.common,
                         gpui::ClipboardChange {
@@ -3377,11 +3373,7 @@ impl Dispatch<zwp_primary_selection_source_v1::ZwpPrimarySelectionSourceV1, Sour
                 source.send(&mime_type, fd, &state.common.borrow().background_executor);
             }
             zwp_primary_selection_source_v1::Event::Cancelled => {
-                source
-                    .cancel
-                    .store(true, std::sync::atomic::Ordering::Release);
-                if state.clipboard.primary.generation == source.generation {
-                    state.clipboard.primary.set_offer(None);
+                if state.clipboard.primary.cancel_source(source) {
                     crate::linux::transfer::notify_clipboard(
                         &state.common,
                         gpui::ClipboardChange {

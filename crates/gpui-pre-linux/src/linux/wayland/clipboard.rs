@@ -98,6 +98,9 @@ pub(crate) struct Selection<T: ReceiveData> {
     pub cached: Option<ClipboardItem>,
     pub cancel: Cancel,
     pub marker: String,
+    own_prefix: String,
+    pending_sources: std::collections::HashMap<u64, String>,
+    last_source: u64,
 }
 impl<T: ReceiveData> Default for Selection<T> {
     fn default() -> Self {
@@ -108,6 +111,9 @@ impl<T: ReceiveData> Default for Selection<T> {
             cached: None,
             cancel: transfer::cancelled(),
             marker: String::new(),
+            own_prefix: String::new(),
+            pending_sources: Default::default(),
+            last_source: 0,
         }
     }
 }
@@ -121,26 +127,44 @@ impl<T: ReceiveData> Selection<T> {
     pub fn set(&mut self, item: ClipboardItem) -> u64 {
         self.advance();
         self.offer = None;
-        self.marker = format!(
-            "pid/{}/{}/{}",
-            std::process::id(),
-            self.generation,
-            self as *const _ as usize
-        );
+        if self.own_prefix.is_empty() {
+            self.own_prefix = format!("pid/{}/{}/", std::process::id(), self as *const _ as usize);
+        }
+        self.marker = format!("{}{}", self.own_prefix, self.generation);
+        self.last_source = self.generation;
+        self.pending_sources
+            .insert(self.generation, self.marker.clone());
         self.contents = Some(item);
         self.generation
     }
     pub fn set_offer(&mut self, offer: Option<DataOffer<T>>) {
-        if offer
-            .as_ref()
-            .is_some_and(|offer| offer.mime_types.contains(&self.marker))
-        {
-            self.offer = offer;
+        if let Some(generation) = offer.as_ref().and_then(|offer| {
+            offer.mime_types.iter().find_map(|mime| {
+                (!self.own_prefix.is_empty())
+                    .then(|| mime.strip_prefix(&self.own_prefix))
+                    .flatten()
+                    .and_then(|suffix| suffix.parse::<u64>().ok())
+                    .filter(|generation| *generation <= self.last_source)
+            })
+        }) {
+            self.pending_sources.remove(&generation);
+            if generation == self.generation && self.contents.is_some() {
+                self.offer = offer;
+            }
             return;
         }
         self.advance();
         self.contents = None;
         self.offer = offer;
+    }
+    pub fn cancel_source(&mut self, source: &SourceData) -> bool {
+        source.cancel.store(true, Ordering::Release);
+        self.pending_sources.remove(&source.generation);
+        if self.generation != source.generation || self.contents.is_none() {
+            return false;
+        }
+        self.set_offer(None);
+        true
     }
     pub fn ready(&self) -> Option<ClipboardItem> {
         self.contents.clone().or_else(|| self.cached.clone())
@@ -209,13 +233,9 @@ pub(crate) struct SourceData {
 }
 impl SourceData {
     pub fn send(&self, mime: &str, fd: OwnedFd, executor: &gpui::BackgroundExecutor) {
-        let Ok(permit) = transfer::TransferPermit::acquire() else {
+        let Some((bytes, cancel, permit)) = self.prepare_send(mime) else {
             return;
         };
-        let Some(bytes) = self.payload.get(mime) else {
-            return;
-        };
-        let cancel = self.cancel.clone();
         executor
             .spawn(async move {
                 let _permit = permit;
@@ -229,6 +249,16 @@ impl SourceData {
                 }
             })
             .detach();
+    }
+    fn prepare_send(&self, mime: &str) -> Option<(Arc<[u8]>, Cancel, transfer::TransferPermit)> {
+        if self.cancel.load(Ordering::Acquire) {
+            return None;
+        }
+        Some((
+            self.payload.get(mime)?,
+            self.cancel.clone(),
+            transfer::TransferPermit::acquire().ok()?,
+        ))
     }
 }
 
@@ -268,5 +298,163 @@ mod tests {
             selection.set_offer(None);
         }
         assert_eq!(selection.ready().unwrap().text().unwrap(), "new");
+    }
+}
+
+#[cfg(test)]
+mod review_ownership {
+    use super::*;
+    #[derive(Clone)]
+    pub(super) struct Offer;
+    impl ReceiveData for Offer {
+        fn receive_data(&self, _: String, _: BorrowedFd<'_>) {}
+        fn destroy_offer(&self) {}
+    }
+    pub(super) fn echo(marker: String) -> DataOffer<Offer> {
+        let mut offer = DataOffer::new(Offer);
+        offer.add_mime_type(marker);
+        offer
+    }
+    #[test]
+    fn review_wayland_queued_own_selection_echo_cannot_clear_newer_owner() {
+        let mut selection: Selection<Offer> = Selection::default();
+        selection.set(ClipboardItem::new_string("old".into()));
+        let old_marker = selection.marker.clone();
+        let current = selection.set(ClipboardItem::new_string("new".into()));
+        let current_marker = selection.marker.clone();
+        selection.set_offer(Some(echo(old_marker)));
+        selection.set_offer(Some(echo(current_marker)));
+        assert_eq!(
+            selection.generation, current,
+            "queued old own-selection echo invalidated current generation"
+        );
+        assert_eq!(
+            selection
+                .contents
+                .as_ref()
+                .and_then(ClipboardItem::text)
+                .as_deref(),
+            Some("new")
+        );
+    }
+}
+
+#[cfg(test)]
+mod source_identity_tests {
+    use super::review_ownership::{Offer, echo};
+    use super::*;
+    use std::os::unix::net::UnixStream;
+    use wayland_client::{
+        Dispatch, Proxy, QueueHandle,
+        protocol::{
+            wl_data_device_manager::WlDataDeviceManager, wl_data_source::WlDataSource,
+            wl_registry::WlRegistry,
+        },
+    };
+    use wayland_protocols::wp::primary_selection::zv1::client::{
+        zwp_primary_selection_device_manager_v1::ZwpPrimarySelectionDeviceManagerV1,
+        zwp_primary_selection_source_v1::ZwpPrimarySelectionSourceV1,
+    };
+    struct Harness;
+    wayland_client::delegate_noop!(Harness: ignore WlRegistry);
+    wayland_client::delegate_noop!(Harness: ignore WlDataDeviceManager);
+    wayland_client::delegate_noop!(Harness: ignore ZwpPrimarySelectionDeviceManagerV1);
+    impl Dispatch<WlDataSource, SourceData> for Harness {
+        fn event(
+            _: &mut Self,
+            _: &WlDataSource,
+            _: wayland_client::protocol::wl_data_source::Event,
+            _: &SourceData,
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
+        }
+    }
+    impl Dispatch<ZwpPrimarySelectionSourceV1, SourceData> for Harness {
+        fn event(
+            _: &mut Self,
+            _: &ZwpPrimarySelectionSourceV1,
+            _: wayland_protocols::wp::primary_selection::zv1::client::zwp_primary_selection_source_v1::Event,
+            _: &SourceData,
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
+        }
+    }
+    fn send<P: Proxy>(
+        source: &P,
+        executor: &gpui::BackgroundExecutor,
+        dispatcher: &gpui::TestDispatcher,
+    ) -> Vec<u8> {
+        let (reader, writer) = UnixStream::pair().unwrap();
+        source
+            .data::<SourceData>()
+            .unwrap()
+            .send("UTF8_STRING", writer.into(), executor);
+        dispatcher.run_until_parked();
+        transfer::read(
+            File::from(OwnedFd::from(reader)),
+            &transfer::cancelled(),
+            Instant::now() + std::time::Duration::from_millis(100),
+            1024,
+        )
+        .unwrap()
+    }
+    fn exercise<P: Proxy>(kind: DataSourceKind, make: impl Fn(SourceData) -> P) {
+        let dispatcher = gpui::TestDispatcher::new(0);
+        let executor = gpui::BackgroundExecutor::new(Arc::new(dispatcher.clone()));
+        let mut selection: Selection<Offer> = Selection::default();
+        let mut source = |text: &str| {
+            let item = ClipboardItem::new_string(text.into());
+            let payload = transfer::snapshot(&item).unwrap();
+            let generation = selection.set(item);
+            (
+                make(SourceData {
+                    kind,
+                    generation,
+                    payload,
+                    cancel: transfer::cancelled(),
+                }),
+                selection.marker.clone(),
+            )
+        };
+        let (old, old_marker) = source("old source");
+        let (new, new_marker) = source("new source");
+        assert_ne!(old.id(), new.id());
+        assert_eq!(send(&old, &executor, &dispatcher), b"old source");
+        selection.set_offer(Some(echo(old_marker.clone())));
+        assert!(!selection.cancel_source(old.data().unwrap()));
+        selection.set_offer(Some(echo(old_marker)));
+        selection.set_offer(Some(echo(new_marker)));
+        assert_eq!(
+            selection.generation,
+            new.data::<SourceData>().unwrap().generation
+        );
+        assert_eq!(
+            selection.ready().unwrap().text().as_deref(),
+            Some("new source")
+        );
+        assert_eq!(send(&new, &executor, &dispatcher), b"new source");
+        assert!(send(&old, &executor, &dispatcher).is_empty());
+        let receive_cancel = selection.cancel.clone();
+        assert!(selection.cancel_source(new.data().unwrap()));
+        assert!(receive_cancel.load(Ordering::Acquire));
+        assert!(selection.ready().is_none());
+    }
+    #[test]
+    fn source_associated_send_cancel_and_queued_echoes_preserve_latest_owner() {
+        let (socket, _server) = UnixStream::pair().unwrap();
+        let connection = Connection::from_socket(socket).unwrap();
+        let queue = connection.new_event_queue::<Harness>();
+        let qh = queue.handle();
+        let registry = connection.display().get_registry(&qh, ());
+        let manager: WlDataDeviceManager = registry.bind(1, 3, &qh, ());
+        exercise(DataSourceKind::Clipboard, |data| {
+            manager.create_data_source(&qh, data)
+        });
+        let primary: ZwpPrimarySelectionDeviceManagerV1 = registry.bind(2, 1, &qh, ());
+        exercise(DataSourceKind::Primary, |data| {
+            primary.create_source(&qh, data)
+        });
     }
 }
