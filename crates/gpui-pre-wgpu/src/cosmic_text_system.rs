@@ -183,7 +183,11 @@ fn locale_from_env() -> String {
         .filter_map(|name| std::env::var(name).ok())
         .find(|value| !value.is_empty())
         .unwrap_or_default();
-    let tag = posix.split(['.', '@']).next().unwrap_or_default().replace('_', "-");
+    let tag = posix
+        .split(['.', '@'])
+        .next()
+        .unwrap_or_default()
+        .replace('_', "-");
     if tag.is_empty() || tag == "C" || tag == "POSIX" {
         "en-US".to_string()
     } else {

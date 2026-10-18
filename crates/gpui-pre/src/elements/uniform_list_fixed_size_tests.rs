@@ -52,16 +52,20 @@ fn fixed_item_size_matches_measured_layout(cx: &mut TestAppContext) {
                         .base_handle
                         .set_offset(point(px(0.0), px(-offset)));
                     let calls = Rc::new(RefCell::new(Vec::<Range<usize>>::new()));
-                    cx.draw(point(px(0.0), px(0.0)), size(px(100.0), px(200.0)), |_, cx| {
-                        cx.new(|_| TestList {
-                            count,
-                            fixed,
-                            unconstrained,
-                            handle: handle.clone(),
-                            calls: calls.clone(),
-                        })
-                        .into_any_element()
-                    });
+                    cx.draw(
+                        point(px(0.0), px(0.0)),
+                        size(px(100.0), px(200.0)),
+                        |_, cx| {
+                            cx.new(|_| TestList {
+                                count,
+                                fixed,
+                                unconstrained,
+                                handle: handle.clone(),
+                                calls: calls.clone(),
+                            })
+                            .into_any_element()
+                        },
+                    );
 
                     let scroll = handle.0.borrow();
                     let last_size = scroll.last_item_size.expect("prepaint captured sizes");

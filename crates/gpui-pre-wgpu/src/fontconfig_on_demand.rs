@@ -29,7 +29,10 @@ impl OnDemandFonts {
     }
 
     /// Not-yet-loaded files of fontconfig's preferred face for each character not tried before.
-    pub(crate) fn new_covering_files(&mut self, chars: impl IntoIterator<Item = char>) -> Vec<PathBuf> {
+    pub(crate) fn new_covering_files(
+        &mut self,
+        chars: impl IntoIterator<Item = char>,
+    ) -> Vec<PathBuf> {
         let mut files = Vec::new();
         for ch in chars {
             if self.tried_chars.insert(ch) {

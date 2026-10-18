@@ -1,7 +1,7 @@
 // Modified for gpui-pre (snapshot of zed@93d7456): this module is added by the script.
 // Injected by gpui-kit's script/bump-gpui.ts. Keep fixes in that script.
 use proc_macro::{Group, Ident, Literal, Punct, Spacing, TokenStream, TokenTree};
-use proc_macro_crate::{crate_name, FoundCrate};
+use proc_macro_crate::{FoundCrate, crate_name};
 
 enum FacadePath {
     Itself,
@@ -23,7 +23,8 @@ fn rewrite_stream(stream: TokenStream, facade: Option<&FacadePath>) -> TokenStre
     for (index, token) in tokens.iter().enumerate() {
         match token {
             TokenTree::Group(group) => {
-                let mut rewritten = Group::new(group.delimiter(), rewrite_stream(group.stream(), facade));
+                let mut rewritten =
+                    Group::new(group.delimiter(), rewrite_stream(group.stream(), facade));
                 rewritten.set_span(group.span());
                 output.extend([TokenTree::Group(rewritten)]);
             }
@@ -69,16 +70,19 @@ fn append_path_head(output: &mut TokenStream, original: &Ident, facade: Option<&
 fn rewrite_literal(literal: &Literal, facade: Option<&FacadePath>) -> Literal {
     let (gpui, platform) = match facade {
         Some(FacadePath::Itself) => ("crate::".into(), "crate::platform::".into()),
-        Some(FacadePath::Name(name)) =>
-            (format!("::{name}::"), format!("::{name}::platform::")),
+        Some(FacadePath::Name(name)) => (format!("::{name}::"), format!("::{name}::platform::")),
         None => return literal.clone(),
     };
     let text = literal.to_string();
     let rewritten = text
         .replace("::gpui_platform::", &platform)
         .replace("::gpui::", &gpui);
-    if rewritten == text { return literal.clone() }
-    let Ok(parsed) = rewritten.parse::<TokenStream>() else { return literal.clone() };
+    if rewritten == text {
+        return literal.clone();
+    }
+    let Ok(parsed) = rewritten.parse::<TokenStream>() else {
+        return literal.clone();
+    };
     let mut tokens = parsed.into_iter();
     match (tokens.next(), tokens.next()) {
         (Some(TokenTree::Literal(literal)), None) => literal,

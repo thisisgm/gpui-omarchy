@@ -124,7 +124,9 @@ impl LinuxCommon {
 
         #[cfg(any(feature = "wayland", feature = "x11"))]
         // Omarchy: fonts are read through fontconfig when first used, not all parsed at startup.
-        let text_system = Arc::new(crate::linux::CosmicTextSystem::new_on_demand("IBM Plex Sans"));
+        let text_system = Arc::new(crate::linux::CosmicTextSystem::new_on_demand(
+            "IBM Plex Sans",
+        ));
         #[cfg(not(any(feature = "wayland", feature = "x11")))]
         let text_system = Arc::new(gpui::NoopTextSystem::new());
 

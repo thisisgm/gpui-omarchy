@@ -376,12 +376,11 @@ impl WgpuRenderer {
         for backends in [wgpu::Backends::VULKAN, wgpu::Backends::GL] {
             let instance =
                 WgpuContext::instance_with_backends(Some(Box::new(window.clone())), backends);
-            let attempt = Self::create_raw_surface(&instance, raw_window_handle).and_then(
-                |surface| {
+            let attempt =
+                Self::create_raw_surface(&instance, raw_window_handle).and_then(|surface| {
                     WgpuContext::new(instance, &surface, compositor_gpu)
                         .map(|context| (context, surface))
-                },
-            );
+                });
             match attempt {
                 Ok(created) => return Ok(created),
                 Err(error) => {
