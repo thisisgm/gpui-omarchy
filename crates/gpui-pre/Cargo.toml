@@ -264,6 +264,11 @@ path = "examples/window_shadow.rs"
 name = "action_macros"
 path = "tests/action_macros.rs"
 
+[[test]]
+name = "uniform_list_fixed_size"
+path = "tests/uniform_list_fixed_size.rs"
+required-features = ["test-support"]
+
 [dependencies.accesskit]
 version = "0.24.0"
 features = ["enumn"]

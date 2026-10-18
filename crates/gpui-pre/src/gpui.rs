@@ -63,6 +63,9 @@ mod taffy;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test;
 mod text_system;
+#[cfg(test)]
+#[path = "elements/uniform_list_fixed_size_tests.rs"]
+mod uniform_list_fixed_size_tests;
 mod util;
 mod view;
 mod window;

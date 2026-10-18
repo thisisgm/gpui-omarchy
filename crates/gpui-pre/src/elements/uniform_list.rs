@@ -51,6 +51,7 @@ where
         scroll_handle: None,
         sizing_behavior: ListSizingBehavior::default(),
         horizontal_sizing_behavior: ListHorizontalSizingBehavior::default(),
+        fixed_item_size: None,
     }
 }
 
@@ -66,6 +67,9 @@ pub struct UniformList {
     scroll_handle: Option<UniformListScrollHandle>,
     sizing_behavior: ListSizingBehavior,
     horizontal_sizing_behavior: ListHorizontalSizingBehavior,
+    /// When set, declares that every item measures exactly this size, and the
+    /// per-frame measurement of the first item is skipped entirely.
+    fixed_item_size: Option<Size<Pixels>>,
 }
 
 /// Frame state used by the [UniformList].
@@ -280,7 +284,9 @@ impl Element for UniformList {
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
         let max_items = self.item_count;
-        let item_size = self.measure_item(None, window, cx);
+        let item_size = self
+            .item_size_for()
+            .unwrap_or_else(|| self.measure_item(None, window, cx));
         let layout_id = self.interactivity.request_layout(
             global_id,
             inspector_id,
@@ -356,7 +362,9 @@ impl Element for UniformList {
             ListHorizontalSizingBehavior::Unconstrained
         );
 
-        let longest_item_size = self.measure_item(None, window, cx);
+        let longest_item_size = self
+            .item_size_for()
+            .unwrap_or_else(|| self.measure_item(None, window, cx));
         let content_width = if can_scroll_horizontally {
             padded_bounds.size.width.max(longest_item_size.width)
         } else {
@@ -658,6 +666,22 @@ impl UniformList {
         self
     }
 
+    /// Opt-in fast path: declares that every item measures exactly `item_size`,
+    /// skipping the render and layout of a first item that `measure_item` otherwise
+    /// performs on both the request_layout and prepaint pass of every frame.
+    ///
+    /// The declared size must hold for every item. A violation shows up as rows
+    /// overlapping or leaving vertical gaps, never as an error. The declared width
+    /// is consumed in exactly the places the measured width was: by
+    /// `ListSizingBehavior::Infer` when the list is sized from Min/MaxContent width,
+    /// and by `ListHorizontalSizingBehavior::Unconstrained` to compute content width
+    /// for horizontal scrolling. The item measured's `with_width_from_item` index is
+    /// inert while this fast path is enabled.
+    pub fn fixed_item_size(mut self, item_size: Size<Pixels>) -> Self {
+        self.fixed_item_size = Some(item_size);
+        self
+    }
+
     fn measure_item(
         &self,
         list_width: Option<Pixels>,
@@ -680,6 +704,17 @@ impl UniformList {
             AvailableSpace::MinContent,
         );
         item_to_measure.layout_as_root(available_space, window, cx)
+    }
+
+    /// The declared item size when the opt-in fast path is active, or `None` when
+    /// the list is empty or the fast path is not enabled. An empty list keeps its
+    /// baseline path so its behavior stays unchanged.
+    fn item_size_for(&self) -> Option<Size<Pixels>> {
+        if self.item_count == 0 {
+            None
+        } else {
+            self.fixed_item_size
+        }
     }
 
     /// Track and render scroll state of this list with reference to the given scroll handle.
