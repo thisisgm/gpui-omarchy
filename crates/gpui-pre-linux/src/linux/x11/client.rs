@@ -42,10 +42,9 @@ use xkbcommon::xkb::{self as xkbc, STATE_LAYOUT_EFFECTIVE};
 
 use super::{
     ButtonOrScroll, ScrollDirection, X11Display, X11WindowStatePtr, XcbAtoms, XimCallbackEvent,
-    XimHandler, button_or_scroll_from_event_detail, check_reply,
-    selection::Clipboard,
-    get_reply, get_valuator_axis_index, handle_connection_error, modifiers_from_state,
-    pressed_button_from_mask, xcb_flush,
+    XimHandler, button_or_scroll_from_event_detail, check_reply, get_reply,
+    get_valuator_axis_index, handle_connection_error, modifiers_from_state,
+    pressed_button_from_mask, selection::Clipboard, xcb_flush,
 };
 
 use crate::linux::{
@@ -59,11 +58,10 @@ use crate::linux::{
 use crate::linux::{LinuxCommon, LinuxKeyboardLayout, X11Window, modifiers_from_xinput_info};
 
 use gpui::{
-    AnyWindowHandle, Bounds, ClipboardItem, CursorStyle, FileDropEvent, FrameRequestSource,
-    Keystroke, Modifiers, ModifiersChangedEvent, MouseButton, Pixels, PlatformDisplay,
-    PlatformFrameSignal, PlatformInput, PlatformKeyboardLayout, PlatformWindow, Point,
-    RequestFrameOptions, ScrollDelta, Size, TouchPhase, WindowButtonLayout, WindowParams,
-    WindowVisibility, point, px,
+    AnyWindowHandle, Bounds, CursorStyle, FileDropEvent, FrameRequestSource, Keystroke, Modifiers,
+    ModifiersChangedEvent, MouseButton, Pixels, PlatformDisplay, PlatformFrameSignal,
+    PlatformInput, PlatformKeyboardLayout, PlatformWindow, Point, RequestFrameOptions, ScrollDelta,
+    Size, TouchPhase, WindowButtonLayout, WindowParams, WindowVisibility, point, px,
 };
 use gpui_wgpu::{CompositorGpuHint, GpuContext};
 
@@ -337,7 +335,9 @@ impl Drop for X11Connection {
     fn drop(&mut self) {
         let mut state = self.0.0.borrow_mut();
         state.common.borrow_mut().after_runnable = None;
-        if let Some(token) = state.clipboard_timer.take() { state.loop_handle.remove(token); }
+        if let Some(token) = state.clipboard_timer.take() {
+            state.loop_handle.remove(token);
+        }
         for token in std::mem::take(&mut state.registrations) {
             state.loop_handle.remove(token);
         }
@@ -484,12 +484,16 @@ impl X11Connection {
             .reply()
             .context("Failed to initialize cursor theme handler")?;
 
-        let clipboard = Clipboard::new(xcb_connection.clone(), xcb_connection.setup().roots[x_root_index].root).context("Failed to initialize clipboard")?;
-
         let screen = &xcb_connection.setup().roots[x_root_index];
         let compositor_gpu = detect_compositor_gpu(&xcb_connection, screen);
 
         let xcb_connection = Rc::new(xcb_connection);
+
+        let clipboard = Clipboard::new(
+            xcb_connection.clone(),
+            xcb_connection.setup().roots[x_root_index].root,
+        )
+        .context("Failed to initialize clipboard")?;
 
         let ximc = X11rbClient::init(Rc::clone(&xcb_connection), x_root_index, None).ok();
         let xim_handler = if ximc.is_some() {
@@ -883,7 +887,14 @@ impl X11Client {
     fn handle_event(&self, event: Event) -> Option<()> {
         let selection_event = self.0.borrow_mut().clipboard.handle_event(&event);
         self.clipboard_progress();
-        match selection_event { Ok(true) => return Some(()), Err(error) => { log::debug!("native clipboard event: {error}"); return Some(()); }, Ok(false) => (), }
+        match selection_event {
+            Ok(true) => return Some(()),
+            Err(error) => {
+                log::debug!("native clipboard event: {error}");
+                return Some(());
+            }
+            Ok(false) => (),
+        }
 
         match event {
             Event::UnmapNotify(event) => {
@@ -1828,34 +1839,126 @@ impl X11Client {
         );
     }
 
-    pub(crate) fn write_to_primary(&self, item: gpui::ClipboardItem) { self.set_clipboard(true, item); }
-    pub(crate) fn write_to_clipboard(&self, item: gpui::ClipboardItem) { self.set_clipboard(false, item); }
+    pub(crate) fn begin_clipboard_handover(
+        &self,
+    ) -> Option<futures::channel::oneshot::Receiver<()>> {
+        let receiver = self
+            .0
+            .borrow_mut()
+            .clipboard
+            .begin_handover()
+            .unwrap_or_else(|error| {
+                log::debug!("native clipboard manager handover: {error}");
+                None
+            });
+        self.clipboard_progress();
+        receiver
+    }
+    pub(crate) fn clipboard_handover_pending(&self) -> bool {
+        self.0.borrow().clipboard.handover_pending()
+    }
+
+    pub(crate) fn clear_clipboard_if_owned(&self) -> bool {
+        let cleared = self
+            .0
+            .borrow_mut()
+            .clipboard
+            .clear_if_owned()
+            .unwrap_or_else(|error| {
+                log::debug!("native clipboard clear: {error}");
+                false
+            });
+        self.clipboard_progress();
+        cleared
+    }
+
+    pub(crate) fn write_to_primary(&self, item: gpui::ClipboardItem) {
+        self.set_clipboard(true, item);
+    }
+    pub(crate) fn write_to_clipboard(&self, item: gpui::ClipboardItem) {
+        self.set_clipboard(false, item);
+    }
     fn set_clipboard(&self, primary: bool, item: gpui::ClipboardItem) {
         let result = self.0.borrow_mut().clipboard.set(primary, item);
-        if let Err(error) = result { log::debug!("native clipboard write: {error}"); }
+        if let Err(error) = result {
+            log::debug!("native clipboard write: {error}");
+        }
         self.clipboard_progress();
     }
-    pub(crate) fn read_from_primary(&self) -> Option<gpui::ClipboardItem> { self.0.borrow().clipboard.cached(true) }
-    pub(crate) fn read_from_clipboard(&self) -> Option<gpui::ClipboardItem> { self.0.borrow().clipboard.cached(false) }
-    pub(crate) fn read_from_clipboard_async(&self) -> gpui::Task<Result<Option<gpui::ClipboardItem>, gpui::ClipboardReadError>> {
+    pub(crate) fn read_from_primary(&self) -> Option<gpui::ClipboardItem> {
+        self.0.borrow().clipboard.cached(true)
+    }
+    pub(crate) fn read_from_clipboard(&self) -> Option<gpui::ClipboardItem> {
+        self.0.borrow().clipboard.cached(false)
+    }
+    pub(crate) fn read_from_clipboard_async(
+        &self,
+    ) -> gpui::Task<Result<Option<gpui::ClipboardItem>, gpui::ClipboardReadError>> {
         let receiver = self.0.borrow_mut().clipboard.read(false);
         self.clipboard_progress();
-        self.0.borrow().common.borrow().foreground_executor.spawn(async move { receiver.await.unwrap_or(Err(gpui::ClipboardReadError::Cancelled)) })
+        self.0
+            .borrow()
+            .common
+            .borrow()
+            .foreground_executor
+            .spawn(async move {
+                receiver
+                    .await
+                    .unwrap_or(Err(gpui::ClipboardReadError::Cancelled))
+            })
     }
     fn clipboard_progress(&self) {
         let mut state = self.0.borrow_mut();
-        for event in std::mem::take(&mut state.clipboard.changes) { crate::linux::transfer::notify_clipboard(&state.common, event); }
-        if !state.clipboard.active() || state.clipboard_timer.is_some() { return; }
+        for event in std::mem::take(&mut state.clipboard.changes) {
+            crate::linux::transfer::notify_clipboard(&state.common, event);
+        }
+        for (primary, generation, representations) in
+            std::mem::take(&mut state.clipboard.decode_jobs)
+        {
+            let this = state.this.clone();
+            let background = state.common.borrow().background_executor.clone();
+            let foreground = state.common.borrow().foreground_executor.clone();
+            let task =
+                background.spawn(async move { crate::linux::transfer::decode(representations) });
+            foreground
+                .spawn(async move {
+                    let result = task.await;
+                    if let Some(client) = this.get_client() {
+                        client
+                            .0
+                            .borrow_mut()
+                            .clipboard
+                            .finish_decode(primary, generation, result);
+                        client.clipboard_progress();
+                    }
+                })
+                .detach();
+        }
+        if !state.clipboard.active() || state.clipboard_timer.is_some() {
+            return;
+        }
         let this = state.this.clone();
-        let token = state.loop_handle.insert_source(calloop::timer::Timer::from_duration(Duration::from_millis(1)), move |_, _, _| {
-            let Some(client) = this.get_client() else { return calloop::timer::TimeoutAction::Drop; };
-            client.0.borrow_mut().clipboard.tick();
-            client.clipboard_progress();
-            let mut state = client.0.borrow_mut();
-            if state.clipboard.active() { calloop::timer::TimeoutAction::ToDuration(Duration::from_millis(5)) }
-            else { state.clipboard_timer = None; calloop::timer::TimeoutAction::Drop }
-        });
-        match token { Ok(token) => state.clipboard_timer = Some(token), Err(error) => log::error!("native clipboard deadline timer: {error}") }
+        let token = state.loop_handle.insert_source(
+            calloop::timer::Timer::from_duration(Duration::from_millis(1)),
+            move |_, _, _| {
+                let Some(client) = this.get_client() else {
+                    return calloop::timer::TimeoutAction::Drop;
+                };
+                client.0.borrow_mut().clipboard.tick();
+                client.clipboard_progress();
+                let mut state = client.0.borrow_mut();
+                if state.clipboard.active() {
+                    calloop::timer::TimeoutAction::ToDuration(Duration::from_millis(5))
+                } else {
+                    state.clipboard_timer = None;
+                    calloop::timer::TimeoutAction::Drop
+                }
+            },
+        );
+        match token {
+            Ok(token) => state.clipboard_timer = Some(token),
+            Err(error) => log::error!("native clipboard deadline timer: {error}"),
+        }
     }
 
     pub(crate) fn active_window(&self) -> Option<AnyWindowHandle> {

@@ -1,8 +1,8 @@
 mod client;
 mod clipboard;
-mod drag;
 mod cursor;
 mod display;
+mod drag;
 mod popup;
 mod serial;
 mod window;

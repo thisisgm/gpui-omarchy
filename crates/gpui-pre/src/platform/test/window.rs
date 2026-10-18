@@ -57,6 +57,7 @@ pub(crate) struct TestWindowState {
     scale_factor: f32,
     appearance: WindowAppearance,
     external_drag_files: Vec<(PathBuf, bool)>,
+    external_drag_payloads: Vec<crate::ExternalDragPayload>,
     start_external_drag_result: bool,
 }
 
@@ -132,6 +133,7 @@ impl TestWindow {
             scale_factor: 2.0,
             appearance: WindowAppearance::Light,
             external_drag_files: Vec::new(),
+            external_drag_payloads: Vec::new(),
             start_external_drag_result: false,
         })))
     }
@@ -294,6 +296,11 @@ impl TestWindow {
         let result = callback(event);
         self.0.lock().input_callback = Some(callback);
         !result.propagate
+    }
+
+    /// Immutable payloads handed to the simulated native drag source.
+    pub fn external_drag_payloads(&self) -> Vec<crate::ExternalDragPayload> {
+        self.0.lock().external_drag_payloads.clone()
     }
 
     pub fn external_drag_files(&self) -> Vec<(PathBuf, bool)> {
@@ -595,7 +602,9 @@ impl PlatformWindow for TestWindow {
 
     fn start_external_drag(&self, payload: &crate::ExternalDragPayload) -> bool {
         let mut state = self.0.lock();
+        state.external_drag_payloads.push(payload.clone());
         match payload {
+            crate::ExternalDragPayload::Mime(_) => (),
             crate::ExternalDragPayload::Files(paths) => {
                 state.external_drag_files.extend_from_slice(paths.entries());
             }

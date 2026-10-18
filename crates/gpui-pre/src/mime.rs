@@ -12,14 +12,21 @@ pub struct MimeRepresentation {
 impl MimeRepresentation {
     /// Captures bytes once, independently of later clipboard or selection changes.
     pub fn new(mime_type: impl Into<Arc<str>>, bytes: impl Into<Arc<[u8]>>) -> Self {
-        Self { mime_type: mime_type.into(), bytes: bytes.into() }
+        Self {
+            mime_type: mime_type.into(),
+            bytes: bytes.into(),
+        }
     }
 
     /// The exact advertised type.
-    pub fn mime_type(&self) -> &str { &self.mime_type }
+    pub fn mime_type(&self) -> &str {
+        &self.mime_type
+    }
 
     /// The bytes served only for this type.
-    pub fn bytes(&self) -> &Arc<[u8]> { &self.bytes }
+    pub fn bytes(&self) -> &Arc<[u8]> {
+        &self.bytes
+    }
 }
 
 /// File-selection intent, independent of the negotiated transport action.
@@ -41,26 +48,43 @@ pub struct MimePayload {
 
 impl MimePayload {
     /// Captures distinct MIME types, preserving the first representation of each type.
-    pub fn new(representations: impl IntoIterator<Item = MimeRepresentation>, intent: SelectionIntent) -> Self {
+    pub fn new(
+        representations: impl IntoIterator<Item = MimeRepresentation>,
+        intent: SelectionIntent,
+    ) -> Self {
         let mut unique: Vec<MimeRepresentation> = Vec::new();
         for representation in representations {
-            if !representation.mime_type.is_empty() && !unique.iter().any(|other| other.mime_type == representation.mime_type) {
+            if !representation.mime_type.is_empty()
+                && !unique
+                    .iter()
+                    .any(|other| other.mime_type == representation.mime_type)
+            {
                 unique.push(representation);
             }
         }
-        Self { representations: unique.into(), intent }
+        Self {
+            representations: unique.into(),
+            intent,
+        }
     }
 
     /// All representations, in caller preference order.
-    pub fn representations(&self) -> &[MimeRepresentation] { &self.representations }
+    pub fn representations(&self) -> &[MimeRepresentation] {
+        &self.representations
+    }
 
     /// The immutable bytes associated with a requested type.
     pub fn get(&self, mime_type: &str) -> Option<Arc<[u8]>> {
-        self.representations.iter().find(|entry| entry.mime_type() == mime_type).map(|entry| entry.bytes.clone())
+        self.representations
+            .iter()
+            .find(|entry| entry.mime_type() == mime_type)
+            .map(|entry| entry.bytes.clone())
     }
 
     /// The selection's semantic intent.
-    pub fn intent(&self) -> SelectionIntent { self.intent }
+    pub fn intent(&self) -> SelectionIntent {
+        self.intent
+    }
 }
 
 /// An action understood by the native data-transfer protocol.
@@ -84,7 +108,13 @@ pub struct NativeDragActions {
 }
 
 impl Default for NativeDragActions {
-    fn default() -> Self { Self { copy: true, move_: false, preferred: NativeDragAction::Copy } }
+    fn default() -> Self {
+        Self {
+            copy: true,
+            move_: false,
+            preferred: NativeDragAction::Copy,
+        }
+    }
 }
 
 /// An application-supplied native drag, including opaque application MIME types.
@@ -159,14 +189,25 @@ mod tests {
     use super::*;
     #[test]
     fn two_mime_requests_return_their_own_immutable_bytes() {
-        let payload = MimePayload::new([
-            MimeRepresentation::new("text/uri-list", &b"file:///a\r\n"[..]),
-            MimeRepresentation::new("x-special/gnome-copied-files", &b"cut\nfile:///a\n"[..]),
-            MimeRepresentation::new("application/x-test-token", &b"token"[..]),
-        ], SelectionIntent::Cut);
+        let payload = MimePayload::new(
+            [
+                MimeRepresentation::new("text/uri-list", &b"file:///a\r\n"[..]),
+                MimeRepresentation::new("x-special/gnome-copied-files", &b"cut\nfile:///a\n"[..]),
+                MimeRepresentation::new("application/x-test-token", &b"token"[..]),
+            ],
+            SelectionIntent::Cut,
+        );
         assert_eq!(&*payload.get("text/uri-list").unwrap(), b"file:///a\r\n");
-        assert_eq!(&*payload.get("x-special/gnome-copied-files").unwrap(), b"cut\nfile:///a\n");
+        assert_eq!(
+            &*payload.get("x-special/gnome-copied-files").unwrap(),
+            b"cut\nfile:///a\n"
+        );
         assert!(payload.get("text/plain").is_none());
-        assert!(Arc::ptr_eq(&payload.get("application/x-test-token").unwrap(), &payload.clone().get("application/x-test-token").unwrap()));
+        let cloned = payload.clone();
+        assert_eq!(payload, cloned);
+        assert!(Arc::ptr_eq(
+            &payload.get("application/x-test-token").unwrap(),
+            &cloned.get("application/x-test-token").unwrap()
+        ));
     }
 }

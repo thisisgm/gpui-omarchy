@@ -6,13 +6,7 @@ use std::{
     sync::Arc,
 };
 #[cfg(any(feature = "wayland", feature = "x11"))]
-use std::{
-    ffi::OsString,
-    fs::File,
-    io::Read as _,
-    os::fd::{AsFd, AsRawFd},
-    time::Duration,
-};
+use std::{ffi::OsString, fs::File, os::fd::AsFd, time::Duration};
 
 #[cfg(any(feature = "wayland", feature = "x11"))]
 use anyhow::ensure;
@@ -107,6 +101,7 @@ pub(crate) struct LinuxCommon {
     )]
     power_sender: Sender<SystemPowerEvent>,
     power_listener_started: bool,
+    quitting: bool,
     /// Runs after each foreground runnable registered by [`LinuxCommon::register_sources`].
     ///
     /// X11 uses this to handle events that a runnable's requests read into xcb's queue, where
@@ -154,6 +149,7 @@ impl LinuxCommon {
             ),
             power_sender,
             power_listener_started: false,
+            quitting: false,
             after_runnable: None,
         };
 
@@ -469,6 +465,9 @@ impl LinuxPlatform {
         let Some(mode) = self.pending_mode.borrow().clone() else {
             return;
         };
+        if self.connection.borrow().clipboard_handover_pending() {
+            return;
+        }
         // `request_mode` rejects open windows, but one can be opened before this runs.
         let result = if self.connection.borrow().has_windows() {
             Err(anyhow!("a window was opened while switching display modes"))
@@ -532,6 +531,7 @@ impl LinuxPlatform {
         }
         let (sender, receiver) = oneshot::channel();
         self.transition_waiter.borrow_mut().replace(sender);
+        self.connection.borrow().begin_clipboard_handover();
         *self.pending_mode.borrow_mut() = Some(mode);
         // The wakeup persists until the loop next polls, so a request made before `run` starts is
         // applied after its first iteration.
@@ -629,7 +629,30 @@ impl Platform for LinuxPlatform {
     }
 
     fn quit(&self) {
-        self.with_common(|common| common.signal.stop());
+        if self.with_common(|common| {
+            if common.quitting {
+                true
+            } else {
+                common.quitting = true;
+                false
+            }
+        }) {
+            return;
+        }
+        let handover = self.connection.borrow().begin_clipboard_handover();
+        if let Some(handover) = handover {
+            let signal = self.common.borrow().signal.clone();
+            self.common
+                .borrow()
+                .foreground_executor
+                .spawn(async move {
+                    let _ = handover.await;
+                    signal.stop();
+                })
+                .detach();
+        } else {
+            self.with_common(|common| common.signal.stop());
+        }
     }
 
     fn set_initial_windowing(&self, request: WindowingRequest) {
@@ -1109,6 +1132,10 @@ impl Platform for LinuxPlatform {
         self.connection.borrow().write_to_primary(item)
     }
 
+    fn clear_clipboard_if_owned(&self) -> bool {
+        self.connection.borrow().clear_clipboard_if_owned()
+    }
+
     fn on_clipboard_change(&self, callback: Box<dyn FnMut(gpui::ClipboardChange)>) {
         self.common.borrow_mut().callbacks.clipboard_change = Some(callback);
     }
@@ -1121,7 +1148,9 @@ impl Platform for LinuxPlatform {
         self.common.borrow_mut().callbacks.native_drag = Some(callback);
     }
 
-    fn read_from_clipboard_async(&self) -> Task<Result<Option<ClipboardItem>, gpui::ClipboardReadError>> {
+    fn read_from_clipboard_async(
+        &self,
+    ) -> Task<Result<Option<ClipboardItem>, gpui::ClipboardReadError>> {
         self.connection.borrow().read_from_clipboard_async()
     }
 
@@ -1281,44 +1310,23 @@ pub(super) fn get_xkb_compose_state(cx: &xkb::Context) -> Option<xkb::compose::S
     state
 }
 
-#[cfg(any(feature = "wayland", feature = "x11"))]
-pub(super) const PIPE_READ_TIMEOUT: Duration = Duration::from_secs(4);
+#[cfg(all(test, any(feature = "wayland", feature = "x11")))]
+pub(super) const PIPE_READ_TIMEOUT: Duration = super::transfer::TRANSFER_TIMEOUT;
 
-#[cfg(any(feature = "wayland", feature = "x11"))]
+#[cfg(all(test, any(feature = "wayland", feature = "x11")))]
 pub(super) fn read_fd_with_timeout(
-    mut fd: filedescriptor::FileDescriptor,
+    fd: filedescriptor::FileDescriptor,
     timeout: Duration,
 ) -> Result<Vec<u8>> {
-    fd.set_non_blocking(true)?;
-    let mut buffer = Vec::new();
-    let mut chunk = [0u8; 8192];
-    loop {
-        let mut poll_fds = [filedescriptor::pollfd {
-            fd: fd.as_raw_fd(),
-            events: filedescriptor::POLLIN,
-            revents: 0,
-        }];
-        let ready = match filedescriptor::poll(&mut poll_fds, Some(timeout)) {
-            Ok(ready) => ready,
-            Err(filedescriptor::Error::Poll(err))
-                if err.kind() == std::io::ErrorKind::Interrupted =>
-            {
-                continue;
-            }
-            Err(err) => return Err(err.into()),
-        };
-        if ready == 0 {
-            anyhow::bail!("timed out waiting for data on pipe after {timeout:?}");
-        }
-        match fd.read(&mut chunk) {
-            Ok(0) => return Ok(buffer),
-            Ok(len) => buffer.extend_from_slice(&chunk[..len]),
-            Err(err)
-                if err.kind() == std::io::ErrorKind::WouldBlock
-                    || err.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(err) => return Err(err.into()),
-        }
-    }
+    use std::os::fd::{FromRawFd, IntoRawFd};
+    let file = unsafe { File::from_raw_fd(fd.into_raw_fd()) };
+    super::transfer::read(
+        file,
+        &super::transfer::cancelled(),
+        std::time::Instant::now() + timeout,
+        super::transfer::BYTE_LIMIT,
+    )
+    .map_err(Into::into)
 }
 
 #[cfg(any(feature = "wayland", feature = "x11"))]
@@ -1905,26 +1913,25 @@ mod tests {
         }
 
         #[test]
-        fn slow_writer_resets_deadline_between_chunks() {
+        fn slow_writer_cannot_reset_absolute_deadline() {
             let pipe = filedescriptor::Pipe::new().unwrap();
-            let chunks = 12;
-            let gap = Duration::from_millis(40);
-            let timeout = Duration::from_millis(400);
-
+            let timeout = Duration::from_millis(80);
             let writer = std::thread::spawn({
                 let mut write = pipe.write;
                 move || {
-                    for _ in 0..chunks {
-                        std::thread::sleep(gap);
-                        write.write_all(&[b'x'; 1000]).unwrap();
+                    for _ in 0..50 {
+                        std::thread::sleep(Duration::from_millis(5));
+                        if write.write_all(&[b'x'; 1000]).is_err() {
+                            break;
+                        }
                     }
                 }
             });
-            // The total transfer (~480ms) exceeds the timeout; this only
-            // passes because the timeout is re-armed per chunk.
-            let bytes = read_fd_with_timeout(pipe.read, timeout).unwrap();
+            let started = Instant::now();
+            let error = read_fd_with_timeout(pipe.read, timeout).unwrap_err();
             writer.join().unwrap();
-            assert_eq!(bytes, vec![b'x'; 1000 * chunks]);
+            assert!(error.to_string().contains("timed out"));
+            assert!(started.elapsed() < Duration::from_secs(1));
         }
 
         #[test]

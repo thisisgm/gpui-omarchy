@@ -1746,7 +1746,11 @@ impl App {
         self.text_rendering_mode.get()
     }
 
-    /// Writes data to the platform clipboard.
+    /// Clears only the selection this application currently owns.
+    pub fn clear_clipboard_if_owned(&self) -> bool {
+        self.platform.clear_clipboard_if_owned()
+    }
+
     /// Observes native selection changes and receive errors.
     pub fn on_clipboard_change(&self, callback: impl FnMut(crate::ClipboardChange) + 'static) {
         self.platform.on_clipboard_change(Box::new(callback));
@@ -1762,6 +1766,7 @@ impl App {
         self.platform.on_native_drag(Box::new(callback));
     }
 
+    /// Replaces the platform clipboard with the supplied item.
     pub fn write_to_clipboard(&self, item: ClipboardItem) {
         self.platform.write_to_clipboard(item)
     }

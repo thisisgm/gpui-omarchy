@@ -573,6 +573,11 @@ pub trait Platform: 'static {
     fn read_from_clipboard(&self) -> Option<ClipboardItem>;
     fn write_to_clipboard(&self, item: ClipboardItem);
 
+    /// Clears CLIPBOARD only while this application is its native owner.
+    fn clear_clipboard_if_owned(&self) -> bool {
+        false
+    }
+
     /// Observes selection replacement, clear and asynchronous receive errors.
     fn on_clipboard_change(&self, _callback: Box<dyn FnMut(crate::ClipboardChange)>) {}
 
@@ -3074,12 +3079,17 @@ pub enum ClipboardEntry {
 impl ClipboardItem {
     /// Creates a clipboard item from immutable MIME representations.
     pub fn new_mime(payload: crate::MimePayload) -> Self {
-        Self { entries: vec![ClipboardEntry::Mime(payload)] }
+        Self {
+            entries: vec![ClipboardEntry::Mime(payload)],
+        }
     }
 
     /// Returns the first MIME payload, when present.
     pub fn mime_payload(&self) -> Option<&crate::MimePayload> {
-        self.entries.iter().find_map(|entry| match entry { ClipboardEntry::Mime(payload) => Some(payload), _ => None })
+        self.entries.iter().find_map(|entry| match entry {
+            ClipboardEntry::Mime(payload) => Some(payload),
+            _ => None,
+        })
     }
 
     /// Create a new ClipboardItem::String with no associated metadata
@@ -3131,6 +3141,9 @@ impl ClipboardItem {
                 if let ClipboardEntry::ExternalPaths(paths) = entry {
                     for path in &paths.0 {
                         use std::fmt::Write as _;
+                        if !answer.is_empty() {
+                            answer.push('\n');
+                        }
                         _ = write!(answer, "{}", path.display());
                     }
                 }

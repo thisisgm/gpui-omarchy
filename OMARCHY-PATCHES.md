@@ -13,6 +13,8 @@ Each entry gives the change, commit, measured effect, evidence, and upstream sta
 - Intra-fork path dependencies | `d35a2d5502857368e8b9cb6907e1a791b7c2e1b1` | No runtime change; all 15 active gpui-pre crates in the Linux consumer tree resolve to this fork without a patch table | Evidence: `../consumer-tree.log`, `../consumer-proof.txt`, and `Cargo.lock` | Fork only; submission unrecorded.
 - Glyph runs keep atlas tiles between frames | `f3a4bc78f57eb1dad9802286253cea22284e5617`, with fix `d38b68a4f95a23e1d7c8dae9003a09866e46ad80` | A line painted again with the same x, scale, rendering mode, dilation and atlas generation reuses its glyphs' raster bounds and tiles; removing a glyph's tile advances the generation, removing an image or SVG tile does not; Flea list bench thread CPU per frame on East fell from 305..333 to 165..176 us (bounds set), 116..131 to 65..78 us (2k set) and 107..120 to 61..67 us (uniform set) with equal allocations | Evidence: both commits' messages, `crates/gpui-pre/src/window/glyph_run_tests.rs`, the atlas generation tests in `crates/gpui-pre-wgpu/src/wgpu_atlas.rs`, and Flea g08 r2 rounds logs `base1.log`, `base2.log`, `r4b.log` | Fork only; submission unrecorded.
 
+- MIME-aware Linux clipboard and Wayland drag | Pending integration commit | Synthetic 1,000-path MIME serialization: 630 to 1,844 microseconds over 25 debug samples, excluding native transport, frame time and memory | Evidence: `crates/gpui-pre-linux/src/linux/transfer.rs` cost test, Wayland offer fakes, X11 selection fakes and `docs/native-mime-transfers.md` | Fork only; native interoperability and independent review pending.
+
 ## Branches and pins
 
 Start one branch per change unit from `main`, with one named change per commit.

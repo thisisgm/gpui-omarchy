@@ -58,8 +58,8 @@ pub(crate) enum Backend {
 ///   has already released everything bound to the connection, including its GPU objects, so
 ///   nothing waits. The platform takes the connection out of its `RefCell` before dropping it,
 ///   because dropping can call back into the platform. Dropping removes the event sources, stops
-///   the desktop portal listener, hands the clipboard to a clipboard manager (X11, on a
-///   background thread) and closes the connection.
+///   the desktop portal listener and closes the connection. X11 hands the clipboard to a
+///   manager on the event loop before quit or a requested mode change.
 ///
 /// Nothing tied to a display server outlives its connection. What does, in `LinuxCommon`, is
 /// session-independent: the executors, the text system, callbacks and the power listener.
@@ -178,6 +178,27 @@ impl DisplayConnection {
         dispatch!(self, connection => connection.write_to_primary(item), headless => ())
     }
 
+    pub(crate) fn begin_clipboard_handover(
+        &self,
+    ) -> Option<futures::channel::oneshot::Receiver<()>> {
+        #[cfg(feature = "x11")]
+        if let Self::X11(connection) = self {
+            return connection.begin_clipboard_handover();
+        }
+        None
+    }
+    pub(crate) fn clipboard_handover_pending(&self) -> bool {
+        #[cfg(feature = "x11")]
+        if let Self::X11(connection) = self {
+            return connection.clipboard_handover_pending();
+        }
+        false
+    }
+
+    pub(crate) fn clear_clipboard_if_owned(&self) -> bool {
+        dispatch!(self, connection => connection.clear_clipboard_if_owned(), headless => false)
+    }
+
     pub(crate) fn write_to_clipboard(&self, item: ClipboardItem) {
         dispatch!(self, connection => connection.write_to_clipboard(item), headless => ())
     }
@@ -186,7 +207,9 @@ impl DisplayConnection {
         dispatch!(self, connection => connection.read_from_primary(), headless => None)
     }
 
-    pub(crate) fn read_from_clipboard_async(&self) -> gpui::Task<Result<Option<ClipboardItem>, gpui::ClipboardReadError>> {
+    pub(crate) fn read_from_clipboard_async(
+        &self,
+    ) -> gpui::Task<Result<Option<ClipboardItem>, gpui::ClipboardReadError>> {
         dispatch!(self, connection => connection.read_from_clipboard_async(), headless => gpui::Task::ready(Ok(None)))
     }
 

@@ -1,7 +1,7 @@
 mod client;
-mod selection;
 mod display;
 mod event;
+mod selection;
 mod window;
 mod xim_handler;
 
