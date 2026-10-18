@@ -361,3 +361,67 @@ fn every_atlas_and_every_clear_gets_its_own_generation() {
     assert_ne!(first.generation(), before);
     assert_ne!(first.generation(), second.generation());
 }
+
+#[test]
+fn a_glyph_run_looks_a_removed_glyph_tile_up_again() {
+    let mut app =
+        TestAppContext::build_with_text_system(TestDispatcher::new(0), None, Arc::new(Glyphs));
+    let cx = app.add_empty_window();
+    let run = Rc::new(GlyphRun::new(line()));
+    let origin = point(px(10.), px(20.));
+    let color = gray(0.2);
+    let painted_run = Rc::clone(&run);
+    sprites(cx, move |window| {
+        window.paint_glyph_run(origin, &painted_run, color).unwrap();
+    });
+    let removed_run = Rc::clone(&run);
+    cx.update(move |window, _| {
+        let line = removed_run.line();
+        let shaped = &line.runs[0];
+        let glyph = &shaped.glyphs[0];
+        let scale_factor = window.scale_factor();
+        let x = (origin.x + glyph.position.x).0 * scale_factor;
+        let variants = crate::SUBPIXEL_VARIANTS_X as f32;
+        let quantized_x = super::round_half_toward_zero(x * variants) / variants;
+        let key = RenderGlyphParams {
+            font_id: shaped.font_id,
+            glyph_id: glyph.id,
+            font_size: line.font_size,
+            subpixel_variant: point((quantized_x.fract() * variants) as u8, 0),
+            scale_factor,
+            is_emoji: false,
+            subpixel_rendering: window
+                .should_use_subpixel_rendering(shaped.font_id, line.font_size),
+            dilation: window.text_system().glyph_dilation_for_color(color),
+        }
+        .into();
+        assert!(
+            window.sprite_atlas.contains(&key),
+            "the run's first glyph has no tile"
+        );
+        let before = window.sprite_atlas.generation();
+        window.sprite_atlas.remove(&key);
+        assert!(!window.sprite_atlas.contains(&key));
+        assert_ne!(
+            window.sprite_atlas.generation(),
+            before,
+            "removing a glyph's tile kept the generation"
+        );
+    });
+    let painted_run = Rc::clone(&run);
+    let painted = sprites(cx, move |window| {
+        window.paint_glyph_run(origin, &painted_run, color).unwrap();
+    });
+    let line = Arc::clone(run.line());
+    let expected = sprites(cx, move |window| by_glyph(window, &line, origin, color));
+    assert!(!expected.is_empty());
+    assert_eq!(
+        painted, expected,
+        "the glyph run reused a removed atlas tile"
+    );
+    assert_eq!(
+        run.resolves(),
+        2,
+        "the removal did not make the run look its tiles up again"
+    );
+}

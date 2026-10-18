@@ -567,4 +567,105 @@ mod tests {
             vec![0x30, 0x20, 0x10, 0x40, 0xCC, 0xBB, 0xAA, 0xDD]
         );
     }
+
+    fn glyph_key(glyph_id: u32, is_emoji: bool) -> AtlasKey {
+        AtlasKey::Glyph(gpui::RenderGlyphParams {
+            font_id: gpui::FontId(1),
+            glyph_id: gpui::GlyphId(glyph_id),
+            font_size: gpui::px(14.),
+            subpixel_variant: Point::default(),
+            scale_factor: 1.,
+            is_emoji,
+            subpixel_rendering: false,
+            dilation: 0,
+        })
+    }
+
+    fn insert_square(atlas: &WgpuAtlas, key: AtlasKey, bytes_per_pixel: usize) -> AtlasTile {
+        let extent = Size {
+            width: DevicePixels(16),
+            height: DevicePixels(16),
+        };
+        atlas
+            .get_or_insert_with(key, &mut || {
+                Ok(Some((
+                    extent,
+                    Cow::Owned(vec![255; 16 * 16 * bytes_per_pixel]),
+                )))
+            })
+            .expect("the atlas takes a 16 by 16 tile")
+            .expect("the builder always returns a tile")
+    }
+
+    #[test]
+    fn removing_a_glyph_tile_whose_region_goes_to_another_glyph_changes_the_generation()
+    -> anyhow::Result<()> {
+        let (device, queue) = test_device_and_queue()?;
+        let atlas = WgpuAtlas::new(device, queue, wgpu::TextureFormat::Bgra8Unorm);
+        let old = insert_square(&atlas, glyph_key(1, false), 1);
+        atlas.before_frame();
+        let before = atlas.generation();
+        atlas.remove(&glyph_key(1, false));
+        let new = insert_square(&atlas, glyph_key(2, false), 1);
+        atlas.before_frame();
+        assert_eq!(
+            old.texture_id, new.texture_id,
+            "the removed texture was not reused"
+        );
+        assert_eq!(old.bounds, new.bounds, "the removed region was not reused");
+        assert_ne!(
+            atlas.generation(),
+            before,
+            "a run keeping the removed glyph would paint the glyph now in its region"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn removing_an_image_tile_keeps_the_generation_and_every_glyph_region() -> anyhow::Result<()> {
+        let (device, queue) = test_device_and_queue()?;
+        let atlas = WgpuAtlas::new(device, queue, wgpu::TextureFormat::Bgra8Unorm);
+        let image = |id| {
+            AtlasKey::Image(RenderImageParams {
+                image_id: ImageId(id),
+                frame_index: 0,
+            })
+        };
+        let emoji = insert_square(&atlas, glyph_key(3, true), 4);
+        let glyph = insert_square(&atlas, glyph_key(4, false), 1);
+        let old: Vec<AtlasTile> = (1..=32)
+            .map(|id| insert_square(&atlas, image(id), 4))
+            .collect();
+        atlas.before_frame();
+        assert!(
+            old.iter().any(|tile| tile.texture_id == emoji.texture_id),
+            "no image shares the emoji's texture"
+        );
+        let before = atlas.generation();
+        for id in 1..=32 {
+            atlas.remove(&image(id));
+        }
+        assert_eq!(
+            atlas.generation(),
+            before,
+            "removing an image changed the generation"
+        );
+        let mut reused = 0;
+        for id in 100..164 {
+            let new = insert_square(&atlas, image(id), 4);
+            reused += old
+                .iter()
+                .filter(|tile| (tile.texture_id, tile.bounds) == (new.texture_id, new.bounds))
+                .count();
+            assert!(
+                new.texture_id != emoji.texture_id || !new.bounds.intersects(&emoji.bounds),
+                "image {id} took part of the emoji's region"
+            );
+        }
+        atlas.before_frame();
+        assert!(reused > 0, "no removed image region was handed out again");
+        assert_eq!(insert_square(&atlas, glyph_key(3, true), 4), emoji);
+        assert_eq!(insert_square(&atlas, glyph_key(4, false), 1), glyph);
+        Ok(())
+    }
 }

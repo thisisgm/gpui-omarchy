@@ -1749,10 +1749,11 @@ pub trait PlatformAtlas {
     ) -> Result<Option<AtlasTile>>;
     fn remove(&self, key: &AtlasKey);
 
-    /// Names the set of tiles this atlas hands out: unique among atlases and replaced each time the
-    /// atlas drops every tile at once, so a tile kept across frames is valid only while the
-    /// generation it came from is current. `None` means the atlas cannot say, and no tile may be
-    /// kept.
+    /// Names the set of glyph tiles this atlas hands out: unique among atlases and replaced each
+    /// time the atlas drops every tile at once or removes a glyph's tile, so a glyph tile kept
+    /// across frames is valid only while the generation it came from is current. Removing an image
+    /// or SVG tile keeps the generation, because that frees only the removed tile's own region.
+    /// `None` means the atlas cannot say, and no tile may be kept.
     fn generation(&self) -> Option<u64> {
         None
     }
@@ -1844,6 +1845,10 @@ impl<Backend: AtlasBackend> AtlasState<Backend> {
 
     pub fn remove(&mut self, key: &AtlasKey) {
         if let Some(tile) = self.tiles_by_key.remove(key) {
+            // A glyph run may still hold this tile, and its region can now go to another glyph.
+            if matches!(key, AtlasKey::Glyph(_)) {
+                self.generation = next_atlas_generation();
+            }
             self.backend.remove(tile);
         }
     }
