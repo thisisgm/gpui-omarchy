@@ -204,6 +204,7 @@ struct Incoming {
     owner: Window,
     deadline: Instant,
     target: Atom,
+    actual_type: Option<Atom>,
     mime: Option<String>,
     types: VecDeque<(Atom, String)>,
     representations: Vec<MimeRepresentation>,
@@ -523,6 +524,7 @@ impl<W: SelectionWire> Clipboard<W> {
             owner: selection.owner,
             deadline: selection.requested.unwrap(),
             target: self.atoms.TARGETS,
+            actual_type: None,
             mime: None,
             types: VecDeque::new(),
             representations: Vec::new(),
@@ -812,6 +814,20 @@ impl<W: SelectionWire> Clipboard<W> {
         } else if let Some((target, bytes)) =
             snapshot.iter().find(|(atom, _)| *atom == request.target)
         {
+            let actual_type = if *target == self.wire.atom("TEXT")? {
+                if std::str::from_utf8(bytes).is_ok() {
+                    self.atoms.UTF8_STRING
+                } else if snapshot
+                    .iter()
+                    .any(|(atom, latin)| *atom == u32::from(AtomEnum::STRING) && latin == bytes)
+                {
+                    AtomEnum::STRING.into()
+                } else {
+                    return self.wire.notify(request, NONE);
+                }
+            } else {
+                *target
+            };
             if self.outgoing.contains_key(&(request.requestor, property)) {
                 return self.wire.notify(request, NONE);
             }
@@ -830,7 +846,7 @@ impl<W: SelectionWire> Clipboard<W> {
                 self.outgoing.insert(
                     (request.requestor, property),
                     Outgoing {
-                        target: *target,
+                        target: actual_type,
                         bytes: bytes.clone(),
                         offset: 0,
                         deadline: Instant::now() + TRANSFER_TIMEOUT,
@@ -838,7 +854,7 @@ impl<W: SelectionWire> Clipboard<W> {
                 );
             } else {
                 self.wire
-                    .put(request.requestor, property, *target, 8, bytes)?;
+                    .put(request.requestor, property, actual_type, 8, bytes)?;
             }
         } else {
             return self.wire.notify(request, NONE);
@@ -890,9 +906,22 @@ impl<W: SelectionWire> Clipboard<W> {
         } else {
             incoming.target
         };
-        if property.format != expected_format || property.type_ != expected_type {
+        let text = incoming.mime.as_deref() == Some("TEXT");
+        let supported = if text {
+            property.type_ == self.atoms.UTF8_STRING
+                || property.type_ == u32::from(AtomEnum::STRING)
+        } else {
+            property.type_ == expected_type
+        };
+        if property.format != expected_format
+            || !supported
+            || incoming
+                .actual_type
+                .is_some_and(|actual| actual != property.type_)
+        {
             return Err(ClipboardReadError::UnsupportedContent);
         }
+        incoming.actual_type = Some(property.type_);
         let limit = if incoming.target == self.atoms.TARGETS {
             TYPE_LIMIT * 4
         } else {
@@ -937,8 +966,18 @@ impl<W: SelectionWire> Clipboard<W> {
                 incoming.types.clear();
             }
             incoming.total += incoming.chunk.len();
+            let mime = incoming.mime.take().unwrap();
+            let mime = if mime == "TEXT" {
+                if incoming.actual_type == Some(AtomEnum::STRING.into()) {
+                    "STRING".into()
+                } else {
+                    "UTF8_STRING".into()
+                }
+            } else {
+                mime
+            };
             incoming.representations.push(MimeRepresentation::new(
-                incoming.mime.take().unwrap(),
+                mime,
                 std::mem::take(&mut incoming.chunk),
             ));
         }
@@ -982,6 +1021,7 @@ impl<W: SelectionWire> Clipboard<W> {
         let incoming = self.incoming.get_mut(&window).unwrap();
         if let Some((target, mime)) = incoming.types.pop_front() {
             incoming.target = target;
+            incoming.actual_type = None;
             incoming.mime = Some(mime);
             let primary = incoming.primary;
             self.wire
@@ -1041,6 +1081,7 @@ impl<W: SelectionWire> Clipboard<W> {
             return Err(ClipboardReadError::UnsupportedContent);
         };
         incoming.target = target;
+        incoming.actual_type = None;
         incoming.mime = Some(mime);
         let primary = incoming.primary;
         self.wire

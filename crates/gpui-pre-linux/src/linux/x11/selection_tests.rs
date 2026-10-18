@@ -24,6 +24,7 @@ impl SelectionWire for FakeWire {
             "UTF8_STRING" => 12,
             "text/plain;charset=utf-8" => 13,
             "text/plain" => 14,
+            "STRING" => AtomEnum::STRING.into(),
             _ => 100 + name.bytes().map(u32::from).sum::<u32>(),
         };
         self.names.borrow_mut().insert(atom, name.into());
@@ -355,12 +356,21 @@ fn foreign_owner_serves_each_file_mime_and_utf8() {
             AtomEnum::ATOM.into(),
         );
         assert_eq!(clipboard.wire.conversions.borrow().last().unwrap().2, atom);
-        notify(&mut clipboard, window, atom, bytes.clone(), 8, atom);
+        let actual = if mime == "TEXT" {
+            clipboard.atoms.UTF8_STRING
+        } else {
+            atom
+        };
+        notify(&mut clipboard, window, atom, bytes.clone(), 8, actual);
         let item = futures::executor::block_on(receiver)
             .unwrap()
             .unwrap()
             .unwrap();
-        assert_eq!(&*item.mime_payload().unwrap().get(mime).unwrap(), &bytes);
+        let actual_mime = if mime == "TEXT" { "UTF8_STRING" } else { mime };
+        assert_eq!(
+            &*item.mime_payload().unwrap().get(actual_mime).unwrap(),
+            &bytes
+        );
         assert!(clipboard.incoming.is_empty());
     }
 }
@@ -1098,6 +1108,79 @@ fn review_x11_multiple_representations_share_one_deadline() {
         futures::executor::block_on(receiver).unwrap(),
         Err(ClipboardReadError::TimedOut)
     );
+}
+
+#[test]
+fn review_x11_text_incr_accepts_actual_string_and_utf8_encodings() {
+    for (encoding, bytes) in [
+        (u32::from(AtomEnum::STRING), vec![b'c', b'a', b'f', 0xe9]),
+        (12, "café".as_bytes().to_vec()),
+    ] {
+        let mut clipboard = clipboard();
+        clipboard.replaced(false, 88);
+        let receiver = clipboard.read(false);
+        let window = clipboard.selections[0].pending.unwrap();
+        let target = clipboard.wire.atom("TEXT").unwrap();
+        let targets = clipboard.atoms.TARGETS;
+        let incr = clipboard.atoms.INCR;
+        notify(
+            &mut clipboard,
+            window,
+            targets,
+            target.to_ne_bytes().to_vec(),
+            32,
+            AtomEnum::ATOM.into(),
+        );
+        notify(
+            &mut clipboard,
+            window,
+            target,
+            (bytes.len() as u32).to_ne_bytes().to_vec(),
+            32,
+            incr,
+        );
+        property(
+            &mut clipboard,
+            window,
+            Property::NEW_VALUE,
+            Some(bytes),
+            encoding,
+        );
+        property(
+            &mut clipboard,
+            window,
+            Property::NEW_VALUE,
+            Some(Vec::new()),
+            encoding,
+        );
+        let item = futures::executor::block_on(receiver)
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(item.text().as_deref(), Some("café"));
+    }
+}
+#[test]
+fn review_x11_text_is_served_with_actual_encoding_for_direct_and_incr() {
+    for text in ["café".to_owned(), "x".repeat(INCR_THRESHOLD + 1)] {
+        let mut clipboard = clipboard();
+        clipboard
+            .set(false, ClipboardItem::new_string(text.clone()))
+            .unwrap();
+        let target = clipboard.wire.atom("TEXT").unwrap();
+        clipboard.serve(&request(&clipboard, target)).unwrap();
+        if text.len() > INCR_THRESHOLD {
+            assert_eq!(
+                clipboard.wire.writes.borrow().last().unwrap().2,
+                clipboard.atoms.INCR
+            );
+            property(&mut clipboard, 90, Property::DELETE, None, NONE);
+        }
+        assert_eq!(
+            clipboard.wire.writes.borrow().last().unwrap().2,
+            clipboard.atoms.UTF8_STRING
+        );
+    }
 }
 
 #[test]
