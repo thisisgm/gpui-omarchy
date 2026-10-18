@@ -602,3 +602,19 @@ mod cost_tests {
         );
     }
 }
+
+pub(crate) fn destination_actions(
+    common: &std::rc::Rc<std::cell::RefCell<super::LinuxCommon>>,
+    event: gpui::NativeDragOffer,
+) -> gpui::NativeDragActions {
+    let callback = common.borrow_mut().callbacks.native_offer.take();
+    let Some(mut callback) = callback else {
+        return gpui::NativeDragActions::default();
+    };
+    let actions = callback(event);
+    let mut common = common.borrow_mut();
+    if common.callbacks.native_offer.is_none() {
+        common.callbacks.native_offer = Some(callback);
+    }
+    actions
+}

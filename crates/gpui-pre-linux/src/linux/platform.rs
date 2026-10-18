@@ -57,6 +57,8 @@ const FILE_PICKER_PORTAL_MISSING: &str =
 #[derive(Default)]
 pub(crate) struct PlatformHandlers {
     pub(crate) clipboard_change: Option<Box<dyn FnMut(gpui::ClipboardChange)>>,
+    pub(crate) native_offer:
+        Option<Box<dyn FnMut(gpui::NativeDragOffer) -> gpui::NativeDragActions>>,
     pub(crate) native_drop: Option<Box<dyn FnMut(gpui::NativeDropEvent) -> bool>>,
     pub(crate) native_drag: Option<Box<dyn FnMut(gpui::NativeDragEvent)>>,
     pub(crate) open_urls: Option<Box<dyn FnMut(Vec<String>)>>,
@@ -1138,6 +1140,13 @@ impl Platform for LinuxPlatform {
 
     fn on_clipboard_change(&self, callback: Box<dyn FnMut(gpui::ClipboardChange)>) {
         self.common.borrow_mut().callbacks.clipboard_change = Some(callback);
+    }
+
+    fn on_native_drag_offer(
+        &self,
+        callback: Box<dyn FnMut(gpui::NativeDragOffer) -> gpui::NativeDragActions>,
+    ) {
+        self.common.borrow_mut().callbacks.native_offer = Some(callback);
     }
 
     fn on_native_drop(&self, callback: Box<dyn FnMut(gpui::NativeDropEvent) -> bool>) {

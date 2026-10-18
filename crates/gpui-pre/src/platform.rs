@@ -581,6 +581,13 @@ pub trait Platform: 'static {
     /// Observes selection replacement, clear and asynchronous receive errors.
     fn on_clipboard_change(&self, _callback: Box<dyn FnMut(crate::ClipboardChange)>) {}
 
+    /// Chooses destination transport actions at Enter, before the source sends bytes.
+    fn on_native_drag_offer(
+        &self,
+        _callback: Box<dyn FnMut(crate::NativeDragOffer) -> crate::NativeDragActions>,
+    ) {
+    }
+
     /// Installs native MIME drop policy. False rejects an unsuitable destination.
     fn on_native_drop(&self, _callback: Box<dyn FnMut(crate::NativeDropEvent) -> bool>) {}
 

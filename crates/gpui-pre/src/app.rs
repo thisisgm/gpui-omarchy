@@ -1756,6 +1756,14 @@ impl App {
         self.platform.on_clipboard_change(Box::new(callback));
     }
 
+    /// Chooses transport actions at Enter; payload validation remains the drop handler's job.
+    pub fn on_native_drag_offer(
+        &self,
+        callback: impl FnMut(crate::NativeDragOffer) -> crate::NativeDragActions + 'static,
+    ) {
+        self.platform.on_native_drag_offer(Box::new(callback));
+    }
+
     /// Installs MIME-aware destination policy; return false to reject the drop.
     pub fn on_native_drop(&self, callback: impl FnMut(crate::NativeDropEvent) -> bool + 'static) {
         self.platform.on_native_drop(Box::new(callback));

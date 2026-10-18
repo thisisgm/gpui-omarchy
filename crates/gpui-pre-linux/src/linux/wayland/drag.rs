@@ -133,7 +133,7 @@ mod tests {
 pub(crate) trait NativeOffer {
     fn version(&self) -> u32;
     fn accept(&self, serial: u32, mime: Option<String>);
-    fn copy_action(&self);
+    fn actions(&self, actions: gpui::NativeDragActions);
     fn finish(&self);
 }
 impl NativeOffer for wayland_client::protocol::wl_data_offer::WlDataOffer {
@@ -143,26 +143,61 @@ impl NativeOffer for wayland_client::protocol::wl_data_offer::WlDataOffer {
     fn accept(&self, serial: u32, mime: Option<String>) {
         self.accept(serial, mime);
     }
-    fn copy_action(&self) {
+    fn actions(&self, actions: gpui::NativeDragActions) {
         use wayland_client::protocol::wl_data_device_manager::DndAction;
-        self.set_actions(DndAction::Copy, DndAction::Copy);
+        let mut supported = DndAction::empty();
+        if actions.copy {
+            supported |= DndAction::Copy;
+        }
+        if actions.move_ {
+            supported |= DndAction::Move;
+        }
+        let preferred = match actions.preferred {
+            NativeDragAction::Copy => DndAction::Copy,
+            NativeDragAction::Move => DndAction::Move,
+        };
+        self.set_actions(supported, preferred);
     }
     fn finish(&self) {
         self.finish();
     }
 }
+#[cfg(test)]
 pub(crate) fn accept_offer(
     offer: &impl NativeOffer,
     serial: u32,
     advertised: &[String],
     arbitrary: bool,
 ) -> Option<Vec<String>> {
+    accept_offer_with_actions(
+        offer,
+        serial,
+        advertised,
+        arbitrary,
+        gpui::NativeDragActions::default(),
+    )
+}
+pub(crate) fn accept_offer_with_actions(
+    offer: &impl NativeOffer,
+    serial: u32,
+    advertised: &[String],
+    arbitrary: bool,
+    actions: gpui::NativeDragActions,
+) -> Option<Vec<String>> {
+    let valid = match actions.preferred {
+        NativeDragAction::Copy => actions.copy,
+        NativeDragAction::Move => actions.move_,
+    };
+    if !valid || (offer.version() < 3 && !actions.copy) {
+        offer.accept(serial, None);
+        return None;
+    }
     let types = transfer::selected_types(advertised, arbitrary);
     let selected = transfer::preferred_drag_type(&types, arbitrary);
     offer.accept(serial, selected.cloned());
     selected?;
     if offer.version() >= 3 {
-        offer.copy_action();
+        offer.actions(actions);
     }
     Some(types)
 }
@@ -203,6 +238,7 @@ mod protocol_tests {
         accepts: RefCell<Vec<(u32, Option<String>)>>,
         actions: Cell<usize>,
         finishes: Cell<usize>,
+        chosen: RefCell<Vec<gpui::NativeDragActions>>,
     }
     impl Offer {
         fn new(version: u32) -> Self {
@@ -211,6 +247,7 @@ mod protocol_tests {
                 accepts: RefCell::default(),
                 actions: Cell::new(0),
                 finishes: Cell::new(0),
+                chosen: RefCell::new(Vec::new()),
             }
         }
     }
@@ -221,8 +258,9 @@ mod protocol_tests {
         fn accept(&self, serial: u32, mime: Option<String>) {
             self.accepts.borrow_mut().push((serial, mime));
         }
-        fn copy_action(&self) {
+        fn actions(&self, actions: gpui::NativeDragActions) {
             self.actions.set(self.actions.get() + 1);
+            self.chosen.borrow_mut().push(actions);
         }
         fn finish(&self) {
             self.finishes.set(self.finishes.get() + 1);
@@ -298,5 +336,49 @@ mod protocol_tests {
             ),
             Some(NativeDragAction::Move)
         );
+    }
+}
+
+#[cfg(test)]
+mod action_policy_tests {
+    use super::*;
+    use std::cell::Cell;
+    struct Offer {
+        move_: Cell<bool>,
+    }
+    impl NativeOffer for Offer {
+        fn version(&self) -> u32 {
+            3
+        }
+        fn accept(&self, _: u32, _: Option<String>) {}
+        fn actions(&self, actions: gpui::NativeDragActions) {
+            self.move_
+                .set(actions.move_ && actions.preferred == NativeDragAction::Move);
+        }
+        fn finish(&self) {}
+    }
+    #[test]
+    fn explicit_destination_policy_can_negotiate_move_before_drop() {
+        let offer = Offer {
+            move_: Cell::new(false),
+        };
+        let actions = gpui::NativeDragActions {
+            copy: false,
+            move_: true,
+            preferred: NativeDragAction::Move,
+        };
+        assert!(
+            accept_offer_with_actions(&offer, 77, &[transfer::URI_LIST.to_owned()], false, actions)
+                .is_some()
+        );
+        assert!(offer.move_.get());
+    }
+    #[test]
+    fn ordinary_destination_policy_still_requests_copy() {
+        let offer = Offer {
+            move_: Cell::new(false),
+        };
+        assert!(accept_offer(&offer, 77, &[transfer::URI_LIST.to_owned()], false).is_some());
+        assert!(!offer.move_.get());
     }
 }

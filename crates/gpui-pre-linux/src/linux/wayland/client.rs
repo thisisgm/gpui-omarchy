@@ -3022,10 +3022,28 @@ impl Dispatch<wl_data_device::WlDataDevice, ()> for WaylandClientStatePtr {
                 let Some(window) = get_window(&mut state, &surface.id()) else {
                     return;
                 };
-                let arbitrary = state.common.borrow().callbacks.native_drop.is_some();
-                let Some(types) =
-                    super::drag::accept_offer(&offer.inner, serial, &offer.mime_types, arbitrary)
-                else {
+                let common = state.common.clone();
+                let arbitrary = common.borrow().callbacks.native_drop.is_some();
+                let generation = state.drag.generation;
+                let event = gpui::NativeDragOffer {
+                    window: window.handle(),
+                    position: Point::new(x.into(), y.into()),
+                    offered_types: offer.mime_types.clone().into(),
+                    modifiers: state.modifiers,
+                };
+                drop(state);
+                let actions = crate::linux::transfer::destination_actions(&common, event);
+                let mut state = client.borrow_mut();
+                if state.drag.generation != generation {
+                    return;
+                }
+                let Some(types) = super::drag::accept_offer_with_actions(
+                    &offer.inner,
+                    serial,
+                    &offer.mime_types,
+                    arbitrary,
+                    actions,
+                ) else {
                     return;
                 };
                 let Ok(permit) = crate::linux::transfer::TransferPermit::acquire() else {

@@ -211,3 +211,16 @@ mod tests {
         ));
     }
 }
+
+/// Offer-time destination policy, evaluated before receiving data or processing Drop.
+#[derive(Clone, Debug)]
+pub struct NativeDragOffer {
+    /// The destination window.
+    pub window: AnyWindowHandle,
+    /// The pointer position at Enter.
+    pub position: Point<Pixels>,
+    /// Types announced by the source; their bytes have not been validated yet.
+    pub offered_types: Arc<[String]>,
+    /// Current modifiers, for application transport policy.
+    pub modifiers: Modifiers,
+}
