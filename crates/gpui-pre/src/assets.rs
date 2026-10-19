@@ -104,6 +104,31 @@ impl RenderImage {
     pub fn frame_count(&self) -> usize {
         self.data.len()
     }
+
+    /// Create a one-frame image from BGRA pixels, `width` by `height` with rows
+    /// packed, taking the buffer as it is so nothing is decoded or copied.
+    /// Returns `None` unless `bytes` holds exactly `width * height * 4` bytes.
+    pub fn from_bgra(width: u32, height: u32, bytes: Vec<u8>) -> Option<Self> {
+        let len = (width as usize)
+            .checked_mul(height as usize)?
+            .checked_mul(4)?;
+        if bytes.len() != len {
+            return None;
+        }
+        let buffer = image::RgbaImage::from_raw(width, height, bytes)?;
+        Some(Self::new([Frame::new(buffer)]))
+    }
+
+    /// Take back the pixel buffer of a one-frame image, so a caller that draws
+    /// a new image every frame can reuse its allocation. Returns `None` for an
+    /// image with any other number of frames.
+    pub fn into_bgra(self) -> Option<Vec<u8>> {
+        let mut data = self.data;
+        if data.len() != 1 {
+            return None;
+        }
+        data.pop().map(|frame| frame.into_buffer().into_raw())
+    }
 }
 
 impl fmt::Debug for RenderImage {
@@ -129,5 +154,29 @@ mod tests {
         assert_eq!(image.render_size(0), Size::default());
         assert_eq!(image.delay(0), Delay::from_numer_denom_ms(100, 1));
         let _ = format!("{image:?}");
+    }
+
+    #[test]
+    fn bgra_pixels_become_an_image_without_a_copy_and_come_back() {
+        let bytes: Vec<u8> = (0..3 * 2 * 4).map(|i| i as u8).collect();
+        let pointer = bytes.as_ptr();
+        let image = RenderImage::from_bgra(3, 2, bytes.clone()).expect("exact size");
+        assert_eq!(image.frame_count(), 1);
+        assert_eq!(image.size(0), size(DevicePixels(3), DevicePixels(2)));
+        assert_eq!(image.as_bytes(0), Some(bytes.as_slice()));
+        let moved = RenderImage::from_bgra(3, 2, bytes).expect("exact size");
+        assert_eq!(moved.as_bytes(0).map(<[u8]>::as_ptr), Some(pointer));
+        let back = moved.into_bgra().expect("one frame");
+        assert_eq!(back.as_ptr(), pointer);
+        assert_eq!(back.len(), 24);
+    }
+
+    #[test]
+    fn bgra_pixels_of_the_wrong_size_are_refused() {
+        assert!(RenderImage::from_bgra(3, 2, vec![0; 23]).is_none());
+        assert!(RenderImage::from_bgra(3, 2, vec![0; 25]).is_none());
+        assert!(RenderImage::from_bgra(u32::MAX, u32::MAX, Vec::new()).is_none());
+        assert!(RenderImage::from_bgra(0, 0, Vec::new()).is_some());
+        assert_eq!(RenderImage::new(SmallVec::new()).into_bgra(), None);
     }
 }
