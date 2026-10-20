@@ -9,6 +9,8 @@ use std::{
     sync::atomic::{AtomicUsize, Ordering::SeqCst},
 };
 
+const BGRA_BYTES_PER_PIXEL: usize = 4;
+
 /// A source of assets for this app to use.
 pub trait AssetSource: 'static + Send + Sync {
     /// Load the given asset from the source path.
@@ -105,13 +107,11 @@ impl RenderImage {
         self.data.len()
     }
 
-    /// Create a one-frame image from BGRA pixels, `width` by `height` with rows
-    /// packed, taking the buffer as it is so nothing is decoded or copied.
-    /// Returns `None` unless `bytes` holds exactly `width * height * 4` bytes.
+    /// Create a one-frame image from packed BGRA pixels without decoding or copying; return `None` unless `bytes` holds exactly `width * height * 4` bytes.
     pub fn from_bgra(width: u32, height: u32, bytes: Vec<u8>) -> Option<Self> {
         let len = (width as usize)
             .checked_mul(height as usize)?
-            .checked_mul(4)?;
+            .checked_mul(BGRA_BYTES_PER_PIXEL)?;
         if bytes.len() != len {
             return None;
         }
@@ -119,9 +119,7 @@ impl RenderImage {
         Some(Self::new([Frame::new(buffer)]))
     }
 
-    /// Take back the pixel buffer of a one-frame image, so a caller that draws
-    /// a new image every frame can reuse its allocation. Returns `None` for an
-    /// image with any other number of frames.
+    /// Take back a one-frame image's BGRA pixel buffer without decoding or copying so its allocation can be reused; return `None` for any other frame count.
     pub fn into_bgra(self) -> Option<Vec<u8>> {
         let mut data = self.data;
         if data.len() != 1 {
@@ -158,7 +156,7 @@ mod tests {
 
     #[test]
     fn bgra_pixels_become_an_image_without_a_copy_and_come_back() {
-        let bytes: Vec<u8> = (0..3 * 2 * 4).map(|i| i as u8).collect();
+        let bytes: Vec<u8> = (0..3 * 2 * BGRA_BYTES_PER_PIXEL).map(|i| i as u8).collect();
         let pointer = bytes.as_ptr();
         let image = RenderImage::from_bgra(3, 2, bytes.clone()).expect("exact size");
         assert_eq!(image.frame_count(), 1);
