@@ -92,6 +92,7 @@ pub struct RenderSvgParams {
 pub struct SvgRenderer {
     asset_source: Arc<dyn AssetSource>,
     usvg_options: Arc<usvg::Options<'static>>,
+    untrusted_options: Arc<usvg::Options<'static>>,
 }
 
 /// A parsed SVG document that can be rasterized at any scale.
@@ -119,76 +120,116 @@ impl From<f32> for SvgSize {
     }
 }
 
+/// Biggest image an untrusted SVG may pull in: 16M pixels of BGRA, the bound a preview raster uses.
+pub const UNTRUSTED_IMAGE_MAX_BYTES: u64 = 16_777_216 * 4;
+
+static SYSTEM_FONT_DB: LazyLock<Arc<usvg::fontdb::Database>> = LazyLock::new(|| {
+    let mut db = usvg::fontdb::Database::new();
+    db.load_system_fonts();
+    Arc::new(db)
+});
+
+/// The font resolver both option sets share: bundled fonts over the system database.
+fn preview_font_resolver(
+    asset_source: Arc<dyn AssetSource>,
+    enriched_fontdb: Arc<OnceLock<Arc<usvg::fontdb::Database>>>,
+) -> usvg::FontResolver<'static> {
+    let default_font_resolver = usvg::FontResolver::default_font_selector();
+    let font_resolver = Box::new({
+        let asset_source = asset_source.clone();
+        move |font: &usvg::Font, db: &mut Arc<usvg::fontdb::Database>| {
+            if db.is_empty() {
+                let fontdb = enriched_fontdb.get_or_init(|| {
+                    let mut db = (**SYSTEM_FONT_DB).clone();
+                    load_bundled_fonts(&*asset_source, &mut db);
+                    fix_generic_font_families(&mut db);
+                    Arc::new(db)
+                });
+                *db = fontdb.clone();
+            }
+            if let Some(id) = default_font_resolver(font, db) {
+                return Some(id);
+            }
+            // fontdb doesn't recognize CSS system font keywords like "system-ui"
+            // or "ui-sans-serif", so fall back to sans-serif before any face.
+            let sans_query = usvg::fontdb::Query {
+                families: &[usvg::fontdb::Family::SansSerif],
+                ..Default::default()
+            };
+            db.query(&sans_query)
+                .or_else(|| db.faces().next().map(|f| f.id))
+        }
+    });
+    let default_fallback_selection = usvg::FontResolver::default_fallback_selector();
+    let fallback_selection = Box::new(
+        move |ch: char, fonts: &[usvg::fontdb::ID], db: &mut Arc<usvg::fontdb::Database>| {
+            if is_emoji_presentation(ch) {
+                if let Some(id) = select_emoji_font(ch, fonts, db.as_ref(), EMOJI_FONT_FAMILIES) {
+                    return Some(id);
+                }
+            }
+
+            default_fallback_selection(ch, fonts, db)
+        },
+    );
+    usvg::FontResolver {
+        select_font: font_resolver,
+        select_fallback: fallback_selection,
+    }
+}
+
+/// An image resolver for SVG from untrusted files: no file path loads, and an oversize data: image is refused.
+fn untrusted_image_href_resolver() -> usvg::ImageHrefResolver<'static> {
+    usvg::ImageHrefResolver {
+        resolve_data: Box::new(|mime, data, _| {
+            if data.len() as u64 > UNTRUSTED_IMAGE_MAX_BYTES {
+                return None;
+            }
+            match mime {
+                "image/jpg" | "image/jpeg" => Some(usvg::ImageKind::JPEG(data)),
+                "image/png" => Some(usvg::ImageKind::PNG(data)),
+                "image/gif" => Some(usvg::ImageKind::GIF(data)),
+                "image/webp" => Some(usvg::ImageKind::WEBP(data)),
+                _ => None,
+            }
+        }),
+        resolve_string: Box::new(|_, _| None),
+    }
+}
+
 impl SvgRenderer {
     /// Creates a new SVG renderer with the provided asset source.
     pub fn new(asset_source: Arc<dyn AssetSource>) -> Self {
-        static SYSTEM_FONT_DB: LazyLock<Arc<usvg::fontdb::Database>> = LazyLock::new(|| {
-            let mut db = usvg::fontdb::Database::new();
-            db.load_system_fonts();
-            Arc::new(db)
-        });
-
         // Build the enriched font DB lazily on first SVG render rather than
         // eagerly at construction time. This avoids the expensive deep-clone
         // of the system font database for code paths that never render SVGs
         // (e.g. tests).
         let enriched_fontdb: Arc<OnceLock<Arc<usvg::fontdb::Database>>> = Arc::new(OnceLock::new());
 
-        let default_font_resolver = usvg::FontResolver::default_font_selector();
-        let font_resolver = Box::new({
-            let asset_source = asset_source.clone();
-            move |font: &usvg::Font, db: &mut Arc<usvg::fontdb::Database>| {
-                if db.is_empty() {
-                    let fontdb = enriched_fontdb.get_or_init(|| {
-                        let mut db = (**SYSTEM_FONT_DB).clone();
-                        load_bundled_fonts(&*asset_source, &mut db);
-                        fix_generic_font_families(&mut db);
-                        Arc::new(db)
-                    });
-                    *db = fontdb.clone();
-                }
-                if let Some(id) = default_font_resolver(font, db) {
-                    return Some(id);
-                }
-                // fontdb doesn't recognize CSS system font keywords like "system-ui"
-                // or "ui-sans-serif", so fall back to sans-serif before any face.
-                let sans_query = usvg::fontdb::Query {
-                    families: &[usvg::fontdb::Family::SansSerif],
-                    ..Default::default()
-                };
-                db.query(&sans_query)
-                    .or_else(|| db.faces().next().map(|f| f.id))
-            }
-        });
-        let default_fallback_selection = usvg::FontResolver::default_fallback_selector();
-        let fallback_selection = Box::new(
-            move |ch: char, fonts: &[usvg::fontdb::ID], db: &mut Arc<usvg::fontdb::Database>| {
-                if is_emoji_presentation(ch) {
-                    if let Some(id) = select_emoji_font(ch, fonts, db.as_ref(), EMOJI_FONT_FAMILIES)
-                    {
-                        return Some(id);
-                    }
-                }
-
-                default_fallback_selection(ch, fonts, db)
-            },
-        );
         let options = usvg::Options {
-            font_resolver: usvg::FontResolver {
-                select_font: font_resolver,
-                select_fallback: fallback_selection,
-            },
+            font_resolver: preview_font_resolver(asset_source.clone(), enriched_fontdb.clone()),
+            ..Default::default()
+        };
+        let untrusted = usvg::Options {
+            font_resolver: preview_font_resolver(asset_source.clone(), enriched_fontdb),
+            image_href_resolver: untrusted_image_href_resolver(),
             ..Default::default()
         };
         Self {
             asset_source,
             usvg_options: Arc::new(options),
+            untrusted_options: Arc::new(untrusted),
         }
     }
 
     /// Parses SVG data into a [`ParsedSvg`] that can be rasterized at any scale.
     pub fn parse_svg(&self, bytes: &[u8]) -> Result<ParsedSvg, usvg::Error> {
         usvg::Tree::from_data(bytes, &self.usvg_options).map(ParsedSvg)
+    }
+
+    /// Parses SVG from an untrusted file: an `<image href>` to a file loads nothing.
+    pub fn parse_svg_untrusted(&self, bytes: &[u8]) -> Result<ParsedSvg, usvg::Error> {
+        usvg::Tree::from_data(bytes, &self.untrusted_options).map(ParsedSvg)
     }
 
     /// Rasterizes a previously parsed SVG into an image buffer.
@@ -391,6 +432,46 @@ mod tests {
 
         assert_eq!(image.size(0), Size::new(DevicePixels(24), DevicePixels(12)));
         Ok(())
+    }
+
+    #[test]
+    fn untrusted_string_hrefs_load_nothing() {
+        let resolver = untrusted_image_href_resolver();
+        let options = usvg::Options::default();
+        assert!((resolver.resolve_string)("/dev/zero", &options).is_none());
+        assert!((resolver.resolve_string)("/etc/hostname", &options).is_none());
+        assert!((resolver.resolve_string)("https://example.com/a.png", &options).is_none());
+    }
+
+    #[test]
+    fn untrusted_data_images_stay_within_the_byte_bound() {
+        let resolver = untrusted_image_href_resolver();
+        let options = usvg::Options::default();
+        let small = Arc::new(vec![137, 80, 78, 71]);
+        let kept = (resolver.resolve_data)("image/png", small.clone(), &options);
+        assert!(matches!(kept, Some(usvg::ImageKind::PNG(data)) if Arc::ptr_eq(&data, &small)));
+        let big = Arc::new(vec![0u8; (UNTRUSTED_IMAGE_MAX_BYTES + 1) as usize]);
+        assert!((resolver.resolve_data)("image/png", big, &options).is_none());
+        assert!((resolver.resolve_data)("image/svg+xml", small, &options).is_none());
+    }
+
+    #[test]
+    fn untrusted_parse_ignores_a_device_href() {
+        let renderer = SvgRenderer::new(Arc::new(()));
+        let svg = b"<svg xmlns=\"http://www.w3.org/2000/svg\" xmlns:xlink=\"http://www.w3.org/1999/xlink\" width=\"10\" height=\"10\"><rect width=\"10\" height=\"10\" fill=\"#3366cc\"/><image x=\"0\" y=\"0\" width=\"10\" height=\"10\" xlink:href=\"/dev/zero\"/></svg>".to_vec();
+        let (parsed, waiting) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = parsed.send(renderer.parse_svg_untrusted(&svg).is_ok());
+        });
+        // Opening /dev/zero for reading never ends; returning at all proves nothing opened it.
+        assert_eq!(waiting.recv_timeout(std::time::Duration::from_secs(10)), Ok(true));
+    }
+
+    #[test]
+    fn untrusted_parse_keeps_a_small_data_image() {
+        let renderer = SvgRenderer::new(Arc::new(()));
+        let svg = b"<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"10\" height=\"10\"><rect width=\"10\" height=\"10\" fill=\"#3366cc\"/><image x=\"0\" y=\"0\" width=\"10\" height=\"10\" href=\"data:image/png;base64,iVBORw0KGgo=\"/></svg>";
+        assert!(renderer.parse_svg_untrusted(svg).is_ok());
     }
 
     #[cfg(not(feature = "ci-exclude-bundled-font-tests"))]
