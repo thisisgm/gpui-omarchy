@@ -8,6 +8,7 @@ mod ime_context;
 mod ime_events;
 mod popup;
 mod presentation;
+mod scroll;
 mod serial;
 mod window;
 

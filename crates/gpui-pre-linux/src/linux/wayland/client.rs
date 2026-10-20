@@ -29,7 +29,6 @@ use wayland_client::globals::{GlobalList, GlobalListContents, registry_queue_ini
 use wayland_client::protocol::wl_callback::{self, WlCallback};
 use wayland_client::protocol::wl_data_device_manager::DndAction;
 use wayland_client::protocol::wl_data_offer::WlDataOffer;
-use wayland_client::protocol::wl_pointer::AxisSource;
 use wayland_client::protocol::{
     wl_data_device, wl_data_device_manager, wl_data_offer, wl_data_source, wl_output, wl_region,
 };
@@ -85,11 +84,12 @@ use super::{
     ime_context::{Preedit, SurroundingText},
     ime_events::{self, ImeHost, ImeWindow},
     presentation::{FrameFeedback, FrameFeedbackData, presentation_timestamp},
+    scroll::ScrollFrame,
     window::{ImeInput, WaylandWindowStatePtr},
 };
 
 use crate::linux::{
-    DOUBLE_CLICK_INTERVAL, LinuxCommon, LinuxKeyboardLayout, SCROLL_LINES, capslock_from_xkb,
+    DOUBLE_CLICK_INTERVAL, LinuxCommon, LinuxKeyboardLayout, capslock_from_xkb,
     cursor_style_to_icon_names, get_xkb_compose_state, is_within_click_distance,
     keystroke_from_xkb, keystroke_underlying_dead_key, modifiers_from_xkb, new_xkb_context,
     open_uri_internal, reveal_path_internal,
@@ -107,8 +107,8 @@ use gpui::{
     FileDropEvent, ForegroundExecutor, GraphicalEnvironment, KeyDownEvent, KeyUpEvent, Keystroke,
     Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseExitEvent, MouseMoveEvent,
     MouseUpEvent, NavigationDirection, Pixels, PlatformDisplay, PlatformFrameSignal, PlatformInput,
-    PlatformKeyboardLayout, PlatformWindow, Point, ScrollDelta, ScrollWheelEvent, SharedString,
-    Size, TouchPhase, WindowButtonLayout, WindowKind, WindowParams, point, px, size,
+    PlatformKeyboardLayout, PlatformWindow, Point, ScrollWheelEvent, SharedString, Size,
+    TouchPhase, WindowButtonLayout, WindowKind, WindowParams, point, px, size,
 };
 use gpui_wgpu::{CompositorGpuHint, GpuContext};
 use wayland_protocols::wp::linux_dmabuf::zv1::client::{
@@ -405,13 +405,10 @@ pub(crate) struct WaylandClientState {
     repeat: KeyRepeat,
     pub modifiers: Modifiers,
     pub capslock: Capslock,
-    axis_source: AxisSource,
     pub mouse_location: Option<Point<Pixels>>,
-    continuous_scroll_delta: Option<Point<Pixels>>,
-    discrete_scroll_delta: Option<Point<f32>>,
     vertical_modifier: f32,
     horizontal_modifier: f32,
-    scroll_event_received: bool,
+    scroll_frame: ScrollFrame,
     enter_token: Option<()>,
     button_pressed: Option<MouseButton>,
     mouse_focused_window: Option<WaylandWindowStatePtr>,
@@ -1094,11 +1091,8 @@ impl WaylandConnection {
                 platform: false,
             },
             capslock: Capslock { on: false },
-            scroll_event_received: false,
-            axis_source: AxisSource::Wheel,
+            scroll_frame: ScrollFrame::default(),
             mouse_location: None,
-            continuous_scroll_delta: None,
-            discrete_scroll_delta: None,
             vertical_modifier: -1.0,
             horizontal_modifier: -1.0,
             button_pressed: None,
@@ -2520,6 +2514,16 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
         let client = this.get_client();
         let mut state = client.borrow_mut();
 
+        // Axis events are read whole at the frame; ScrollFrame alone decides which events are axis events.
+        let shift = state.modifiers.shift;
+        let (vertical, horizontal) = (state.vertical_modifier, state.horizontal_modifier);
+        if state
+            .scroll_frame
+            .event(&event, shift, vertical, horizontal)
+        {
+            return;
+        }
+
         match event {
             wl_pointer::Event::Enter {
                 serial,
@@ -2720,127 +2724,21 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
                 }
             }
 
-            // Axis Events
-            wl_pointer::Event::AxisSource {
-                axis_source: WEnum::Value(axis_source),
-            } => {
-                state.axis_source = axis_source;
-            }
-            wl_pointer::Event::Axis {
-                axis: WEnum::Value(axis),
-                value,
-                ..
-            } => {
-                if state.axis_source == AxisSource::Wheel {
-                    return;
-                }
-                let axis = if state.modifiers.shift {
-                    wl_pointer::Axis::HorizontalScroll
-                } else {
-                    axis
-                };
-                let axis_modifier = match axis {
-                    wl_pointer::Axis::VerticalScroll => state.vertical_modifier,
-                    wl_pointer::Axis::HorizontalScroll => state.horizontal_modifier,
-                    _ => 1.0,
-                };
-                state.scroll_event_received = true;
-                let scroll_delta = state
-                    .continuous_scroll_delta
-                    .get_or_insert(point(px(0.0), px(0.0)));
-                let modifier = 3.0;
-                match axis {
-                    wl_pointer::Axis::VerticalScroll => {
-                        scroll_delta.y += px(value as f32 * modifier * axis_modifier);
-                    }
-                    wl_pointer::Axis::HorizontalScroll => {
-                        scroll_delta.x += px(value as f32 * modifier * axis_modifier);
-                    }
-                    _ => unreachable!(),
-                }
-            }
-            wl_pointer::Event::AxisDiscrete {
-                axis: WEnum::Value(axis),
-                discrete,
-            } => {
-                state.scroll_event_received = true;
-                let axis = if state.modifiers.shift {
-                    wl_pointer::Axis::HorizontalScroll
-                } else {
-                    axis
-                };
-                let axis_modifier = match axis {
-                    wl_pointer::Axis::VerticalScroll => state.vertical_modifier,
-                    wl_pointer::Axis::HorizontalScroll => state.horizontal_modifier,
-                    _ => 1.0,
-                };
-
-                let scroll_delta = state.discrete_scroll_delta.get_or_insert(point(0.0, 0.0));
-                match axis {
-                    wl_pointer::Axis::VerticalScroll => {
-                        scroll_delta.y += discrete as f32 * axis_modifier * SCROLL_LINES;
-                    }
-                    wl_pointer::Axis::HorizontalScroll => {
-                        scroll_delta.x += discrete as f32 * axis_modifier * SCROLL_LINES;
-                    }
-                    _ => unreachable!(),
-                }
-            }
-            wl_pointer::Event::AxisValue120 {
-                axis: WEnum::Value(axis),
-                value120,
-            } => {
-                state.scroll_event_received = true;
-                let axis = if state.modifiers.shift {
-                    wl_pointer::Axis::HorizontalScroll
-                } else {
-                    axis
-                };
-                let axis_modifier = match axis {
-                    wl_pointer::Axis::VerticalScroll => state.vertical_modifier,
-                    wl_pointer::Axis::HorizontalScroll => state.horizontal_modifier,
-                    _ => unreachable!(),
-                };
-
-                let scroll_delta = state.discrete_scroll_delta.get_or_insert(point(0.0, 0.0));
-                let wheel_percent = value120 as f32 / 120.0;
-                match axis {
-                    wl_pointer::Axis::VerticalScroll => {
-                        scroll_delta.y += wheel_percent * axis_modifier * SCROLL_LINES;
-                    }
-                    wl_pointer::Axis::HorizontalScroll => {
-                        scroll_delta.x += wheel_percent * axis_modifier * SCROLL_LINES;
-                    }
-                    _ => unreachable!(),
-                }
-            }
             wl_pointer::Event::Frame => {
-                if state.scroll_event_received {
-                    state.scroll_event_received = false;
-                    let continuous = state.continuous_scroll_delta.take();
-                    let discrete = state.discrete_scroll_delta.take();
-                    if let Some(continuous) = continuous {
-                        if let Some(window) = state.mouse_focused_window.clone() {
-                            let input = PlatformInput::ScrollWheel(ScrollWheelEvent {
-                                position: state.mouse_location.unwrap(),
-                                delta: ScrollDelta::Pixels(continuous),
-                                modifiers: state.modifiers,
-                                touch_phase: TouchPhase::Moved,
-                            });
-                            drop(state);
-                            window.handle_input(input);
-                        }
-                    } else if let Some(discrete) = discrete
-                        && let Some(window) = state.mouse_focused_window.clone()
-                    {
-                        let input = PlatformInput::ScrollWheel(ScrollWheelEvent {
-                            position: state.mouse_location.unwrap(),
-                            delta: ScrollDelta::Lines(discrete),
-                            modifiers: state.modifiers,
-                            touch_phase: TouchPhase::Moved,
-                        });
-                        drop(state);
-                        window.handle_input(input);
+                let scrolls = state.scroll_frame.frame();
+                if !scrolls.is_empty()
+                    && let Some(window) = state.mouse_focused_window.clone()
+                {
+                    let position = state.mouse_location.unwrap();
+                    let modifiers = state.modifiers;
+                    drop(state);
+                    for (touch_phase, delta) in scrolls {
+                        window.handle_input(PlatformInput::ScrollWheel(ScrollWheelEvent {
+                            position,
+                            delta,
+                            modifiers,
+                            touch_phase,
+                        }));
                     }
                 }
             }
