@@ -129,3 +129,13 @@ allow = ["Unicode-3.0"]
 name = "zerovec-derive"
 version = "=0.11.6"
 allow = ["Unicode-3.0"]
+
+# Unmaintained-only advisories inherited from upstream, the same five the Flea workspace ignores.
+[advisories]
+ignore = [
+    { id = "RUSTSEC-2024-0436", reason = "Unmaintained only, no vulnerability or patched release: gpui-pre -> image 0.25.10 -> exr 1.74.2 -> pulp 0.22.3 -> paste 1.0.15; pastey exists in another branch but this caller needs a migration." },
+    { id = "RUSTSEC-2026-0192", reason = "Unmaintained only, no vulnerability or patched release: gpui-pre -> ttf-parser 0.25.1; skrifa exists through cosmic-text but replacing the direct parser requires an API migration." },
+    { id = "RUSTSEC-2026-0370", reason = "Unmaintained only, no vulnerability or patched release: gpui-pre-platform -> gpui-pre-linux -> oo7 0.6.0 -> zvariant 5.15.1; current oo7, ashpd and accesskit_unix still require zbus 5, so zbus 6 needs upstream migrations." },
+    { id = "RUSTSEC-2026-0371", reason = "Unmaintained only, no vulnerability or patched release: gpui-pre-platform -> gpui-pre-linux -> accesskit_unix 0.22.1 -> zbus 5.19.0 -> zbus_names 4.3.5; maintained names live in zbus 6, requiring upstream migrations." },
+    { id = "RUSTSEC-2026-0372", reason = "Unmaintained only, no vulnerability or patched release: gpui-pre-platform -> gpui-pre-linux -> oo7 0.6.0 -> zvariant 5.15.1 -> zvariant_derive 5.15.1; maintained derives live in zbus 6, requiring upstream migrations." },
+]

@@ -77,8 +77,8 @@ pub(crate) fn pointer_pressed<H: ImeHost>(host: &H, window: &H::Window) -> bool 
         return false;
     }
     host.with_session(|ime, text_input| ime.disable(text_input));
-    enable(host);
     window.ime_input(ImeInput::UnmarkText);
+    enable(host);
     true
 }
 
@@ -88,6 +88,14 @@ pub(crate) fn text_input_destroyed<H: ImeHost>(host: &H) {
     if let Some(window) = old.and_then(|old| host.window(&old)) {
         window.ime_input(ImeInput::DeleteText);
     }
+}
+
+/// Keyboard capability disappeared; clear the focused field even without a text-input owner.
+pub(crate) fn keyboard_removed<H: ImeHost>(host: &H, focused: Option<&H::Surface>) {
+    if let Some(surface) = focused {
+        keyboard_left(host, surface);
+    }
+    text_input_destroyed(host);
 }
 
 /// The window on `surface` is closing, so its composition ends with it.
@@ -112,6 +120,11 @@ pub(crate) fn done<H: ImeHost>(host: &H, serial: u32) {
     }
     let area = window.ime_area();
     let context = window.ime_context();
+    if host.with_session(|ime, text_input| {
+        text_input.is_some_and(|text_input| ime.publish_blocked(text_input, context.as_ref()))
+    }) {
+        return;
+    }
     publish(host, &surface, context, area, ChangeCause::InputMethod);
 }
 
@@ -126,9 +139,6 @@ fn publish_queued<H: ImeHost>(host: &H) {
     let Some((surface, bounds)) = host.with_session(|ime, _| ime.take_queued()) else {
         return;
     };
-    if !host.with_session(|ime, _| ime.wants_publish(&surface)) {
-        return;
-    }
     let Some(window) = host.window(&surface) else {
         return;
     };
@@ -764,5 +774,173 @@ mod tests {
             host.ime().wants_publish(&2),
             "the next window's serials still match"
         );
+    }
+
+    #[test]
+    fn fix1_a1_blocked_app_state_survives_until_matching_done_or_enable() {
+        for reenable in [false, true] {
+            let host = FakeHost::default();
+            let window = host.focused(1, "ab", 2..2);
+            host.take();
+            move_caret_in_frame(&host, 1, &window, 20.0);
+            host.idle();
+            host.take();
+            done(&host, 1);
+            assert!(host.take().is_empty(), "stale done must not publish");
+            for (text, x) in [("abc", 40.0), ("abcd", 60.0)] {
+                *window.field.borrow_mut() = FakeField::new(text, text.len()..text.len());
+                move_caret_in_frame(&host, 1, &window, x);
+                host.idle();
+                assert!(host.take().is_empty(), "blocked updates must wait");
+            }
+            if reenable {
+                enable(&host);
+            } else {
+                done(&host, host.text_input.commits());
+            }
+            let requests = host.take();
+            assert!(
+                requests.contains(&Request::Rectangle(60, 20, 1, 18)),
+                "latest blocked caret: {requests:?}"
+            );
+            assert!(
+                requests.contains(&Request::Surrounding("abcd".into(), 4, 4)),
+                "latest blocked context: {requests:?}"
+            );
+            assert_eq!(
+                requests.iter().filter(|r| **r == Request::Commit).count(),
+                1
+            );
+            assert!(!requests.contains(&Request::Rectangle(40, 20, 1, 18)));
+        }
+    }
+
+    #[test]
+    fn fix1_b1_pointer_restart_publishes_the_retained_preedit() {
+        let host = FakeHost::default();
+        let window = host.focused(1, "ab", 1..1);
+        host.ime().set_preedit(preedit("ni", 2, 2));
+        done(&host, host.text_input.commits());
+        host.take();
+        assert!(pointer_pressed(&host, &window));
+        host.idle();
+        assert_eq!(window.text(), "anib");
+        assert_eq!(window.marked(), None);
+        assert_eq!(
+            host.take(),
+            [
+                Request::Disable,
+                Request::Commit,
+                Request::Enable,
+                Request::Rectangle(10, 20, 1, 18),
+                Request::Surrounding("anib".into(), 3, 3),
+                Request::Commit
+            ]
+        );
+    }
+
+    #[test]
+    fn fix1_b2_keyboard_removal_clears_a_mark_without_an_ime_owner() {
+        let host = FakeHost::default();
+        let window = host.open(1, "ab", 1..1);
+        window.ime_input(ImeInput::SetMarkedText("x".into()));
+        assert_eq!(host.ime().owner(), None);
+        keyboard_removed(&host, Some(&1));
+        assert_eq!(window.text(), "ab");
+        assert_eq!(window.marked(), None);
+        assert!(window.field.borrow().cursor_visible);
+        assert_eq!(host.ime().owner(), None);
+        assert!(host.take().is_empty());
+    }
+    #[test]
+    fn fix1_a1_matching_done_preserves_its_edit_with_a_blocked_app_update() {
+        let host = FakeHost::default();
+        let window = host.focused(1, "ab", 2..2);
+        host.take();
+        move_caret_in_frame(&host, 1, &window, 20.0);
+        host.idle();
+        host.take();
+        done(&host, 1);
+        *window.field.borrow_mut() = FakeField::new("abcd", 4..4);
+        move_caret_in_frame(&host, 1, &window, 60.0);
+        host.idle();
+        assert!(host.take().is_empty());
+        host.ime().set_commit(Some("中".into()));
+        done(&host, host.text_input.commits());
+        let requests = host.take();
+        assert!(
+            requests.contains(&Request::Surrounding("abcd中".into(), 7, 7)),
+            "{requests:?}"
+        );
+        assert!(requests.contains(&Request::Rectangle(60, 20, 1, 18)));
+    }
+    #[test]
+    fn fix1_a1_replay_respects_withdrawn_surrounding_text_support() {
+        for reenable in [false, true] {
+            let host = FakeHost::default();
+            let window = host.focused(1, "ab", 2..2);
+            host.take();
+            move_caret_in_frame(&host, 1, &window, 20.0);
+            host.idle();
+            host.take();
+            done(&host, 1);
+            *window.field.borrow_mut() = FakeField::new("private", 7..7);
+            move_caret_in_frame(&host, 1, &window, 60.0);
+            host.idle();
+            assert!(host.take().is_empty());
+            window.context.set(false);
+            if reenable {
+                enable(&host);
+            } else {
+                done(&host, host.text_input.commits());
+            }
+            let requests = host.take();
+            assert!(
+                !requests
+                    .iter()
+                    .any(|r| matches!(r, Request::Surrounding(_, _, _))),
+                "{requests:?}"
+            );
+            assert!(requests.contains(&Request::Enable));
+            assert!(requests.contains(&Request::Rectangle(60, 20, 1, 18)));
+        }
+    }
+    #[test]
+    fn fix1_a1_replay_coalesces_a_newer_caret_before_idle() {
+        for reenable in [false, true] {
+            let host = FakeHost::default();
+            let window = host.focused(1, "ab", 2..2);
+            host.take();
+            move_caret_in_frame(&host, 1, &window, 20.0);
+            host.idle();
+            host.take();
+            done(&host, 1);
+            *window.field.borrow_mut() = FakeField::new("abc", 3..3);
+            move_caret_in_frame(&host, 1, &window, 40.0);
+            host.idle();
+            *window.field.borrow_mut() = FakeField::new("abcd", 4..4);
+            move_caret_in_frame(&host, 1, &window, 60.0);
+            assert!(host.take().is_empty());
+            if reenable {
+                enable(&host);
+            } else {
+                done(&host, host.text_input.commits());
+            }
+            let requests = host.take();
+            assert!(
+                requests.contains(&Request::Rectangle(60, 20, 1, 18)),
+                "{requests:?}"
+            );
+            assert!(requests.contains(&Request::Surrounding("abcd".into(), 4, 4)));
+            assert_eq!(
+                requests.iter().filter(|r| **r == Request::Commit).count(),
+                1
+            );
+            host.idle();
+            assert!(
+                host.take().is_empty(),
+                "deferred callbacks must not republish replayed state"
+            );
+        }
     }
 }

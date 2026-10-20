@@ -479,6 +479,13 @@ pub(crate) enum PendingActivation {
 }
 
 impl WaylandClientState {
+    fn clear_keyboard_composition(&mut self) {
+        if let Some(compose) = self.compose_state.as_mut() {
+            compose.reset();
+        }
+        self.pre_edit_text.take();
+    }
+
     fn consume_startup_activation_token(&mut self, surface: &wl_surface::WlSurface) {
         let Some(startup_activation_token) = self.startup_activation_token.take() else {
             return;
@@ -705,6 +712,7 @@ impl WaylandClientStatePtr {
             return false;
         }
         data_device.start_drag(Some(&source), surface, None, serial.as_raw());
+        state.drag.native_started();
         state.external_drag = Some(ExternalDrag {
             source,
             window,
@@ -2152,8 +2160,11 @@ impl Dispatch<wl_seat::WlSeat, ()> for WaylandClientStatePtr {
                 }
                 let focused = state.keyboard_focused_window.take();
                 state.repeat.current_id += 1;
+                state.enter_token.take();
+                state.clear_keyboard_composition();
                 drop(state);
-                ime_events::text_input_destroyed(&*this);
+                let surface = focused.as_ref().map(|window| window.surface().id());
+                ime_events::keyboard_removed(&*this, surface.as_ref());
                 if let Some(window) = focused {
                     window.set_focused(false);
                 }
@@ -2256,12 +2267,7 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandClientStatePtr {
                 state.repeat.current_id += 1;
                 state.restore_cursor_after_hide();
 
-                if keyboard_focused_window.is_some() {
-                    if let Some(ref mut compose) = state.compose_state {
-                        compose.reset();
-                    }
-                    state.pre_edit_text.take();
-                }
+                state.clear_keyboard_composition();
                 drop(state);
                 ime_events::keyboard_left(&*this, &surface.id());
                 if let Some(window) = keyboard_focused_window {

@@ -2236,7 +2236,7 @@ impl PlatformInputHandler {
     }
 
     /// See [`InputHandler::set_selected_text_range`].
-    pub fn set_selected_text_range(&mut self, range_utf16: Range<usize>) {
+    pub fn set_selected_text_range(&mut self, range_utf16: UTF16Selection) {
         self.cx
             .update(|window, cx| {
                 self.handler
@@ -2430,7 +2430,7 @@ pub trait InputHandler: 'static {
     /// range_utf16 is in terms of UTF-16 characters, from 0 to the length of the document
     fn set_selected_text_range(
         &mut self,
-        _range_utf16: Range<usize>,
+        _range_utf16: UTF16Selection,
         _window: &mut Window,
         _cx: &mut App,
     ) {

@@ -209,6 +209,11 @@ fn untrusted_image_href_resolver() -> usvg::ImageHrefResolver<'static> {
                     },
                     usvg::ImageKind::SVG(_) => return false,
                 };
+                if let usvg::ImageKind::GIF(data) = kind
+                    && !gif_frames_within_bounds(data)
+                {
+                    return false;
+                }
                 w <= UNTRUSTED_IMAGE_MAX_EDGE
                     && h <= UNTRUSTED_IMAGE_MAX_EDGE
                     && w.saturating_mul(h) <= UNTRUSTED_IMAGE_MAX_PIXELS
@@ -216,6 +221,67 @@ fn untrusted_image_href_resolver() -> usvg::ImageHrefResolver<'static> {
         }),
         resolve_string: Box::new(|_, _| None),
     }
+}
+
+// Walks GIF descriptors and sub-blocks without decoding or allocating a frame.
+fn gif_frames_within_bounds(mut data: &[u8]) -> bool {
+    fn take<'a>(data: &mut &'a [u8], count: usize) -> Option<&'a [u8]> {
+        let (head, tail) = data.split_at_checked(count)?;
+        *data = tail;
+        Some(head)
+    }
+    fn table(data: &mut &[u8], flags: u8) -> Option<()> {
+        if flags & 0x80 != 0 {
+            take(data, 3 * (2usize << (flags & 7)))?;
+        }
+        Some(())
+    }
+    fn blocks(data: &mut &[u8]) -> Option<()> {
+        loop {
+            let count = take(data, 1)?[0] as usize;
+            if count == 0 {
+                return Some(());
+            }
+            take(data, count)?;
+        }
+    }
+    let valid = |data: &mut &[u8]| -> Option<()> {
+        let header = take(data, 13)?;
+        if !matches!(&header[..6], b"GIF87a" | b"GIF89a") {
+            return None;
+        }
+        table(data, header[10])?;
+        let mut frames = 0;
+        loop {
+            match take(data, 1)?[0] {
+                0x3b => return (frames > 0).then_some(()),
+                0x21 => {
+                    take(data, 1)?;
+                    blocks(data)?;
+                }
+                0x2c => {
+                    let descriptor = take(data, 9)?;
+                    let word =
+                        |at| u16::from_le_bytes([descriptor[at], descriptor[at + 1]]) as usize;
+                    let (x, y, w, h) = (word(0), word(2), word(4), word(6));
+                    if w == 0
+                        || h == 0
+                        || x + w > UNTRUSTED_IMAGE_MAX_EDGE
+                        || y + h > UNTRUSTED_IMAGE_MAX_EDGE
+                        || w * h > UNTRUSTED_IMAGE_MAX_PIXELS
+                    {
+                        return None;
+                    }
+                    table(data, descriptor[8])?;
+                    take(data, 1)?;
+                    blocks(data)?;
+                    frames += 1;
+                }
+                _ => return None,
+            }
+        }
+    };
+    valid(&mut data).is_some()
 }
 
 impl SvgRenderer {
@@ -471,7 +537,10 @@ mod tests {
         let small = Arc::new(png_with_size(1, 1));
         let kept = (resolver.resolve_data)("image/png", small.clone(), &options);
         assert!(matches!(kept, Some(usvg::ImageKind::PNG(data)) if Arc::ptr_eq(&data, &small)));
-        let big = Arc::new(vec![0u8; (UNTRUSTED_IMAGE_MAX_BYTES + 1) as usize]);
+        let mut oversized = decodable_png();
+        oversized.resize((UNTRUSTED_IMAGE_MAX_BYTES + 1) as usize, 0);
+        assert!(image::load_from_memory_with_format(&oversized, image::ImageFormat::Png).is_ok());
+        let big = Arc::new(oversized);
         assert!((resolver.resolve_data)("image/png", big, &options).is_none());
         assert!((resolver.resolve_data)("image/svg+xml", small, &options).is_none());
     }
@@ -491,11 +560,38 @@ mod tests {
         );
     }
 
+    fn decodable_png() -> Vec<u8> {
+        use image::ImageEncoder;
+        let mut encoded = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut encoded)
+            .write_image(&[255, 0, 0], 1, 1, image::ExtendedColorType::Rgb8)
+            .unwrap();
+        encoded
+    }
+
     #[test]
     fn untrusted_parse_keeps_a_small_data_image() {
         let renderer = SvgRenderer::new(Arc::new(()));
-        let svg = b"<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"10\" height=\"10\"><rect width=\"10\" height=\"10\" fill=\"#3366cc\"/><image x=\"0\" y=\"0\" width=\"10\" height=\"10\" href=\"data:image/png;base64,iVBORw0KGgo=\"/></svg>";
-        assert!(renderer.parse_svg_untrusted(svg).is_ok());
+        let encoded = decodable_png();
+        let data = Arc::new(encoded.clone());
+        let resolver = untrusted_image_href_resolver();
+        assert!(matches!(
+            (resolver.resolve_data)("image/png", data, &usvg::Options::default()),
+            Some(usvg::ImageKind::PNG(_))
+        ));
+        let url: String = encoded.iter().map(|b| format!("%{b:02X}")).collect();
+        let svg = format!(
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"10\" height=\"10\"><image width=\"10\" height=\"10\" href=\"data:image/png,{url}\"/></svg>"
+        );
+        let parsed = renderer.parse_svg_untrusted(svg.as_bytes()).unwrap();
+        let rendered = renderer
+            .render_parsed(
+                &parsed,
+                SvgSize::ExactSize(Size::new(DevicePixels(10), DevicePixels(10))),
+            )
+            .unwrap();
+        let bytes = rendered.as_bytes(0).unwrap();
+        assert_eq!(&bytes[(5 * 10 + 5) * 4..][..4], &[0, 0, 255, 255]);
     }
 
     fn png_with_size(width: u32, height: u32) -> Vec<u8> {
@@ -510,8 +606,12 @@ mod tests {
         let mut bytes = b"GIF89a".to_vec();
         bytes.extend_from_slice(&width.to_le_bytes());
         bytes.extend_from_slice(&height.to_le_bytes());
-        // Full logical screen descriptor: imagesize needs 12 bytes minimum.
         bytes.extend_from_slice(&[0x70, 0, 0]);
+        bytes.push(0x2c);
+        bytes.extend_from_slice(&[0, 0, 0, 0]);
+        bytes.extend_from_slice(&width.to_le_bytes());
+        bytes.extend_from_slice(&height.to_le_bytes());
+        bytes.extend_from_slice(&[0, 2, 0, 0x3b]);
         bytes
     }
 
@@ -760,5 +860,64 @@ mod tests {
             "Monospace should map to Lilex, got {:?}",
             face.families
         );
+    }
+
+    #[test]
+    fn fix1_d5_gif_frame_bounds_override_a_small_logical_screen() {
+        let mut encoded = Vec::new();
+        {
+            let mut encoder = image::codecs::gif::GifEncoder::new(&mut encoded);
+            encoder
+                .encode_frame(image::Frame::new(image::RgbaImage::from_pixel(
+                    8193,
+                    1,
+                    image::Rgba([255, 0, 0, 255]),
+                )))
+                .unwrap();
+        }
+        encoded[6..10].copy_from_slice(&[1, 0, 1, 0]);
+        let dimensions = imagesize::blob_size(&encoded).unwrap();
+        assert_eq!((dimensions.width, dimensions.height), (1, 1));
+        let resolver = untrusted_image_href_resolver();
+        assert!(
+            (resolver.resolve_data)("image/gif", Arc::new(encoded), &usvg::Options::default())
+                .is_none()
+        );
+        let mut valid = Vec::new();
+        {
+            let mut encoder = image::codecs::gif::GifEncoder::new(&mut valid);
+            encoder
+                .encode_frame(image::Frame::new(image::RgbaImage::from_pixel(
+                    2,
+                    1,
+                    image::Rgba([255, 0, 0, 255]),
+                )))
+                .unwrap();
+        }
+        assert!(
+            (resolver.resolve_data)("image/gif", Arc::new(valid), &usvg::Options::default())
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn fix1_d5_gif_checks_later_frame_offsets_area_and_truncation() {
+        let first = gif_with_size(1, 1);
+        let mut later = first[..first.len() - 1].to_vec();
+        let frame = gif_with_size(8193, 1);
+        later.extend_from_slice(&frame[13..]);
+        assert!(!gif_frames_within_bounds(&later));
+        for (at, value) in [(18, 4097u16), (16, 8192u16)] {
+            let mut bad = gif_with_size(4097, 1);
+            if at == 18 {
+                bad[20..22].copy_from_slice(&4097u16.to_le_bytes());
+            }
+            bad[at..at + 2].copy_from_slice(&value.to_le_bytes());
+            assert!(!gif_frames_within_bounds(&bad));
+        }
+        assert!(gif_frames_within_bounds(&first));
+        for end in 0..first.len() {
+            assert!(!gif_frames_within_bounds(&first[..end]));
+        }
     }
 }

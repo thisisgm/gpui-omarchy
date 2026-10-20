@@ -48,8 +48,13 @@ pub(crate) trait TextInputRequests {
     fn request_commit(&self);
 }
 
-/// Text-input-v3 state for one seat: the entered surface, the pending batch, the commit
-/// count that `done` serials are checked against, and the state last published.
+struct AppPublication<S> {
+    surface: S,
+    context: Option<SurroundingText>,
+    bounds: Option<Bounds<Pixels>>,
+}
+
+/// The seat's text-input owner, pending batch, commit serial and published state.
 pub(crate) struct ImeSession<S> {
     owner: Option<S>,
     enabled: Option<bool>,
@@ -60,6 +65,7 @@ pub(crate) struct ImeSession<S> {
     context: Option<SurroundingText>,
     rectangle: Option<ImeCursorRectangle>,
     queued: Option<(S, Bounds<Pixels>)>,
+    blocked: Option<AppPublication<S>>,
 }
 
 impl<S> Default for ImeSession<S> {
@@ -74,6 +80,7 @@ impl<S> Default for ImeSession<S> {
             context: None,
             rectangle: None,
             queued: None,
+            blocked: None,
         }
     }
 }
@@ -124,6 +131,7 @@ impl<S: Clone + PartialEq> ImeSession<S> {
         self.context = None;
         self.rectangle = None;
         self.queued = None;
+        self.blocked = None;
     }
 
     fn commit(&mut self, text_input: &impl TextInputRequests) {
@@ -149,6 +157,12 @@ impl<S: Clone + PartialEq> ImeSession<S> {
         if !self.owns(surface) {
             return;
         }
+        let bounds = self
+            .queued
+            .take()
+            .map(|(_, bounds)| bounds)
+            .or_else(|| self.blocked.take().and_then(|blocked| blocked.bounds))
+            .or(bounds);
         self.forget();
         self.enabled = Some(true);
         self.publish = true;
@@ -235,6 +249,13 @@ impl<S: Clone + PartialEq> ImeSession<S> {
         cause: ChangeCause,
     ) {
         if !self.wants_publish(surface) {
+            if cause == ChangeCause::Other && self.owns(surface) && self.enabled == Some(true) {
+                self.blocked = Some(AppPublication {
+                    surface: surface.clone(),
+                    context,
+                    bounds,
+                });
+            }
             return;
         }
         let mut changed = false;
@@ -271,6 +292,42 @@ impl<S: Clone + PartialEq> ImeSession<S> {
         if changed {
             self.commit(text_input);
         }
+    }
+
+    pub fn publish_blocked(
+        &mut self,
+        text_input: &impl TextInputRequests,
+        current_context: Option<&SurroundingText>,
+    ) -> bool {
+        if !self.publish {
+            return false;
+        }
+        if let Some((surface, bounds)) = self.queued.take() {
+            self.blocked = Some(AppPublication {
+                surface,
+                context: current_context.cloned(),
+                bounds: Some(bounds),
+            });
+        }
+        let Some(blocked) = self.blocked.take() else {
+            return false;
+        };
+        if !self.wants_publish(&blocked.surface) {
+            return false;
+        }
+        let context = if current_context == blocked.context.as_ref() {
+            blocked.context
+        } else {
+            current_context.cloned()
+        };
+        self.publish(
+            text_input,
+            &blocked.surface,
+            context,
+            blocked.bounds,
+            ChangeCause::Other,
+        );
+        true
     }
 
     /// Holds an app-side caret move; true when the caller must schedule the deferred publish.

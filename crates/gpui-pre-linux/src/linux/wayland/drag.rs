@@ -29,7 +29,7 @@ pub(crate) struct DragState<Offer, Window> {
     held: Option<Offer>,
     // Hyprland's own data device cancels a drop on finish without acceptance, where other compositors cancel on destroy.
     hyprland: bool,
-    // The type Hyprland is told to accept once the read succeeds, so a drop it no longer tracks cannot count as done.
+    // The type Hyprland accepts only at the final allowed submission, immediately before finish.
     selected: Option<String>,
     _window: PhantomData<Window>,
 }
@@ -150,6 +150,12 @@ impl<Offer, Window> DragState<Offer, Window> {
     }
 }
 impl<Offer: NativeOffer, Window> DragState<Offer, Window> {
+    pub fn native_started(&mut self) {
+        if self.hyprland && self.dropped {
+            self.clear();
+        }
+    }
+
     pub fn drop_pending(&mut self) {
         if self.refused {
             self.settle();
@@ -206,11 +212,6 @@ impl<Offer: NativeOffer, Window> DragState<Offer, Window> {
             self.refuse();
             return false;
         }
-        if let Some(mime) = self.selected.take()
-            && let Some(offer) = &self.offer
-        {
-            offer.accept(self.serial, Some(mime));
-        }
         self.entered = true;
         true
     }
@@ -223,6 +224,12 @@ impl<Offer: NativeOffer, Window> DragState<Offer, Window> {
             return;
         }
         if let Some(offer) = &self.offer {
+            if self.dropped
+                && self.action.is_some()
+                && let Some(mime) = self.selected.take()
+            {
+                offer.accept(self.serial, Some(mime));
+            }
             finish_offer(offer, accepted, self.dropped, self.action);
         }
         self.clear();
@@ -733,7 +740,7 @@ mod decoded_paths_tests {
 mod offer_life_tests {
     use super::*;
     use std::{cell::RefCell, fs::File, io::Write, os::fd::BorrowedFd, rc::Rc};
-    #[derive(Debug, PartialEq)]
+    #[derive(Debug, Clone, PartialEq)]
     enum Request {
         Accept(u32, Option<String>),
         Actions,
@@ -960,8 +967,9 @@ mod offer_life_tests {
             let generation = drag.generation;
             drag.drop_pending();
             drag.submit(generation, false);
-            assert_eq!(log.borrow()[3], Request::Accept(987, None));
-            assert_eq!(log.borrow()[4..], *end);
+            let at = if hyprland { 2 } else { 3 };
+            assert_eq!(log.borrow()[at], Request::Accept(987, None));
+            assert_eq!(log.borrow()[at + 1..], *end);
         }
     }
     #[test]
@@ -971,10 +979,17 @@ mod offer_life_tests {
         let generation = drag.generation;
         drag.drop_pending();
         drag.submit(generation, true);
-        assert_eq!(log.borrow()[3..], [Request::Finish, Request::Destroy]);
+        assert_eq!(
+            log.borrow()[2..],
+            [
+                Request::Accept(987, uri()),
+                Request::Finish,
+                Request::Destroy
+            ]
+        );
     }
     #[test]
-    fn hyprland_accepts_the_type_only_after_a_good_read() {
+    fn hyprland_accepts_the_type_only_at_final_allowed_submission() {
         for (hyprland, at_enter) in [
             (
                 false,
@@ -998,11 +1013,26 @@ mod offer_life_tests {
                 .iter()
                 .filter(|request| **request == Request::Accept(987, uri()))
                 .count();
-            assert_eq!(accepts, 1);
-            assert_eq!(log.borrow().len(), 3);
+            assert_eq!(accepts, usize::from(!hyprland));
+            assert_eq!(log.borrow().len(), if hyprland { 2 } else { 3 });
+            drag.action = Some(NativeDragAction::Copy);
+            drag.drop_pending();
+            drag.submit(generation, true);
+            let requests = log.borrow();
+            assert_eq!(
+                requests
+                    .iter()
+                    .filter(|r| **r == Request::Accept(987, uri()))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                requests[requests.len() - 2..],
+                [Request::Finish, Request::Destroy]
+            );
         }
     }
-    // On Hyprland the type is never accepted before a good read, so a finish after a failed one ends as a cancel.
+    // On Hyprland only final allowed submission accepts a type, so finishing a refused read cancels.
     #[test]
     fn fast_release_then_failed_read_ends_as_a_cancel() {
         let (offer, log) = offer();
@@ -1044,28 +1074,92 @@ mod offer_life_tests {
         drag.begin(offer().0, 2, Point::default(), vec![], 988);
         assert_eq!(*log.borrow(), [Request::Destroy]);
     }
-    // Hyprland applies finish to its current drag and, from v0.53, tells a destination nothing when a new drag begins after Drop.
     #[test]
-    #[ignore = "upstream Hyprland defect, a read still open at Drop can end a drag begun within the transfer timeout"]
     fn new_drag_after_drop_on_hyprland_053_gets_no_late_finish() {
-        for read in [false, true] {
-            let (dropped, log) = offer();
+        for success in [false, true] {
+            let (old, old_log) = offer();
             let mut drag = DragState::new(true);
-            let request = enter(&mut drag, dropped, Ok(())).unwrap();
+            let request = enter(&mut drag, old, Ok(())).unwrap();
             let generation = request.generation;
             drag.drop_pending();
             assert!(!drag.leave());
-            let result = if read {
+            // The worker reply remains queued until after the newer Enter.
+            let result = if success {
                 request.run()
             } else {
                 drop(request);
                 Err(ClipboardReadError::TimedOut)
             };
-            if drag.publish(generation, result) && drag.admit(generation, true) {
-                drag.action = Some(NativeDragAction::Copy);
-                drag.submit(generation, true);
-            }
-            assert!(!log.borrow().contains(&Request::Finish), "read={read}");
+            assert_eq!(result.is_ok(), success);
+            let (new, new_log) = offer();
+            let new_request = enter(&mut drag, new, Ok(())).unwrap();
+            let current = drag.generation;
+            let before = new_log.borrow().clone();
+            assert!(!drag.publish(generation, result));
+            drag.submit(generation, true);
+            assert_eq!(
+                *old_log.borrow(),
+                [Request::Actions, Request::Receive, Request::Destroy]
+            );
+            assert_eq!(
+                *new_log.borrow(),
+                before,
+                "the newer drag must be untouched"
+            );
+            assert_eq!(drag.generation, current);
+            assert!(drag.publish(current, new_request.run()));
+            assert!(drag.admit(current, true));
+            drag.drop_pending();
+            drag.submit(current, true);
+            assert!(
+                new_log.borrow().contains(&Request::Finish),
+                "ordinary success must finish"
+            );
+        }
+    }
+    #[test]
+    fn fix1_c3_hyprland_refusal_never_follows_type_acceptance() {
+        let mut drag = DragState::new(true);
+        let log = entered(&mut drag);
+        drag.drop_pending();
+        drag.submit(drag.generation, false);
+        assert!(
+            !log.borrow()
+                .iter()
+                .any(|r| matches!(r, Request::Accept(_, Some(_)))),
+            "{log:?}"
+        );
+        assert_eq!(
+            log.borrow()[2..],
+            [
+                Request::Accept(987, None),
+                Request::Finish,
+                Request::Destroy
+            ]
+        );
+    }
+
+    #[test]
+    fn fix1_c1_native_drag_cancels_a_pending_incoming_drop() {
+        for success in [false, true] {
+            let mut drag = DragState::new(true);
+            let (old, old_log) = offer();
+            let request = enter(&mut drag, old, Ok(())).unwrap();
+            let generation = request.generation;
+            drag.drop_pending();
+            let result = if success {
+                request.run()
+            } else {
+                drop(request);
+                Err(ClipboardReadError::TimedOut)
+            };
+            assert_eq!(result.is_ok(), success);
+            drag.native_started();
+            assert!(!drag.publish(generation, result));
+            assert_eq!(
+                *old_log.borrow(),
+                [Request::Actions, Request::Receive, Request::Destroy]
+            );
         }
     }
 }

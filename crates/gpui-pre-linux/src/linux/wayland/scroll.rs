@@ -9,22 +9,15 @@ use crate::linux::SCROLL_LINES;
 /// GPUI's scale on a continuous axis value.
 const CONTINUOUS_SCALE: f32 = 3.0;
 
-/// The axis events of one `wl_pointer` frame, plus whether a finger stroke is open across frames.
-///
-/// The frame is read whole at `wl_pointer.frame` because a compositor may send `axis` before
-/// `axis_source` in the same frame (Hyprland does). A frame with no `axis_source` counts as a
-/// wheel frame, as qtwayland resets its frame source to wheel. Only a finger source is a
-/// terminated stroke (wl_pointer.axis_source, qtwayland `isDefinitelyTerminated`): it opens with
-/// a zero-delta `Started` and ends with a zero-delta `Ended` on its `axis_stop`. Every other
-/// source scrolls with `Moved` alone and never opens, extends or ends a stroke. Outside a finger
-/// stroke a frame with a discrete value scrolls by lines and one without scrolls its continuous
-/// value, the value qtwayland turns into its angle delta.
+/// Buffers one pointer frame; a finger stroke ends only after every moving physical axis stops.
 #[derive(Default)]
 pub(crate) struct ScrollFrame {
     source: Option<AxisSource>,
     continuous: Option<(f32, f32)>,
     discrete: Option<(f32, f32)>,
-    stopped: bool,
+    stopped: u8,
+    moved: u8,
+    axes: u8,
     stroke: bool,
 }
 
@@ -37,6 +30,11 @@ impl ScrollFrame {
         vertical: f32,
         horizontal: f32,
     ) -> bool {
+        let bit = |axis| match axis {
+            Axis::VerticalScroll => 1,
+            Axis::HorizontalScroll => 2,
+            _ => 0,
+        };
         // Shift turns a vertical scroll horizontal, and each axis takes its own direction.
         let oriented = |axis: Axis| match axis {
             Axis::VerticalScroll if shift => Some((Axis::HorizontalScroll, horizontal)),
@@ -61,6 +59,9 @@ impl ScrollFrame {
                 value,
                 ..
             } => {
+                if *value != 0.0 {
+                    self.moved |= bit(*axis);
+                }
                 if let Some((axis, modifier)) = oriented(*axis) {
                     add(
                         &mut self.continuous,
@@ -90,7 +91,10 @@ impl ScrollFrame {
                     add(&mut self.discrete, axis, notches * modifier * SCROLL_LINES);
                 }
             }
-            wl_pointer::Event::AxisStop { .. } => self.stopped = true,
+            wl_pointer::Event::AxisStop {
+                axis: WEnum::Value(axis),
+                ..
+            } => self.stopped |= bit(*axis),
             _ => return false,
         }
         true
@@ -102,6 +106,7 @@ impl ScrollFrame {
         let continuous = self.continuous.take();
         let discrete = self.discrete.take();
         let stopped = std::mem::take(&mut self.stopped);
+        let moved = std::mem::take(&mut self.moved);
         let zero = ScrollDelta::Pixels(point(px(0.0), px(0.0)));
         let mut events = Vec::new();
         match continuous {
@@ -123,9 +128,11 @@ impl ScrollFrame {
         {
             events.push((TouchPhase::Moved, ScrollDelta::Lines(point(x, y))));
         }
-        // An axis value and its axis_stop in one frame are the stroke's last motion, then its end.
-        if stopped && std::mem::take(&mut self.stroke) {
-            events.push((TouchPhase::Ended, zero));
+        if source == AxisSource::Finger {
+            self.axes = (self.axes | moved) & !stopped;
+            if self.axes == 0 && std::mem::take(&mut self.stroke) {
+                events.push((TouchPhase::Ended, zero));
+            }
         }
         events
     }
@@ -296,5 +303,88 @@ mod tests {
         let mut scroll = ScrollFrame::default();
         assert!(scroll.frame().is_empty());
         assert!(!scroll.event(&wl_pointer::Event::Frame, false, -1.0, -1.0));
+    }
+
+    #[test]
+    fn fix1_d1_nonfinger_stop_preserves_an_open_finger_stroke() {
+        for other in [
+            AxisSource::Continuous,
+            AxisSource::Wheel,
+            AxisSource::WheelTilt,
+        ] {
+            let mut scroll = ScrollFrame::default();
+            frame(&mut scroll, &[axis(UP), source(AxisSource::Finger)]);
+            assert_eq!(
+                frame(&mut scroll, &[axis(0.0), source(other), stop()]),
+                [pixels(TouchPhase::Moved, 0.0)]
+            );
+            assert_eq!(
+                frame(&mut scroll, &[axis(UP), source(AxisSource::Finger)]),
+                [pixels(TouchPhase::Moved, 60.0)]
+            );
+            assert_eq!(
+                frame(&mut scroll, &[source(AxisSource::Finger), stop()]),
+                [pixels(TouchPhase::Ended, 0.0)]
+            );
+        }
+    }
+
+    #[test]
+    fn fix1_d2_diagonal_stroke_waits_for_both_axes_to_stop() {
+        for first in [Axis::VerticalScroll, Axis::HorizontalScroll] {
+            let other = if first == Axis::VerticalScroll {
+                Axis::HorizontalScroll
+            } else {
+                Axis::VerticalScroll
+            };
+            let motion = |axis| wl_pointer::Event::Axis {
+                time: 0,
+                axis: WEnum::Value(axis),
+                value: UP,
+            };
+            let stop_axis = |axis| wl_pointer::Event::AxisStop {
+                time: 0,
+                axis: WEnum::Value(axis),
+            };
+            let mut scroll = ScrollFrame::default();
+            assert_eq!(
+                frame(
+                    &mut scroll,
+                    &[motion(first), motion(other), source(AxisSource::Finger)]
+                )[0]
+                .0,
+                TouchPhase::Started
+            );
+            let continuing = frame(
+                &mut scroll,
+                &[stop_axis(first), motion(other), source(AxisSource::Finger)],
+            );
+            assert_eq!(
+                continuing.len(),
+                1,
+                "one stopped axis must not end a diagonal stroke"
+            );
+            assert_eq!(continuing[0].0, TouchPhase::Moved);
+            assert_eq!(
+                frame(&mut scroll, &[motion(other), source(AxisSource::Finger)])[0].0,
+                TouchPhase::Moved
+            );
+            assert_eq!(
+                frame(&mut scroll, &[source(AxisSource::Finger), stop_axis(other)]),
+                [pixels(TouchPhase::Ended, 0.0)]
+            );
+        }
+    }
+
+    #[test]
+    fn fix1_d2_stops_use_physical_axes_across_shift_changes() {
+        let mut scroll = ScrollFrame::default();
+        assert!(scroll.event(&axis(UP), true, -1.0, -1.0));
+        assert!(scroll.event(&source(AxisSource::Finger), true, -1.0, -1.0));
+        let sent = scroll.frame();
+        assert_eq!(sent[0].0, TouchPhase::Started);
+        assert!(scroll.event(&stop(), false, -1.0, -1.0));
+        assert!(scroll.event(&source(AxisSource::Finger), false, -1.0, -1.0));
+        assert_eq!(scroll.frame()[0].0, TouchPhase::Ended);
     }
 }

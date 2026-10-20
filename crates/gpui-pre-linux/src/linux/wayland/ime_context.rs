@@ -41,7 +41,7 @@ pub(crate) struct SurroundingText {
 pub(crate) struct Deletion {
     pub range: Range<usize>,
     pub retained: String,
-    pub selection: Range<usize>,
+    pub selection: UTF16Selection,
 }
 
 fn utf16_to_byte(text: &str, offset: usize) -> Option<usize> {
@@ -127,7 +127,10 @@ impl SurroundingText {
         let retained = self.text.get(low..high)?.to_owned();
         Some(Deletion {
             range: from..to,
-            selection: from..from + retained.encode_utf16().count(),
+            selection: UTF16Selection {
+                range: from..from + retained.encode_utf16().count(),
+                reversed: self.cursor < self.anchor,
+            },
             retained,
         })
     }
@@ -149,7 +152,7 @@ pub(crate) trait ImeTarget {
         text: &str,
         selection: Option<Range<usize>>,
     );
-    fn set_selected_text_range(&mut self, range: Range<usize>);
+    fn set_selected_text_range(&mut self, selection: UTF16Selection);
     fn unmark_text(&mut self);
     fn set_ime_cursor_visible(&mut self, visible: bool);
 }
@@ -184,8 +187,8 @@ impl ImeTarget for PlatformInputHandler {
         PlatformInputHandler::replace_and_mark_text_in_range(self, range, text, selection)
     }
 
-    fn set_selected_text_range(&mut self, range: Range<usize>) {
-        PlatformInputHandler::set_selected_text_range(self, range)
+    fn set_selected_text_range(&mut self, selection: UTF16Selection) {
+        PlatformInputHandler::set_selected_text_range(self, selection)
     }
 
     fn unmark_text(&mut self) {
@@ -221,8 +224,7 @@ pub(crate) fn handle(target: &mut impl ImeTarget, input: ImeInput) {
     }
 }
 
-/// Applies one batch in the text-input-v3 `done` order: drop the preedit, delete around
-/// the selection, insert the commit, then mark the new preedit.
+/// Applies a done batch: remove preedit, delete around selection, commit, then mark new preedit.
 pub(crate) fn apply(target: &mut impl ImeTarget, batch: ImeBatch) {
     target.set_ime_cursor_visible(true);
     if let Some(marked) = target.marked_text_range() {
@@ -230,14 +232,22 @@ pub(crate) fn apply(target: &mut impl ImeTarget, batch: ImeBatch) {
     }
     let mut selection = None;
     if batch.delete != (0, 0) {
-        let deletion =
-            surrounding(target).and_then(|text| text.deletion(batch.delete.0, batch.delete.1));
+        let context = surrounding(target);
+        let deletion = context
+            .as_ref()
+            .and_then(|text| text.deletion(batch.delete.0, batch.delete.1));
         if let Some(deletion) = deletion {
             target.replace_text_in_range(Some(deletion.range), &deletion.retained);
-            target.set_selected_text_range(deletion.selection.clone());
-            selection = Some(deletion.selection);
+            selection = Some(deletion.selection.range.clone());
+            target.set_selected_text_range(deletion.selection);
         } else {
-            log::warn!("wayland: refused IME deletion outside valid UTF-8 context");
+            log::warn!(
+                "wayland: refused IME deletion outside valid UTF-8 context: before={} after={} context_bytes={} context_available={}",
+                batch.delete.0,
+                batch.delete.1,
+                context.as_ref().map_or(0, |text| text.text.len()),
+                context.is_some()
+            );
         }
     }
     if let Some(text) = batch.commit {
@@ -350,9 +360,9 @@ impl ImeTarget for FakeField {
         self.marked = Some(inserted);
     }
 
-    fn set_selected_text_range(&mut self, range: Range<usize>) {
-        self.selection = range;
-        self.reversed = false;
+    fn set_selected_text_range(&mut self, selection: UTF16Selection) {
+        self.selection = selection.range;
+        self.reversed = selection.reversed;
     }
 
     fn unmark_text(&mut self) {
@@ -408,8 +418,68 @@ mod tests {
         let deletion = text.deletion(3, 1).unwrap();
         assert_eq!(deletion.range, 11..15);
         assert_eq!(deletion.retained, "\u{20000}");
-        assert_eq!(deletion.selection, 11..13);
+        assert_eq!(deletion.selection.range, 11..13);
+        assert!(!deletion.selection.reversed);
         assert!(text.deletion(1, 0).is_none());
         assert!(text.deletion(u32::MAX, 0).is_none());
+    }
+
+    #[test]
+    fn fix1_a2_deletion_preserves_reversed_selection() {
+        for after in [0, 1] {
+            let mut field = FakeField::new("abcd", 1..3);
+            field.reversed = true;
+            apply(
+                &mut field,
+                ImeBatch {
+                    delete: (1, after),
+                    ..ImeBatch::default()
+                },
+            );
+            assert_eq!(field.text, if after == 0 { "bcd" } else { "bc" });
+            assert_eq!(field.selection, 0..2);
+            assert!(field.reversed);
+            let context = surrounding(&mut field).unwrap();
+            assert_eq!((context.cursor, context.anchor), (0, 2));
+        }
+    }
+
+    #[test]
+    fn fix1_a4_refused_deletion_warning_names_lengths_and_context() {
+        struct Capture(std::sync::Mutex<Vec<String>>);
+        impl log::Log for Capture {
+            fn enabled(&self, _: &log::Metadata<'_>) -> bool {
+                true
+            }
+            fn log(&self, record: &log::Record<'_>) {
+                if record.args().to_string().contains("refused IME deletion") {
+                    self.0.lock().unwrap().push(record.args().to_string());
+                }
+            }
+            fn flush(&self) {}
+        }
+        static CAPTURE: Capture = Capture(std::sync::Mutex::new(Vec::new()));
+        log::set_logger(&CAPTURE).unwrap();
+        log::set_max_level(log::LevelFilter::Warn);
+        for (before, after) in [(1, 0), (u32::MAX, 3)] {
+            let mut field = FakeField::new("é", 1..1);
+            apply(
+                &mut field,
+                ImeBatch {
+                    delete: (before, after),
+                    ..ImeBatch::default()
+                },
+            );
+        }
+        let messages = CAPTURE.0.lock().unwrap().clone();
+        for expected in [
+            "before=1 after=0 context_bytes=2",
+            "before=4294967295 after=3 context_bytes=2",
+        ] {
+            assert!(
+                messages.iter().any(|message| message.contains(expected)),
+                "{messages:?}"
+            );
+        }
     }
 }
