@@ -38,6 +38,15 @@ pub trait EntityInputHandler: 'static + Sized {
     /// See [`InputHandler::unmark_text`] for details
     fn unmark_text(&mut self, window: &mut Window, cx: &mut Context<Self>);
 
+    /// See [`InputHandler::set_ime_cursor_visible`] for details.
+    fn set_ime_cursor_visible(
+        &mut self,
+        _visible: bool,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+    }
+
     /// See [`InputHandler::paste`] for details
     fn paste(&mut self, item: ClipboardItem, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(text) = item.text() {
@@ -143,6 +152,12 @@ impl<V: 'static> ElementInputHandler<V> {
 }
 
 impl<V: EntityInputHandler> InputHandler for ElementInputHandler<V> {
+    fn set_ime_cursor_visible(&mut self, visible: bool, window: &mut Window, cx: &mut App) {
+        self.view.update(cx, |view, cx| {
+            view.set_ime_cursor_visible(visible, window, cx)
+        });
+    }
+
     fn selected_text_range(
         &mut self,
         ignore_disabled_input: bool,

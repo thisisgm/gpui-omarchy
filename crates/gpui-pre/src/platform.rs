@@ -2087,6 +2087,12 @@ impl PlatformInputHandler {
             .flatten()
     }
 
+    pub fn set_ime_cursor_visible(&mut self, visible: bool) {
+        self.cx
+            .update(|window, cx| self.handler.set_ime_cursor_visible(visible, window, cx))
+            .ok();
+    }
+
     #[cfg_attr(target_os = "windows", allow(dead_code))]
     pub fn marked_text_range(&mut self) -> Option<Range<usize>> {
         self.cx
@@ -2317,6 +2323,9 @@ pub struct UTF16Selection {
 ///
 /// <https://developer.apple.com/documentation/appkit/nstextinputclient>
 pub trait InputHandler: 'static {
+    /// Show or hide the caret during IME preedit; editors may override the default no-op.
+    fn set_ime_cursor_visible(&mut self, _visible: bool, _window: &mut Window, _cx: &mut App) {}
+
     /// Get the range of the user's currently selected text, if any
     /// Corresponds to [selectedRange()](https://developer.apple.com/documentation/appkit/nstextinputclient/1438242-selectedrange)
     ///

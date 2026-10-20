@@ -52,7 +52,7 @@ use wayland_protocols::wp::primary_selection::zv1::client::{
     zwp_primary_selection_source_v1,
 };
 use wayland_protocols::wp::text_input::zv3::client::zwp_text_input_v3::{
-    ContentHint, ContentPurpose,
+    ChangeCause, ContentHint, ContentPurpose,
 };
 use wayland_protocols::wp::text_input::zv3::client::{
     zwp_text_input_manager_v3, zwp_text_input_v3,
@@ -81,6 +81,9 @@ use xkbcommon::xkb::{self, KEYMAP_COMPILE_NO_FLAGS, Keycode};
 
 use super::{
     display::{WaylandDisplay, refresh_interval_from_millihertz},
+    ime::{ImeCursorRectangle, ImeSession, TextInputRequests},
+    ime_context::{Preedit, SurroundingText},
+    ime_events::{self, ImeHost, ImeWindow},
     presentation::{FrameFeedback, FrameFeedbackData, presentation_timestamp},
     window::{ImeInput, WaylandWindowStatePtr},
 };
@@ -120,77 +123,91 @@ const MIN_KEYCODE: u32 = 8;
 const UNKNOWN_KEYBOARD_LAYOUT_NAME: SharedString = SharedString::new_static("unknown");
 const XDG_ACTIVATION_TOKEN_ENV_VAR: &str = "XDG_ACTIVATION_TOKEN";
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct ImeCursorRectangle {
-    x: i32,
-    y: i32,
-    width: i32,
-    height: i32,
-}
-
-impl From<Bounds<Pixels>> for ImeCursorRectangle {
-    fn from(bounds: Bounds<Pixels>) -> Self {
-        Self {
-            x: bounds.origin.x.as_f32() as i32,
-            y: bounds.origin.y.as_f32() as i32,
-            width: bounds.size.width.as_f32() as i32,
-            height: bounds.size.height.as_f32() as i32,
-        }
-    }
-}
-
-trait ImeCursorRectangleSink {
-    fn set_ime_cursor_rectangle(&self, x: i32, y: i32, width: i32, height: i32);
-    fn commit_ime_state(&self);
-}
-
-impl ImeCursorRectangleSink for zwp_text_input_v3::ZwpTextInputV3 {
-    fn set_ime_cursor_rectangle(&self, x: i32, y: i32, width: i32, height: i32) {
-        self.set_cursor_rectangle(x, y, width, height);
+impl TextInputRequests for zwp_text_input_v3::ZwpTextInputV3 {
+    fn request_enable(&self) {
+        self.enable();
+        self.set_content_type(ContentHint::None, ContentPurpose::Normal);
     }
 
-    fn commit_ime_state(&self) {
+    fn request_disable(&self) {
+        self.disable();
+    }
+
+    fn request_surrounding_text(&self, text: String, cursor: i32, anchor: i32) {
+        self.set_surrounding_text(text, cursor, anchor);
+    }
+
+    fn request_change_cause(&self, cause: ChangeCause) {
+        self.set_text_change_cause(cause);
+    }
+
+    fn request_cursor_rectangle(&self, rectangle: ImeCursorRectangle) {
+        self.set_cursor_rectangle(rectangle.x, rectangle.y, rectangle.width, rectangle.height);
+    }
+
+    fn request_commit(&self) {
         self.commit();
     }
 }
 
-fn set_ime_cursor_rectangle(
-    text_input: &impl ImeCursorRectangleSink,
-    cursor_rectangle: ImeCursorRectangle,
-) {
-    text_input.set_ime_cursor_rectangle(
-        cursor_rectangle.x,
-        cursor_rectangle.y,
-        cursor_rectangle.width,
-        cursor_rectangle.height,
-    );
-}
+impl ImeHost for WaylandClientStatePtr {
+    type Surface = ObjectId;
+    type TextInput = zwp_text_input_v3::ZwpTextInputV3;
+    type Window = WaylandWindowStatePtr;
 
-fn update_ime_cursor_rectangle(
-    text_input: &impl ImeCursorRectangleSink,
-    last_ime_cursor_rectangle: &mut Option<ImeCursorRectangle>,
-    bounds: Bounds<Pixels>,
-) {
-    let cursor_rectangle = ImeCursorRectangle::from(bounds);
-    if *last_ime_cursor_rectangle == Some(cursor_rectangle) {
-        return;
+    fn with_session<R>(
+        &self,
+        f: impl FnOnce(&mut ImeSession<ObjectId>, Option<&Self::TextInput>) -> R,
+    ) -> R {
+        let client = self.get_client();
+        let mut state = client.borrow_mut();
+        let state = &mut *state;
+        f(&mut state.ime, state.text_input.as_ref())
     }
 
-    *last_ime_cursor_rectangle = Some(cursor_rectangle);
-    set_ime_cursor_rectangle(text_input, cursor_rectangle);
-    text_input.commit_ime_state();
+    fn window(&self, surface: &ObjectId) -> Option<WaylandWindowStatePtr> {
+        get_window(&mut self.get_client().borrow_mut(), surface)
+    }
+
+    fn defer(&self, task: impl FnOnce(&Self) + 'static) {
+        let this = self.clone();
+        self.get_client()
+            .borrow()
+            .loop_handle
+            .insert_idle(move |_| {
+                if this.0.upgrade().is_some() {
+                    task(&this);
+                }
+            });
+    }
 }
 
-fn set_ime_cursor_rectangle_after_done(
-    text_input: &impl ImeCursorRectangleSink,
-    last_ime_cursor_rectangle: &mut Option<ImeCursorRectangle>,
-    bounds: Bounds<Pixels>,
-    should_commit: bool,
-) {
-    if should_commit {
-        update_ime_cursor_rectangle(text_input, last_ime_cursor_rectangle, bounds);
-    } else {
-        set_ime_cursor_rectangle(text_input, ImeCursorRectangle::from(bounds));
+impl ImeWindow for WaylandWindowStatePtr {
+    fn ime_input(&self, input: ImeInput) {
+        self.handle_ime(input);
+    }
+
+    // IBus Intercepts keys like `a`, `b`, but those keys are needed for vim mode.
+    // We should only send ASCII characters to Zed, otherwise a user could remap a letter like `か` or `相`.
+    fn ime_key(&self, text: String) {
+        self.handle_input(PlatformInput::KeyDown(KeyDownEvent {
+            keystroke: Keystroke {
+                modifiers: Modifiers::default(),
+                key: text.clone(),
+                key_char: Some(text),
+                is_keypad: false,
+            },
+            is_held: false,
+            prefer_character_input: false,
+        }));
+    }
+
+    fn ime_area(&self) -> Option<Bounds<Pixels>> {
+        self.get_ime_area()
+    }
+
+    fn ime_context(&self) -> Option<SurroundingText> {
+        self.get_ime_context()
     }
 }
 
@@ -370,9 +387,7 @@ pub(crate) struct WaylandClientState {
     primary_selection: Option<zwp_primary_selection_device_v1::ZwpPrimarySelectionDeviceV1>,
     text_input: Option<zwp_text_input_v3::ZwpTextInputV3>,
     pre_edit_text: Option<String>,
-    ime_pre_edit: Option<String>,
-    composing: bool,
-    last_ime_cursor_rectangle: Option<ImeCursorRectangle>,
+    ime: ImeSession<ObjectId>,
     // Surface to Window mapping
     windows: HashMap<ObjectId, WaylandWindowStatePtr>,
     // Output to scale mapping
@@ -417,7 +432,6 @@ pub(crate) struct WaylandClientState {
     /// Long-lived sources this client registered on the loop, removed when it drops.
     registrations: Vec<RegistrationToken>,
     pub common: Rc<RefCell<LinuxCommon>>,
-    ime_enabled: Option<bool>,
     // The clockid_t of wp_presentation timestamps, sent once on bind.
     presentation_clock_id: u32,
 }
@@ -700,57 +714,25 @@ impl WaylandClientStatePtr {
     }
 
     pub fn enable_ime(&self) {
-        let client = self.get_client();
-        let mut state = client.borrow_mut();
-        state.ime_enabled = Some(true);
-        state.last_ime_cursor_rectangle = None;
-        let Some(text_input) = state.text_input.take() else {
-            return;
-        };
-
-        text_input.enable();
-        text_input.set_content_type(ContentHint::None, ContentPurpose::Normal);
-        let mut cursor_rectangle = None;
-        if let Some(window) = state.keyboard_focused_window.clone() {
-            drop(state);
-            if let Some(area) = window.get_ime_area() {
-                let area = ImeCursorRectangle::from(area);
-                set_ime_cursor_rectangle(&text_input, area);
-                cursor_rectangle = Some(area);
-            }
-            state = client.borrow_mut();
-        }
-        text_input.commit();
-        state.last_ime_cursor_rectangle = cursor_rectangle;
-        state.text_input = Some(text_input);
+        ime_events::enable(self);
     }
 
     pub fn disable_ime(&self) {
         let client = self.get_client();
         let mut state = client.borrow_mut();
-        state.ime_enabled = Some(false);
-        state.composing = false;
-        if let Some(text_input) = &state.text_input {
-            text_input.disable();
-            text_input.commit();
-        }
+        let state = &mut *state;
+        state.ime.disable(state.text_input.as_ref());
     }
 
     pub fn ime_enabled(&self) -> Option<bool> {
         let client = self.get_client();
-        client.borrow().ime_enabled
+        client.borrow().ime.enabled()
     }
 
-    pub fn update_ime_position(&self, bounds: Bounds<Pixels>) {
-        let client = self.get_client();
-        let mut state = client.borrow_mut();
-        if state.pre_edit_text.is_some() {
-            return;
+    pub fn update_ime_position(&self, surface: ObjectId, bounds: Bounds<Pixels>) {
+        if self.get_client().borrow().pre_edit_text.is_none() {
+            ime_events::caret_moved(self, surface, bounds);
         }
-        let Some(text_input) = state.text_input.clone() else {
-            return;
-        };
-        update_ime_cursor_rectangle(&text_input, &mut state.last_ime_cursor_rectangle, bounds);
     }
 
     pub fn handle_keyboard_layout_change(&self) {
@@ -792,6 +774,7 @@ impl WaylandClientStatePtr {
     }
 
     pub fn drop_window(&self, surface_id: &ObjectId) {
+        ime_events::window_closed(self, surface_id);
         let client = self.get_client();
         let mut state = client.borrow_mut();
         let closed_window = state.windows.remove(surface_id).unwrap();
@@ -1067,9 +1050,7 @@ impl WaylandConnection {
             primary_selection,
             text_input: None,
             pre_edit_text: None,
-            ime_pre_edit: None,
-            composing: false,
-            last_ime_cursor_rectangle: None,
+            ime: ImeSession::default(),
             outputs: HashMap::default(),
             in_progress_outputs,
             output_globals,
@@ -1126,7 +1107,6 @@ impl WaylandConnection {
                 ..environment.clone()
             },
             registrations: Vec::new(),
-            ime_enabled: None,
             presentation_clock_id: libc::CLOCK_MONOTONIC as u32,
         }));
 
@@ -2124,7 +2104,7 @@ impl Dispatch<xdg_activation_token_v1::XdgActivationTokenV1, ()> for WaylandClie
 
 impl Dispatch<wl_seat::WlSeat, ()> for WaylandClientStatePtr {
     fn event(
-        state: &mut Self,
+        this: &mut Self,
         seat: &wl_seat::WlSeat,
         event: wl_seat::Event,
         _: &(),
@@ -2135,15 +2115,12 @@ impl Dispatch<wl_seat::WlSeat, ()> for WaylandClientStatePtr {
             capabilities: WEnum::Value(capabilities),
         } = event
         {
-            let client = state.get_client();
+            let client = this.get_client();
             let mut state = client.borrow_mut();
             if capabilities.contains(wl_seat::Capability::Keyboard) {
                 let keyboard = seat.get_keyboard(qh, ());
-
                 if let Some(text_input) = state.text_input.take() {
                     text_input.destroy();
-                    state.ime_pre_edit = None;
-                    state.composing = false;
                 }
 
                 state.text_input = state
@@ -2157,6 +2134,24 @@ impl Dispatch<wl_seat::WlSeat, ()> for WaylandClientStatePtr {
                 }
 
                 state.wl_keyboard = Some(keyboard);
+                drop(state);
+                ime_events::text_input_destroyed(&*this);
+                state = client.borrow_mut();
+            } else {
+                if let Some(keyboard) = state.wl_keyboard.take() {
+                    keyboard.release();
+                }
+                if let Some(text_input) = state.text_input.take() {
+                    text_input.destroy();
+                }
+                let focused = state.keyboard_focused_window.take();
+                state.repeat.current_id += 1;
+                drop(state);
+                ime_events::text_input_destroyed(&*this);
+                if let Some(window) = focused {
+                    window.set_focused(false);
+                }
+                state = client.borrow_mut();
             }
             if capabilities.contains(wl_seat::Capability::Pointer) {
                 let pointer = seat.get_pointer(qh, ());
@@ -2255,13 +2250,15 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandClientStatePtr {
                 state.repeat.current_id += 1;
                 state.restore_cursor_after_hide();
 
-                if let Some(window) = keyboard_focused_window {
+                if keyboard_focused_window.is_some() {
                     if let Some(ref mut compose) = state.compose_state {
                         compose.reset();
                     }
                     state.pre_edit_text.take();
-                    drop(state);
-                    window.handle_ime(ImeInput::DeleteText);
+                }
+                drop(state);
+                ime_events::keyboard_left(&*this, &surface.id());
+                if let Some(window) = keyboard_focused_window {
                     window.set_focused(false);
                 }
             }
@@ -2439,69 +2436,40 @@ impl Dispatch<zwp_text_input_v3::ZwpTextInputV3, ()> for WaylandClientStatePtr {
     ) {
         let client = this.get_client();
         let mut state = client.borrow_mut();
+        if state.text_input.as_ref() != Some(text_input) {
+            return;
+        }
         match event {
-            zwp_text_input_v3::Event::Enter { .. } => {
+            zwp_text_input_v3::Event::Enter { surface } => {
                 drop(state);
-                this.enable_ime();
+                ime_events::enter(&*this, surface.id());
             }
-            zwp_text_input_v3::Event::Leave { .. } => {
+            zwp_text_input_v3::Event::Leave { surface } => {
                 drop(state);
-                this.disable_ime();
+                ime_events::leave(&*this, &surface.id());
             }
             zwp_text_input_v3::Event::CommitString { text } => {
-                state.composing = false;
-                let Some(window) = state.keyboard_focused_window.clone() else {
-                    return;
-                };
-
-                if let Some(commit_text) = text {
-                    drop(state);
-                    // IBus Intercepts keys like `a`, `b`, but those keys are needed for vim mode.
-                    // We should only send ASCII characters to Zed, otherwise a user could remap a letter like `か` or `相`.
-                    if commit_text.len() == 1 {
-                        window.handle_input(PlatformInput::KeyDown(KeyDownEvent {
-                            keystroke: Keystroke {
-                                modifiers: Modifiers::default(),
-                                key: commit_text.clone(),
-                                key_char: Some(commit_text),
-                                is_keypad: false,
-                            },
-                            is_held: false,
-                            prefer_character_input: false,
-                        }));
-                    } else {
-                        window.handle_ime(ImeInput::InsertText(commit_text));
-                    }
-                }
+                state.ime.set_commit(text);
             }
-            zwp_text_input_v3::Event::PreeditString { text, .. } => {
-                state.composing = true;
-                state.ime_pre_edit = text;
+            zwp_text_input_v3::Event::PreeditString {
+                text,
+                cursor_begin,
+                cursor_end,
+            } => {
+                state
+                    .ime
+                    .set_preedit(text.map(|text| Preedit::new(text, cursor_begin, cursor_end)));
+            }
+            zwp_text_input_v3::Event::DeleteSurroundingText {
+                before_length,
+                after_length,
+            } => {
+                state.ime.set_delete(before_length, after_length);
             }
             zwp_text_input_v3::Event::Done { serial } => {
-                let last_serial = state.serial_tracker.get(SerialKind::InputMethod);
                 state.serial_tracker.update(SerialKind::InputMethod, serial);
-                let Some(window) = state.keyboard_focused_window.clone() else {
-                    return;
-                };
-
-                if let Some(text) = state.ime_pre_edit.take() {
-                    drop(state);
-                    window.handle_ime(ImeInput::SetMarkedText(text));
-                    if let Some(area) = window.get_ime_area() {
-                        let mut state = client.borrow_mut();
-                        set_ime_cursor_rectangle_after_done(
-                            text_input,
-                            &mut state.last_ime_cursor_rectangle,
-                            area,
-                            last_serial.as_raw() == serial,
-                        );
-                    }
-                } else {
-                    state.composing = false;
-                    drop(state);
-                    window.handle_ime(ImeInput::DeleteText);
-                }
+                drop(state);
+                ime_events::done(&*this, serial);
             }
             _ => {}
         }
@@ -2674,15 +2642,12 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
                 match button_state {
                     wl_pointer::ButtonState::Pressed => {
                         if let Some(window) = state.keyboard_focused_window.clone() {
-                            if state.composing && state.text_input.is_some() {
-                                drop(state);
-                                // text_input_v3 don't have something like a reset function
-                                this.disable_ime();
-                                this.enable_ime();
-                                window.handle_ime(ImeInput::UnmarkText);
-                                state = client.borrow_mut();
-                            } else if let (Some(text), Some(compose)) =
-                                (state.pre_edit_text.take(), state.compose_state.as_mut())
+                            drop(state);
+                            let composed = ime_events::pointer_pressed(&*this, &window);
+                            state = client.borrow_mut();
+                            if !composed
+                                && let (Some(text), Some(compose)) =
+                                    (state.pre_edit_text.take(), state.compose_state.as_mut())
                             {
                                 compose.reset();
                                 drop(state);
@@ -3457,8 +3422,6 @@ impl Dispatch<XdgDialogV1, ()> for WaylandClientStatePtr {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::Cell;
-
     use super::*;
 
     #[test]
@@ -3565,24 +3528,6 @@ mod tests {
         assert!(keystroke.is_keypad);
     }
 
-    #[derive(Default)]
-    struct FakeImeCursorRectangleSink {
-        cursor_rectangles: RefCell<Vec<(i32, i32, i32, i32)>>,
-        commit_count: Cell<usize>,
-    }
-
-    impl ImeCursorRectangleSink for FakeImeCursorRectangleSink {
-        fn set_ime_cursor_rectangle(&self, x: i32, y: i32, width: i32, height: i32) {
-            self.cursor_rectangles
-                .borrow_mut()
-                .push((x, y, width, height));
-        }
-
-        fn commit_ime_state(&self) {
-            self.commit_count.set(self.commit_count.get() + 1);
-        }
-    }
-
     #[test]
     fn builds_terminated_uri_list_for_each_dragged_path() {
         let paths = gpui::FileDragPaths::new([
@@ -3615,71 +3560,6 @@ mod tests {
                 false
             )]))
             .is_empty()
-        );
-    }
-
-    fn ime_cursor_bounds(x: f32) -> Bounds<Pixels> {
-        Bounds::new(point(px(x), px(20.25)), size(px(1.0), px(18.75)))
-    }
-
-    #[test]
-    fn caches_cursor_rectangle_committed_after_done() {
-        let text_input = FakeImeCursorRectangleSink::default();
-        let mut last_ime_cursor_rectangle = None;
-        let initial_bounds = ime_cursor_bounds(10.0);
-        let updated_bounds = ime_cursor_bounds(20.0);
-
-        update_ime_cursor_rectangle(&text_input, &mut last_ime_cursor_rectangle, initial_bounds);
-        set_ime_cursor_rectangle_after_done(
-            &text_input,
-            &mut last_ime_cursor_rectangle,
-            updated_bounds,
-            true,
-        );
-        update_ime_cursor_rectangle(&text_input, &mut last_ime_cursor_rectangle, updated_bounds);
-
-        assert_eq!(text_input.commit_count.get(), 2);
-        assert_eq!(text_input.cursor_rectangles.borrow().len(), 2);
-    }
-
-    #[test]
-    fn skips_unchanged_cursor_rectangle_after_done() {
-        let text_input = FakeImeCursorRectangleSink::default();
-        let mut last_ime_cursor_rectangle = None;
-        let bounds = ime_cursor_bounds(10.0);
-
-        update_ime_cursor_rectangle(&text_input, &mut last_ime_cursor_rectangle, bounds);
-        set_ime_cursor_rectangle_after_done(
-            &text_input,
-            &mut last_ime_cursor_rectangle,
-            bounds,
-            true,
-        );
-
-        assert_eq!(text_input.commit_count.get(), 1);
-        assert_eq!(text_input.cursor_rectangles.borrow().len(), 1);
-    }
-
-    #[test]
-    fn skips_cursor_rectangles_with_unchanged_protocol_coordinates() {
-        let text_input = FakeImeCursorRectangleSink::default();
-        let mut last_ime_cursor_rectangle = None;
-
-        update_ime_cursor_rectangle(
-            &text_input,
-            &mut last_ime_cursor_rectangle,
-            ime_cursor_bounds(10.25),
-        );
-        update_ime_cursor_rectangle(
-            &text_input,
-            &mut last_ime_cursor_rectangle,
-            ime_cursor_bounds(10.75),
-        );
-
-        assert_eq!(text_input.commit_count.get(), 1);
-        assert_eq!(
-            text_input.cursor_rectangles.borrow().as_slice(),
-            &[(10, 20, 1, 18)]
         );
     }
 }
