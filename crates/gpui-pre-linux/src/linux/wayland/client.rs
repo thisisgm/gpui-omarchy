@@ -94,9 +94,7 @@ use crate::linux::{
     keystroke_from_xkb, keystroke_underlying_dead_key, modifiers_from_xkb, new_xkb_context,
     open_uri_internal, reveal_path_internal,
     wayland::{
-        clipboard::{
-            Clipboard, DataOffer, DataSourceKind, ReadCompletion, ReadRequest, ReadSlot, SourceData,
-        },
+        clipboard::{Clipboard, DataOffer, DataSourceKind, ReadCompletion, SourceData},
         cursor::Cursor,
         serial::{Serial, SerialKind, SerialTracker},
         to_shape,
@@ -443,6 +441,8 @@ pub(crate) struct ExternalDrag {
     window: WaylandWindowStatePtr,
     source_id: u64,
     action: Option<gpui::NativeDragAction>,
+    // The actions this source offered, so a drop the compositor never reported an action for can still name it.
+    offered: Vec<gpui::NativeDragAction>,
 }
 
 #[cfg(test)]
@@ -675,6 +675,7 @@ impl WaylandClientStatePtr {
         for representation in payload.representations() {
             source.offer(representation.mime_type().to_owned());
         }
+        let mut offered = Vec::new();
         if source.version() >= 3 {
             let mut supported = DndAction::empty();
             if actions.copy {
@@ -694,6 +695,14 @@ impl WaylandClientStatePtr {
                 };
             }
             source.set_actions(supported);
+            offered = [
+                (DndAction::Copy, gpui::NativeDragAction::Copy),
+                (DndAction::Move, gpui::NativeDragAction::Move),
+            ]
+            .into_iter()
+            .filter(|(bit, _)| supported.contains(*bit))
+            .map(|(_, action)| action)
+            .collect();
         } else if !actions.copy {
             source.destroy();
             return false;
@@ -704,6 +713,7 @@ impl WaylandClientStatePtr {
             window,
             source_id,
             action: None,
+            offered,
         });
         true
     }
@@ -978,6 +988,7 @@ impl WaylandConnection {
         let mut wl_outputs: HashMap<ObjectId, wl_output::WlOutput> = HashMap::default();
         #[allow(clippy::mutable_key_type)]
         let mut output_globals: HashMap<u32, ObjectId> = HashMap::default();
+        let mut hyprland = false;
         globals.contents().with_list(|list| -> anyhow::Result<()> {
             for global in list {
                 match &global.interface[..] {
@@ -1000,6 +1011,7 @@ impl WaylandConnection {
                         output_globals.insert(global.name, output.id());
                         wl_outputs.insert(output.id(), output);
                     }
+                    interface if super::drag::hyprland_data_device(interface) => hyprland = true,
                     _ => {}
                 }
             }
@@ -1060,7 +1072,7 @@ impl WaylandConnection {
             keyboard_layout: LinuxKeyboardLayout::new(UNKNOWN_KEYBOARD_LAYOUT_NAME),
             keymap_state: None,
             compose_state: None,
-            drag: DragState::default(),
+            drag: DragState::new(hyprland),
             external_drag: None,
             click: ClickState {
                 last_click: Instant::now(),
@@ -3026,7 +3038,8 @@ impl Dispatch<wl_data_device::WlDataDevice, ()> for WaylandClientStatePtr {
                     return;
                 };
                 let offer = state.data_offers.remove(index);
-                let Some(window) = get_window(&mut state, &surface.id()) else {
+                let window = get_window(&mut state, &surface.id());
+                let Some((offer, window)) = state.drag.target(offer, window) else {
                     return;
                 };
                 let common = state.common.clone();
@@ -3041,56 +3054,33 @@ impl Dispatch<wl_data_device::WlDataDevice, ()> for WaylandClientStatePtr {
                 drop(state);
                 let actions = crate::linux::transfer::destination_actions(&common, event);
                 let mut state = client.borrow_mut();
-                if state.drag.generation != generation {
+                let Some(offer) = state.drag.resume(generation, offer) else {
                     return;
-                }
-                let Some(types) = super::drag::accept_offer_with_actions(
+                };
+                let selection = super::drag::accept_offer_with_actions(
                     &offer.inner,
                     serial,
                     &offer.mime_types,
                     arbitrary,
                     actions,
+                );
+                let state = &mut *state;
+                let connection = &state.clipboard.connection;
+                let Some(request) = state.drag.enter(
+                    offer,
+                    window,
+                    Point::new(x.into(), y.into()),
+                    serial,
+                    selection,
+                    || {
+                        connection
+                            .flush()
+                            .map_err(crate::linux::transfer::transport)
+                    },
                 ) else {
                     return;
                 };
-                let Ok(permit) = crate::linux::transfer::TransferPermit::acquire() else {
-                    return;
-                };
-                let files = match types
-                    .iter()
-                    .map(|mime| offer.receive(mime).map(|file| (mime.clone(), file)))
-                    .collect::<Result<Vec<_>, _>>()
-                {
-                    Ok(files) => files,
-                    Err(error) => {
-                        log::debug!("native drop receive: {error}");
-                        return;
-                    }
-                };
-                if let Err(error) = state.clipboard.connection.flush() {
-                    log::debug!("native drop flush: {error}");
-                    return;
-                }
-                let generation = state.drag.begin(
-                    offer.clone(),
-                    window,
-                    Point::new(x.into(), y.into()),
-                    offer.mime_types.clone(),
-                );
-                if offer.inner.version() < 3 {
-                    state.drag.action = Some(gpui::NativeDragAction::Copy);
-                }
-                let slot = ReadSlot::default();
-                state.drag.pending = Some(slot.clone());
-                let request = ReadRequest {
-                    generation,
-                    cancel: state.drag.cancel.clone(),
-                    deadline: Instant::now() + crate::linux::transfer::TRANSFER_TIMEOUT,
-                    files,
-                    _offer: offer,
-                    _permit: permit,
-                    slot,
-                };
+                let generation = request.generation;
                 let task = state
                     .common
                     .borrow()
@@ -3106,22 +3096,9 @@ impl Dispatch<wl_data_device::WlDataDevice, ()> for WaylandClientStatePtr {
                         let Some(client) = this.0.upgrade() else {
                             return;
                         };
-                        let mut state = client.borrow_mut();
-                        if state.drag.generation != generation {
+                        if !client.borrow_mut().drag.publish(generation, result) {
                             return;
                         }
-                        let accepted = ReadCompletion::publish(result, |result| match result {
-                            Ok(item) => state.drag.complete(generation, item),
-                            Err(error) => {
-                                log::debug!("native drop receive: {error}");
-                                state.drag.clear();
-                                false
-                            }
-                        });
-                        if !accepted {
-                            return;
-                        }
-                        drop(state);
                         this.dispatch_native_drop();
                     })
                     .detach();
@@ -3183,6 +3160,18 @@ impl Dispatch<wl_data_offer::WlDataOffer, ()> for WaylandClientStatePtr {
                     .find(|offer| offer.inner.id() == data_offer.id())
                 {
                     offer.add_mime_type(mime_type);
+                }
+            }
+            wl_data_offer::Event::SourceActions { source_actions } => {
+                if let Some(offer) = state
+                    .data_offers
+                    .iter_mut()
+                    .find(|offer| offer.inner.id() == data_offer.id())
+                {
+                    offer.source_actions = Some(match source_actions {
+                        WEnum::Value(actions) => actions,
+                        WEnum::Unknown(bits) => DndAction::from_bits_truncate(bits),
+                    });
                 }
             }
             wl_data_offer::Event::Action { dnd_action } => {
@@ -3261,6 +3250,13 @@ impl Dispatch<wl_data_source::WlDataSource, SourceData> for WaylandClientStatePt
                     wl_data_source::Event::Cancelled => gpui::NativeDragPhase::Cancelled,
                     _ => return,
                 };
+                if matches!(
+                    phase,
+                    gpui::NativeDragPhase::Dropped | gpui::NativeDragPhase::Finished
+                ) {
+                    let drag = state.external_drag.as_mut().unwrap();
+                    drag.action = super::drag::performed_action(drag.action, &drag.offered);
+                }
                 let drag = state.external_drag.as_ref().unwrap();
                 crate::linux::transfer::notify_drag(
                     &state.common,
@@ -3681,6 +3677,7 @@ impl WaylandClientStatePtr {
         let common = state.common.clone();
         let paths = state.drag.paths.clone();
         drop(state);
+        let has_paths = !paths.0.is_empty();
         if !entered {
             let event = gpui::NativeDropEvent {
                 window: window.handle(),
@@ -3691,54 +3688,42 @@ impl WaylandClientStatePtr {
                 action,
                 modifiers,
             };
-            if !crate::linux::transfer::allow_drop(&common, event, !paths.0.is_empty()) {
-                client.borrow_mut().drag.clear();
+            let allowed = crate::linux::transfer::allow_drop(&common, event, has_paths);
+            if !client.borrow_mut().drag.admit(generation, allowed) {
                 return;
             }
-            if client.borrow().drag.generation != generation {
-                return;
-            }
-            client.borrow_mut().drag.entered = true;
-            if !paths.0.is_empty() {
+            if has_paths {
                 window.handle_input(PlatformInput::FileDrop(FileDropEvent::Entered {
                     position,
-                    paths: paths.clone(),
+                    paths,
                 }));
             }
         }
         if !dropped {
             return;
         }
-        if offer.inner.version() >= 3 && action.is_none() {
-            client.borrow_mut().drag.clear();
-            if !paths.0.is_empty() {
-                window.handle_input(PlatformInput::FileDrop(FileDropEvent::Exited));
-            }
-            return;
-        }
-        let event = gpui::NativeDropEvent {
-            window: window.handle(),
-            position,
-            dropped: true,
-            offered_types,
-            data,
-            action,
-            modifiers,
+        let accepted = (offer.inner.version() < 3 || action.is_some()) && {
+            let event = gpui::NativeDropEvent {
+                window: window.handle(),
+                position,
+                dropped: true,
+                offered_types,
+                data,
+                action,
+                modifiers,
+            };
+            crate::linux::transfer::allow_drop(&common, event, has_paths)
         };
-        let accepted = crate::linux::transfer::allow_drop(&common, event, !paths.0.is_empty());
         if client.borrow().drag.generation != generation {
             return;
         }
-        if accepted {
-            if !paths.0.is_empty() {
-                window.handle_input(PlatformInput::FileDrop(FileDropEvent::Submit { position }));
-            }
-            super::drag::finish_offer(&offer.inner, accepted, dropped, action);
-        } else if !paths.0.is_empty() {
-            window.handle_input(PlatformInput::FileDrop(FileDropEvent::Exited));
+        if has_paths {
+            window.handle_input(PlatformInput::FileDrop(if accepted {
+                FileDropEvent::Submit { position }
+            } else {
+                FileDropEvent::Exited
+            }));
         }
-        if client.borrow().drag.generation == generation {
-            client.borrow_mut().drag.clear();
-        }
+        client.borrow_mut().drag.submit(generation, accepted);
     }
 }
