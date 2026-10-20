@@ -2008,6 +2008,7 @@ dependencies = [
  "hdrhistogram",
  "heapless",
  "image",
+ "imagesize",
  "inventory",
  "itertools 0.14.0",
  "libc",

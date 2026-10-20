@@ -120,8 +120,14 @@ impl From<f32> for SvgSize {
     }
 }
 
-/// Biggest image an untrusted SVG may pull in: 16M pixels of BGRA, the bound a preview raster uses.
+/// Biggest encoded image an untrusted SVG may pull in; the header bound below is what bites.
 pub const UNTRUSTED_IMAGE_MAX_BYTES: u64 = 16_777_216 * 4;
+
+/// Longest edge, in pixels, an untrusted data: image may name: the preview raster's own edge bound.
+pub const UNTRUSTED_IMAGE_MAX_EDGE: usize = 8192;
+
+/// Most pixels an untrusted data: image may name: the preview raster's own pixel bound.
+pub const UNTRUSTED_IMAGE_MAX_PIXELS: usize = 16_777_216;
 
 static SYSTEM_FONT_DB: LazyLock<Arc<usvg::fontdb::Database>> = LazyLock::new(|| {
     let mut db = usvg::fontdb::Database::new();
@@ -192,6 +198,21 @@ fn untrusted_image_href_resolver() -> usvg::ImageHrefResolver<'static> {
                 "image/webp" => Some(usvg::ImageKind::WEBP(data)),
                 _ => None,
             }
+            .filter(|kind| {
+                let (w, h) = match kind {
+                    usvg::ImageKind::JPEG(data)
+                    | usvg::ImageKind::PNG(data)
+                    | usvg::ImageKind::GIF(data)
+                    | usvg::ImageKind::WEBP(data) => match imagesize::blob_size(data) {
+                        Ok(size) => (size.width, size.height),
+                        Err(_) => return false,
+                    },
+                    usvg::ImageKind::SVG(_) => return false,
+                };
+                w <= UNTRUSTED_IMAGE_MAX_EDGE
+                    && h <= UNTRUSTED_IMAGE_MAX_EDGE
+                    && w.saturating_mul(h) <= UNTRUSTED_IMAGE_MAX_PIXELS
+            })
         }),
         resolve_string: Box::new(|_, _| None),
     }
@@ -447,7 +468,7 @@ mod tests {
     fn untrusted_data_images_stay_within_the_byte_bound() {
         let resolver = untrusted_image_href_resolver();
         let options = usvg::Options::default();
-        let small = Arc::new(vec![137, 80, 78, 71]);
+        let small = Arc::new(png_with_size(1, 1));
         let kept = (resolver.resolve_data)("image/png", small.clone(), &options);
         assert!(matches!(kept, Some(usvg::ImageKind::PNG(data)) if Arc::ptr_eq(&data, &small)));
         let big = Arc::new(vec![0u8; (UNTRUSTED_IMAGE_MAX_BYTES + 1) as usize]);
@@ -464,7 +485,10 @@ mod tests {
             let _ = parsed.send(renderer.parse_svg_untrusted(&svg).is_ok());
         });
         // Opening /dev/zero for reading never ends; returning at all proves nothing opened it.
-        assert_eq!(waiting.recv_timeout(std::time::Duration::from_secs(10)), Ok(true));
+        assert_eq!(
+            waiting.recv_timeout(std::time::Duration::from_secs(10)),
+            Ok(true)
+        );
     }
 
     #[test]
@@ -472,6 +496,132 @@ mod tests {
         let renderer = SvgRenderer::new(Arc::new(()));
         let svg = b"<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"10\" height=\"10\"><rect width=\"10\" height=\"10\" fill=\"#3366cc\"/><image x=\"0\" y=\"0\" width=\"10\" height=\"10\" href=\"data:image/png;base64,iVBORw0KGgo=\"/></svg>";
         assert!(renderer.parse_svg_untrusted(svg).is_ok());
+    }
+
+    fn png_with_size(width: u32, height: u32) -> Vec<u8> {
+        let mut bytes = vec![137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82];
+        bytes.extend_from_slice(&width.to_be_bytes());
+        bytes.extend_from_slice(&height.to_be_bytes());
+        bytes.extend_from_slice(&[8, 2, 0, 0, 0]);
+        bytes
+    }
+
+    fn gif_with_size(width: u16, height: u16) -> Vec<u8> {
+        let mut bytes = b"GIF89a".to_vec();
+        bytes.extend_from_slice(&width.to_le_bytes());
+        bytes.extend_from_slice(&height.to_le_bytes());
+        // Full logical screen descriptor: imagesize needs 12 bytes minimum.
+        bytes.extend_from_slice(&[0x70, 0, 0]);
+        bytes
+    }
+
+    fn jpeg_with_size(width: u16, height: u16) -> Vec<u8> {
+        let mut bytes = vec![0xFF, 0xD8, 0xFF, 0xC0, 0x00, 0x0B, 0x08];
+        bytes.extend_from_slice(&height.to_be_bytes());
+        bytes.extend_from_slice(&width.to_be_bytes());
+        bytes.extend_from_slice(&[0x01, 0x01, 0x11, 0x00]);
+        bytes
+    }
+
+    fn webp_with_size(width: u16, height: u16) -> Vec<u8> {
+        let mut bytes = b"RIFF".to_vec();
+        bytes.extend_from_slice(&100u32.to_le_bytes());
+        bytes.extend_from_slice(b"WEBP");
+        bytes.extend_from_slice(b"VP8 ");
+        bytes.extend_from_slice(&20u32.to_le_bytes());
+        bytes.extend_from_slice(&[0x10, 0x6D, 0xD2, 0x9D, 0x01, 0x2A]);
+        bytes.extend_from_slice(&(width & 0x3FFF).to_le_bytes());
+        bytes.extend_from_slice(&(height & 0x3FFF).to_le_bytes());
+        bytes
+    }
+
+    #[test]
+    fn untrusted_liar_dimensions_are_refused() {
+        let resolver = untrusted_image_href_resolver();
+        let options = usvg::Options::default();
+        let resolve = |mime: &str, data: Vec<u8>| {
+            (resolver.resolve_data)(mime, Arc::new(data), &options).is_some()
+        };
+        assert!(!resolve("image/png", png_with_size(8193, 1)));
+        assert!(!resolve("image/png", png_with_size(4097, 4097)));
+        assert!(resolve("image/png", png_with_size(4096, 4096)));
+        assert!(resolve("image/png", png_with_size(256, 256)));
+        assert!(!resolve("image/gif", gif_with_size(8193, 1)));
+        assert!(resolve("image/gif", gif_with_size(10, 10)));
+        assert!(!resolve("image/jpeg", jpeg_with_size(8193, 1)));
+        assert!(resolve("image/jpeg", jpeg_with_size(10, 10)));
+        assert!(!resolve("image/webp", webp_with_size(9000, 9000)));
+        assert!(!resolve("image/png", vec![0, 1, 2, 3]));
+    }
+
+    #[test]
+    fn untrusted_liar_header_never_reaches_the_decoder() {
+        // A decodable 30000x30000 PNG exceeds both bounds: the gate must refuse it before decoding paints black over the background.
+        use image::ImageEncoder;
+        let pixels = vec![0u8; 30000 * 30000];
+        let mut encoded = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut encoded)
+            .write_image(&pixels, 30000, 30000, image::ExtendedColorType::L8)
+            .expect("a solid liar image encodes");
+        let url: String = encoded.iter().map(|b| format!("%{b:02X}")).collect();
+        let svg = format!("<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"10\" height=\"10\"><rect width=\"10\" height=\"10\" fill=\"#3366cc\"/><image x=\"0\" y=\"0\" width=\"10\" height=\"10\" href=\"data:image/png,{url}\"/></svg>").into_bytes();
+        let renderer = SvgRenderer::new(Arc::new(()));
+        let (done, waiting) = std::sync::mpsc::channel();
+        let start = std::time::Instant::now();
+        std::thread::spawn(move || {
+            let outcome = (|| {
+                let parsed = renderer.parse_svg_untrusted(&svg).ok()?;
+                let image = renderer
+                    .render_parsed(
+                        &parsed,
+                        SvgSize::ExactSize(Size::new(DevicePixels(10), DevicePixels(10))),
+                    )
+                    .ok()?;
+                let bytes = image.as_bytes(0)?;
+                let center = (5 * 10 + 5) * 4;
+                Some(bytes[center..center + 4].to_vec())
+            })();
+            let _ = done.send((start.elapsed(), outcome));
+        });
+        match waiting.recv_timeout(std::time::Duration::from_secs(60)) {
+            Ok((elapsed, Some(pixel))) => {
+                eprintln!("liar header decoded nothing in {elapsed:?}; center pixel {pixel:?}");
+                assert!(elapsed < std::time::Duration::from_secs(10));
+                assert_eq!(pixel, vec![0xCC, 0x66, 0x33, 0xFF]);
+            }
+            Ok((elapsed, None)) => panic!("liar header rendered nothing after {elapsed:?}"),
+            Err(_) => panic!("liar header render never returned"),
+        }
+    }
+
+    #[test]
+    fn untrusted_small_data_image_still_draws() {
+        use image::ImageEncoder;
+        let mut pixels = Vec::with_capacity(256 * 256 * 3);
+        for _ in 0..256 * 256 {
+            pixels.extend_from_slice(&[255, 0, 0]);
+        }
+        let mut encoded = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut encoded)
+            .write_image(&pixels, 256, 256, image::ExtendedColorType::Rgb8)
+            .expect("a solid test image encodes");
+        let url: String = encoded.iter().map(|b| format!("%{b:02X}")).collect();
+        let svg = format!(
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"256\" height=\"256\"><image x=\"0\" y=\"0\" width=\"256\" height=\"256\" href=\"data:image/png,{url}\"/></svg>"
+        );
+        let renderer = SvgRenderer::new(Arc::new(()));
+        let parsed = renderer
+            .parse_svg_untrusted(svg.as_bytes())
+            .expect("a kept image parses");
+        let image = renderer
+            .render_parsed(
+                &parsed,
+                SvgSize::ExactSize(Size::new(DevicePixels(256), DevicePixels(256))),
+            )
+            .expect("a kept image renders");
+        let bytes = image.as_bytes(0).expect("a rendered frame");
+        let center = (128 * 256 + 128) * 4;
+        assert_eq!(&bytes[center..center + 4], &[0, 0, 255, 255]);
     }
 
     #[cfg(not(feature = "ci-exclude-bundled-font-tests"))]

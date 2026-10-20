@@ -434,6 +434,9 @@ features = [
 ]
 default-features = false
 
+[dependencies.imagesize]
+version = "=0.15.0"
+
 [dependencies.inventory]
 version = "0.3.19"
 
