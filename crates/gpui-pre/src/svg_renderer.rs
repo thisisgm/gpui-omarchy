@@ -223,7 +223,7 @@ fn untrusted_image_href_resolver() -> usvg::ImageHrefResolver<'static> {
     }
 }
 
-// Walks GIF descriptors and sub-blocks without decoding or allocating a frame.
+// Walks, never decodes: `GIF89a 0A00 0A00 00 00 00 | 21 F9 04 00 00 00 00 00 | 2C 0000 0000 0A00 0A00 00 02 01 00 00 | 3B`, a header with screen descriptor, an extension, an image and the trailer.
 fn gif_frames_within_bounds(mut data: &[u8]) -> bool {
     fn take<'a>(data: &mut &'a [u8], count: usize) -> Option<&'a [u8]> {
         let (head, tail) = data.split_at_checked(count)?;
@@ -654,15 +654,45 @@ mod tests {
         assert!(!resolve("image/png", vec![0, 1, 2, 3]));
     }
 
+    fn images(group: &usvg::Group) -> usize {
+        group
+            .children()
+            .iter()
+            .map(|node| match node {
+                usvg::Node::Image(_) => 1,
+                usvg::Node::Group(group) => images(group),
+                _ => 0,
+            })
+            .sum()
+    }
+
     #[test]
     fn untrusted_liar_header_never_reaches_the_decoder() {
-        // A decodable 30000x30000 PNG exceeds both bounds: the gate must refuse it before decoding paints black over the background.
-        use image::ImageEncoder;
-        let pixels = vec![0u8; 30000 * 30000];
-        let mut encoded = Vec::new();
-        image::codecs::png::PngEncoder::new(&mut encoded)
-            .write_image(&pixels, 30000, 30000, image::ExtendedColorType::L8)
-            .expect("a solid liar image encodes");
+        // Built by hand, a 30000 by 30000 header with an empty zlib stream: the gate must refuse it before any decode.
+        let chunk = |kind: &[u8; 4], body: &[u8]| {
+            let mut crc = 0xFFFF_FFFFu32;
+            for byte in kind.iter().chain(body) {
+                crc ^= u32::from(*byte);
+                for _ in 0..8 {
+                    crc = (crc >> 1) ^ (0xEDB8_8320 & 0u32.wrapping_sub(crc & 1));
+                }
+            }
+            let mut bytes = (body.len() as u32).to_be_bytes().to_vec();
+            bytes.extend_from_slice(kind);
+            bytes.extend_from_slice(body);
+            bytes.extend_from_slice(&(!crc).to_be_bytes());
+            bytes
+        };
+        let mut header = 30000u32.to_be_bytes().to_vec();
+        header.extend_from_slice(&30000u32.to_be_bytes());
+        header.extend_from_slice(&[8, 0, 0, 0, 0]);
+        let mut encoded = b"\x89PNG\r\n\x1a\n".to_vec();
+        encoded.extend(chunk(b"IHDR", &header));
+        encoded.extend(chunk(
+            b"IDAT",
+            &[0x78, 0x01, 0x01, 0, 0, 0xFF, 0xFF, 0, 0, 0, 1],
+        ));
+        encoded.extend(chunk(b"IEND", &[]));
         let url: String = encoded.iter().map(|b| format!("%{b:02X}")).collect();
         let svg = format!("<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"10\" height=\"10\"><rect width=\"10\" height=\"10\" fill=\"#3366cc\"/><image x=\"0\" y=\"0\" width=\"10\" height=\"10\" href=\"data:image/png,{url}\"/></svg>").into_bytes();
         let renderer = SvgRenderer::new(Arc::new(()));
@@ -671,6 +701,7 @@ mod tests {
         std::thread::spawn(move || {
             let outcome = (|| {
                 let parsed = renderer.parse_svg_untrusted(&svg).ok()?;
+                let kept = images(parsed.0.root());
                 let image = renderer
                     .render_parsed(
                         &parsed,
@@ -679,13 +710,14 @@ mod tests {
                     .ok()?;
                 let bytes = image.as_bytes(0)?;
                 let center = (5 * 10 + 5) * 4;
-                Some(bytes[center..center + 4].to_vec())
+                Some((kept, bytes[center..center + 4].to_vec()))
             })();
             let _ = done.send((start.elapsed(), outcome));
         });
         match waiting.recv_timeout(std::time::Duration::from_secs(60)) {
-            Ok((elapsed, Some(pixel))) => {
+            Ok((elapsed, Some((kept, pixel)))) => {
                 eprintln!("liar header decoded nothing in {elapsed:?}; center pixel {pixel:?}");
+                assert_eq!(kept, 0, "the refused image never became a node");
                 assert!(elapsed < std::time::Duration::from_secs(10));
                 assert_eq!(pixel, vec![0xCC, 0x66, 0x33, 0xFF]);
             }

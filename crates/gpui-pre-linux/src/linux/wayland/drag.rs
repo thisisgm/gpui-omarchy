@@ -259,8 +259,12 @@ impl<T: NativeOffer + ReceiveData, Window> DragState<DataOffer<T>, Window> {
         };
         // Hyprland's receive alone names the source's target; an accept now would let a later finish report success.
         if self.hyprland {
-            self.selected = Some(mime);
             self.action = hyprland_action(actions, offer.source_actions);
+            if self.action.is_none() {
+                self.refused = true;
+                return None;
+            }
+            self.selected = Some(mime);
         } else {
             offer.accept(serial, Some(mime));
         }
@@ -448,12 +452,9 @@ pub(crate) fn finish_offer(
         offer.finish();
     }
 }
-// Names globals that only Hyprland v0.41 and later offer, the releases with Hyprland's own data device.
+// Names a global a Hyprland release first shipped after v0.41, the release with its own data device.
 pub(crate) fn hyprland_data_device(interface: &str) -> bool {
-    matches!(
-        interface,
-        "hyprland_focus_grab_manager_v1" | "hyprland_surface_manager_v1"
-    )
+    interface == "hyprland_surface_manager_v1"
 }
 // Hyprland never sends a negotiated action, so the destination takes its preferred action, else its other one, within the source's.
 pub(crate) fn hyprland_action(
@@ -585,7 +586,7 @@ mod protocol_tests {
     }
     #[test]
     fn only_hyprland_with_its_own_data_device_is_recognised() {
-        assert!(hyprland_data_device("hyprland_focus_grab_manager_v1"));
+        assert!(!hyprland_data_device("hyprland_focus_grab_manager_v1"));
         assert!(hyprland_data_device("hyprland_surface_manager_v1"));
         assert!(!hyprland_data_device("hyprland_toplevel_export_manager_v1"));
         assert!(!hyprland_data_device(
@@ -854,17 +855,25 @@ mod offer_life_tests {
         assert_eq!(drag.action, Some(NativeDragAction::Copy));
     }
     #[test]
-    fn hyprland_drop_from_a_move_only_source_into_a_copy_destination_has_no_action() {
+    fn hyprland_drop_from_a_move_only_source_into_a_copy_destination_is_refused_at_enter() {
         use wayland_client::protocol::wl_data_device_manager::DndAction;
-        let (mut offer, _) = offer();
+        let (mut offer, log) = offer();
         offer.source_actions = Some(DndAction::Move);
         let mut drag = DragState::new(true);
         let selection = accept_offer(&offer.inner, 987, &offer.mime_types, false);
         assert!(
             drag.enter(offer, 2, Point::default(), 987, selection, || Ok(()))
-                .is_some()
+                .is_none()
         );
+        assert!(drag.refused);
         assert_eq!(drag.action, None);
+        assert!(drag.pending.is_none());
+        assert_eq!(*log.borrow(), [Request::Actions]);
+        drag.drop_pending();
+        assert_eq!(
+            *log.borrow(),
+            [Request::Actions, Request::Finish, Request::Destroy]
+        );
     }
     #[test]
     fn other_compositors_leave_the_drop_action_to_their_action_event() {

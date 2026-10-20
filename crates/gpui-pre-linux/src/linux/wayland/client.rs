@@ -185,8 +185,7 @@ impl ImeWindow for WaylandWindowStatePtr {
         self.handle_ime(input);
     }
 
-    // IBus Intercepts keys like `a`, `b`, but those keys are needed for vim mode.
-    // We should only send ASCII characters to Zed, otherwise a user could remap a letter like `か` or `相`.
+    // IBus intercepts keys like `a`, which vim mode needs, so only ASCII reaches the keymap as a key.
     fn ime_key(&self, text: String) {
         self.handle_input(PlatformInput::KeyDown(KeyDownEvent {
             keystroke: Keystroke {

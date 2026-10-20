@@ -259,6 +259,7 @@ impl<S: Clone + PartialEq> ImeSession<S> {
             return;
         }
         let mut changed = false;
+        let mut bounds = bounds.map(ImeCursorRectangle::from);
         if context.is_some() != self.context.is_some() {
             if self.composing {
                 context = self.context.clone();
@@ -267,7 +268,8 @@ impl<S: Clone + PartialEq> ImeSession<S> {
                 text_input.request_disable();
                 text_input.request_enable();
                 self.context = None;
-                self.rectangle = None;
+                // The reset drops the rectangle, so the one last sent goes out again.
+                bounds = bounds.or(self.rectangle.take());
                 changed = true;
             }
         }
@@ -281,10 +283,7 @@ impl<S: Clone + PartialEq> ImeSession<S> {
             self.context = Some(context);
             changed = true;
         }
-        if let Some(rectangle) = bounds
-            .map(ImeCursorRectangle::from)
-            .filter(|rectangle| self.rectangle != Some(*rectangle))
-        {
+        if let Some(rectangle) = bounds.filter(|rectangle| self.rectangle != Some(*rectangle)) {
             text_input.request_cursor_rectangle(rectangle);
             self.rectangle = Some(rectangle);
             changed = true;
@@ -419,6 +418,7 @@ pub(crate) mod testing {
 
 #[cfg(test)]
 mod tests {
+    use super::super::ime_context::{FakeField, surrounding};
     use super::testing::{FakeTextInput, Request, caret, preedit};
     use super::*;
 
@@ -621,6 +621,29 @@ mod tests {
         session.disable(Some(&text_input));
         assert_eq!(session.take_queued(), None, "disable drops a queued caret");
         assert!(!session.queue_position(1, caret(24.0)));
+    }
+
+    #[test]
+    fn ime_context_presence_change_resends_the_rectangle_without_bounds() {
+        let text_input = FakeTextInput::default();
+        let mut session = enabled(&text_input, 1);
+        let context = surrounding(&mut FakeField::new("a", 1..1)).unwrap();
+        let sent = Request::Surrounding(context.text.clone(), context.cursor, context.anchor);
+        session.publish(&text_input, &1, Some(context), None, ChangeCause::Other);
+        assert_eq!(
+            text_input.take(),
+            [
+                Request::Enable,
+                Request::Rectangle(10, 20, 1, 18),
+                Request::Commit,
+                Request::Disable,
+                Request::Enable,
+                sent,
+                Request::Cause(ChangeCause::Other),
+                Request::Rectangle(10, 20, 1, 18),
+                Request::Commit
+            ]
+        );
     }
 
     #[test]
