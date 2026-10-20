@@ -669,12 +669,15 @@ mod tests {
     #[test]
     fn untrusted_liar_header_never_reaches_the_decoder() {
         // Built by hand, a 30000 by 30000 header with an empty zlib stream: the gate must refuse it before any decode.
+        // PNG's chunk CRC is CRC-32 with the reflected IEEE polynomial, started from all ones.
+        const CRC32_REFLECTED_POLYNOMIAL: u32 = 0xEDB8_8320;
+        const CRC32_INITIAL: u32 = u32::MAX;
         let chunk = |kind: &[u8; 4], body: &[u8]| {
-            let mut crc = 0xFFFF_FFFFu32;
+            let mut crc = CRC32_INITIAL;
             for byte in kind.iter().chain(body) {
                 crc ^= u32::from(*byte);
                 for _ in 0..8 {
-                    crc = (crc >> 1) ^ (0xEDB8_8320 & 0u32.wrapping_sub(crc & 1));
+                    crc = (crc >> 1) ^ (CRC32_REFLECTED_POLYNOMIAL & 0u32.wrapping_sub(crc & 1));
                 }
             }
             let mut bytes = (body.len() as u32).to_be_bytes().to_vec();

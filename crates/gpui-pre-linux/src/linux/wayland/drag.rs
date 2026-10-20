@@ -452,7 +452,7 @@ pub(crate) fn finish_offer(
         offer.finish();
     }
 }
-// Names a global a Hyprland release first shipped after v0.41, the release with its own data device.
+// Names a global Hyprland first registers in v0.47.0; v0.41 to v0.46 run its data device without it and take the ordinary path.
 pub(crate) fn hyprland_data_device(interface: &str) -> bool {
     interface == "hyprland_surface_manager_v1"
 }
