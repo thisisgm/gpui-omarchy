@@ -38,6 +38,7 @@ impl Wire {
         wire
     }
 
+    // Sample input: native u32 words [7, (12 << 16) | 1, 9] decode to object 7, opcode 1 and payload [9].
     fn requests(&mut self) -> Vec<(u32, u16, Vec<u32>)> {
         self.connection.flush().unwrap();
         let mut bytes = Vec::new();
