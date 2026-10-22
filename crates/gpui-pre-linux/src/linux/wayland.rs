@@ -3,6 +3,7 @@ mod clipboard;
 mod cursor;
 mod display;
 mod drag;
+mod opaque_region;
 mod popup;
 mod presentation;
 mod serial;

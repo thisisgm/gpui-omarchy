@@ -33,6 +33,7 @@ use wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1;
 
 use crate::linux::wayland::{
     display::WaylandDisplay,
+    opaque_region,
     presentation::{FrameFeedback, FrameFeedbackData, WindowFrameCounter},
     serial::SerialKind,
 };
@@ -701,6 +702,17 @@ impl WaylandWindowState {
             WindowDecorations::Server => px(0.0),
             WindowDecorations::Client => self.client_inset.unwrap_or(px(0.0)),
         }
+    }
+
+    fn refresh_opaque_region(&self) {
+        opaque_region::refresh(
+            &self.surface,
+            &self.globals.compositor,
+            &self.globals.qh,
+            self.bounds.size,
+            self.background_appearance,
+            self.decorations,
+        );
     }
 }
 
@@ -1577,16 +1589,24 @@ impl WaylandWindowStatePtr {
     pub fn set_size_and_scale(&self, size: Option<Size<Pixels>>, scale: Option<f32>) {
         let (size, scale) = {
             let mut state = self.state.borrow_mut();
-            if size.is_none_or(|size| size == state.bounds.size)
-                && scale.is_none_or(|scale| scale == state.scale)
-            {
+            let state = &mut *state;
+            if !opaque_region::update_size_and_scale(
+                &mut state.bounds,
+                &mut state.scale,
+                size,
+                scale,
+                |surface_size| {
+                    opaque_region::refresh(
+                        &state.surface,
+                        &state.globals.compositor,
+                        &state.globals.qh,
+                        surface_size,
+                        state.background_appearance,
+                        state.decorations,
+                    );
+                },
+            ) {
                 return;
-            }
-            if let Some(size) = size {
-                state.bounds.size = size;
-            }
-            if let Some(scale) = scale {
-                state.scale = scale;
             }
             let device_bounds = state.bounds.to_device_pixels(state.scale);
             if let Some(renderer) = &mut state.renderer {
@@ -2384,32 +2404,7 @@ fn update_window(mut state: RefMut<WaylandWindowState>) {
     if let Some(renderer) = &mut state.renderer {
         renderer.update_transparency(!opaque);
     }
-    let opaque_area = state.window_bounds.map(|v| f32::from(v) as i32);
-    opaque_area.inset(f32::from(state.inset()) as i32);
-
-    let region = state
-        .globals
-        .compositor
-        .create_region(&state.globals.qh, ());
-    region.add(
-        opaque_area.origin.x,
-        opaque_area.origin.y,
-        opaque_area.size.width,
-        opaque_area.size.height,
-    );
-
-    // Note that rounded corners make this rectangle API hard to work with.
-    // As this is common when using CSD, let's just disable this API.
-    if state.background_appearance == WindowBackgroundAppearance::Opaque
-        && state.decorations == WindowDecorations::Server
-    {
-        // Promise the compositor that this region of the window surface
-        // contains no transparent pixels. This allows the compositor to skip
-        // updating whatever is behind the surface for better performance.
-        state.surface.set_opaque_region(Some(&region));
-    } else {
-        state.surface.set_opaque_region(None);
-    }
+    state.refresh_opaque_region();
 
     if let Some(ref blur_manager) = state.globals.blur_manager {
         if state.background_appearance == WindowBackgroundAppearance::Blurred {
@@ -2426,8 +2421,6 @@ fn update_window(mut state: RefMut<WaylandWindowState>) {
             }
         }
     }
-
-    region.destroy();
 }
 
 pub(crate) trait WindowDecorationsExt {
