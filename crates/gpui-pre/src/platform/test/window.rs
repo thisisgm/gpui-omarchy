@@ -1,10 +1,10 @@
 use crate::{
-    AnyWindowHandle, Bounds, DevicePixels, DispatchEventResult, DisplayId, GpuSpecs, HeadlessAtlas,
-    Pixels, PlatformAtlas, PlatformDisplay, PlatformHeadlessRenderer, PlatformInput,
-    PlatformInputHandler, PlatformWindow, Point, PromptButton, RequestFrameOptions, Scene, Size,
-    TestDisplay, TestPlatform, TextInputConfiguration, TextInputStateChange, WindowAppearance,
-    WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowInsets, WindowParams,
-    WindowVisibility,
+    AnyWindowHandle, Bounds, DevicePixels, DispatchEventResult, DisplayId, FrameOutcome,
+    FrameTerminal, GpuSpecs, HeadlessAtlas, Pixels, PlatformAtlas, PlatformDisplay,
+    PlatformHeadlessRenderer, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
+    PresentedFrames, PromptButton, RequestFrameOptions, Scene, Size, TestDisplay, TestPlatform,
+    TextInputConfiguration, TextInputStateChange, WindowAppearance, WindowBackgroundAppearance,
+    WindowBounds, WindowControlArea, WindowInsets, WindowParams, WindowVisibility,
 };
 use gpui_util::ResultExt as _;
 #[cfg(any(test, feature = "test-support"))]
@@ -50,6 +50,11 @@ pub(crate) struct TestWindowState {
     frame_wake_count: Rc<Cell<usize>>,
     frame_scheduled: bool,
     frame_callback_pending: bool,
+    feedback_frames: Option<PresentedFrames>,
+    frame_terminal_callback: Option<Box<dyn FnMut(FrameTerminal)>>,
+    frame_presented_callback: Option<Box<dyn FnMut()>>,
+    feedback_pending: Vec<u64>,
+    skip_next_present: bool,
     input_handler: Option<PlatformInputHandler>,
     text_input_configurations: Vec<TextInputConfiguration>,
     text_input_state_changes: Vec<TextInputStateChange>,
@@ -125,6 +130,11 @@ impl TestWindow {
             frame_wake_count: Rc::new(Cell::new(0)),
             frame_scheduled: false,
             frame_callback_pending: false,
+            feedback_frames: None,
+            frame_terminal_callback: None,
+            frame_presented_callback: None,
+            feedback_pending: Vec::new(),
+            skip_next_present: false,
             input_handler: None,
             text_input_configurations: Vec::new(),
             text_input_state_changes: Vec::new(),
@@ -137,6 +147,62 @@ impl TestWindow {
             start_external_drag_result: false,
         })))
     }
+    /// Opts this test window into exact submit/terminal feedback. Default is unsupported.
+    pub fn enable_frame_feedback(&self) {
+        self.0
+            .lock()
+            .feedback_frames
+            .get_or_insert_with(PresentedFrames::default);
+    }
+
+    /// Skips the next native submission, for failed-present/recovery path tests.
+    pub fn skip_next_present(&self) {
+        self.0.lock().skip_next_present = true;
+    }
+
+    /// Delivers a terminal event for a real successful test-window submission. Unknown, duplicate and unsubmitted IDs have no effect.
+    pub fn simulate_frame_terminal(&self, terminal: FrameTerminal) {
+        let (callback, advanced) = {
+            let mut state = self.0.lock();
+            let Some(index) = state
+                .feedback_pending
+                .iter()
+                .position(|id| *id == terminal.frame_id)
+            else {
+                return;
+            };
+            state.feedback_pending.remove(index);
+            let frames = state.feedback_frames.as_mut().unwrap();
+            let mut advanced = false;
+            if let FrameOutcome::Presented(time) = terminal.outcome {
+                if terminal.frame_id > frames.presented {
+                    frames.presented = terminal.frame_id;
+                    frames.presented_at = time.timestamp;
+                    frames.clock_id = time.clock_id.unwrap_or(1);
+                    advanced = true;
+                }
+            }
+            (state.frame_terminal_callback.take(), advanced)
+        };
+        if let Some(mut callback) = callback {
+            callback(terminal);
+            let mut state = self.0.lock();
+            if state.frame_terminal_callback.is_none() {
+                state.frame_terminal_callback = Some(callback);
+            }
+        }
+        if advanced {
+            let callback = self.0.lock().frame_presented_callback.take();
+            if let Some(mut callback) = callback {
+                callback();
+                let mut state = self.0.lock();
+                if state.frame_presented_callback.is_none() {
+                    state.frame_presented_callback = Some(callback);
+                }
+            }
+        }
+    }
+
     pub fn simulate_scheduled_frame(&self) -> bool {
         let callback = {
             let mut state = self.0.lock();
@@ -552,14 +618,42 @@ impl PlatformWindow for TestWindow {
     }
 
     fn draw(&self, scene: &Scene) {
+        let _ = self.draw_with_feedback(scene);
+    }
+
+    fn draw_with_feedback(&self, scene: &Scene) -> Option<u64> {
+        if std::mem::take(&mut self.0.lock().skip_next_present) {
+            return None;
+        }
         let scale_factor = self.scale_factor();
         let mut state = self.0.lock();
         state.frame_callback_pending = true;
         state.frame_scheduled = true;
         let device_size: Size<DevicePixels> = state.bounds.size.to_device_pixels(scale_factor);
         if let Some(renderer) = &mut state.renderer {
-            renderer.render_scene(scene, device_size).warn_on_err();
+            renderer.render_scene(scene, device_size).warn_on_err()?;
         }
+        let frames = state.feedback_frames.as_mut()?;
+        frames.committed += 1;
+        let id = frames.committed;
+        state.feedback_pending.push(id);
+        Some(id)
+    }
+
+    fn frame_feedback_supported(&self) -> bool {
+        self.0.lock().feedback_frames.is_some()
+    }
+
+    fn on_frame_terminal(&self, callback: Box<dyn FnMut(FrameTerminal)>) {
+        self.0.lock().frame_terminal_callback = Some(callback);
+    }
+
+    fn presented_frames(&self) -> Option<PresentedFrames> {
+        self.0.lock().feedback_frames
+    }
+
+    fn on_frame_presented(&self, callback: Box<dyn FnMut()>) {
+        self.0.lock().frame_presented_callback = Some(callback);
     }
 
     fn sprite_atlas(&self) -> sync::Arc<dyn crate::PlatformAtlas> {

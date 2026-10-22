@@ -9,21 +9,21 @@ use crate::{
     AsyncWindowContext, AtlasTile, AvailableSpace, Background, BorderStyle, Bounds, BoxShadow,
     Capslock, Context, Corners, CursorHideMode, CursorStyle, Decorations, DevicePixels,
     DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity,
-    EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
-    Hsla, InputHandler, InputPreference, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent,
-    Keystroke, KeystrokeEvent, LayoutId, LineLayout, LineLayoutIndex, Modifiers,
-    ModifiersChangedEvent, MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent,
-    Path, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler,
-    PlatformWindow, Point, PolychromeSprite, PresentedFrames, Priority, PromptButton, PromptLevel,
-    Quad, Render, RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams, Replay,
-    ResizeEdge, SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels,
-    Scene, Shadow, SharedString, Size, StrikethroughStyle, Style, SubpixelSprite, SubscriberSet,
-    Subscription, SystemWindowTab, SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task,
-    TextInputConfiguration, TextInputStateChange, TextRenderingMode, TextStyle,
-    TextStyleRefinement, ThermalState, TransformationMatrix, Underline, UnderlineStyle,
-    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations,
-    WindowOptions, WindowParams, WindowTextSystem, WindowVisibility, point, prelude::*, px, rems,
-    size, transparent_black,
+    EntityId, EventEmitter, FileDropEvent, FontId, FrameFeedbackEvent, Global, GlobalElementId,
+    GlyphId, GpuSpecs, Hsla, InputHandler, InputPreference, IsZero, KeyBinding, KeyContext,
+    KeyDownEvent, KeyEvent, Keystroke, KeystrokeEvent, LayoutId, LineLayout, LineLayoutIndex,
+    Modifiers, ModifiersChangedEvent, MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent,
+    MouseUpEvent, Path, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput,
+    PlatformInputHandler, PlatformWindow, Point, PolychromeSprite, PresentedFrames, Priority,
+    PromptButton, PromptLevel, Quad, Render, RenderGlyphParams, RenderImage, RenderImageParams,
+    RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X,
+    SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size, StrikethroughStyle,
+    Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab, SystemWindowTabController,
+    TabStopMap, TaffyLayoutEngine, Task, TextInputConfiguration, TextInputStateChange,
+    TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState, TransformationMatrix,
+    Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
+    WindowControls, WindowDecorations, WindowOptions, WindowParams, WindowTextSystem,
+    WindowVisibility, point, prelude::*, px, rems, size, transparent_black,
 };
 
 use crate::gestures::{GestureTuning, RecognizedTouchGesture, TouchGestureRecognizer};
@@ -351,6 +351,8 @@ thread_local! {
     /// This allows multiple test Apps to have isolated arenas, preventing
     /// cross-session corruption when the scheduler interleaves their tasks.
     static CURRENT_ELEMENT_ARENA: Cell<Option<*const RefCell<Arena>>> = const { Cell::new(None) };
+    // Restored by a scope guard even if a draw panics or opens a nested window.
+    static CURRENT_DRAW_ID: Cell<Option<(WindowId, u64)>> = const { Cell::new(None) };
 }
 
 /// Whether a window draw is currently in progress on this thread.
@@ -1038,6 +1040,7 @@ pub(crate) struct DeferredDraw {
 }
 
 pub(crate) struct Frame {
+    draw_id: Option<u64>,
     pub(crate) focus: Option<FocusId>,
     pub(crate) window_active: bool,
     pub(crate) element_states: FxHashMap<(GlobalElementId, TypeId), ElementStateBox>,
@@ -1094,6 +1097,7 @@ impl Frame {
 
     pub(crate) fn new(dispatch_tree: DispatchTree) -> Self {
         Frame {
+            draw_id: None,
             focus: None,
             window_active: false,
             element_states: FxHashMap::default(),
@@ -1123,6 +1127,7 @@ impl Frame {
     }
 
     pub(crate) fn clear(&mut self) {
+        self.draw_id = None;
         self.element_states.clear();
         self.accessed_element_states.clear();
         self.mouse_listeners.clear();
@@ -1252,6 +1257,7 @@ pub struct Window {
     pub(crate) image_cache_stack: Vec<AnyImageCache>,
     pub(crate) rendered_frame: Frame,
     pub(crate) next_frame: Frame,
+    next_draw_id: u64,
     next_hitbox_id: HitboxId,
     pub(crate) next_tooltip_id: TooltipId,
     pub(crate) tooltip_bounds: Option<TooltipBounds>,
@@ -1272,6 +1278,9 @@ pub struct Window {
     pub(crate) button_layout_observers: SubscriberSet<(), AnyObserver>,
     pub(crate) frame_presented_observers: SubscriberSet<(), AnyObserver>,
     frame_presented_hooked: bool,
+    frame_feedback_hooked: bool,
+    frame_feedback_observers:
+        SubscriberSet<(), Box<dyn FnMut(FrameFeedbackEvent, &mut Window, &mut App) -> bool>>,
     active: Rc<Cell<bool>>,
     visibility: WindowVisibility,
     pub(crate) visibility_observers:
@@ -1901,14 +1910,14 @@ impl Window {
                                     window.refresh();
                                 }
                                 let arena_clear_needed = window.draw(cx);
-                                window.present();
+                                window.present(cx);
                                 arena_clear_needed.clear(cx);
                             })
                             .log_err();
                     })
                 } else if needs_present {
                     handle
-                        .update(&mut cx, |_, window, _| window.present())
+                        .update(&mut cx, |_, window, cx| window.present(cx))
                         .log_err();
                 }
 
@@ -2154,6 +2163,7 @@ impl Window {
             focused_text_input_active: false,
             rendered_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
             next_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
+            next_draw_id: 0,
             next_frame_callbacks,
             next_hitbox_id: HitboxId(0),
             next_tooltip_id: TooltipId::default(),
@@ -2174,6 +2184,8 @@ impl Window {
             button_layout_observers: SubscriberSet::new(),
             frame_presented_observers: SubscriberSet::new(),
             frame_presented_hooked: false,
+            frame_feedback_hooked: false,
+            frame_feedback_observers: SubscriberSet::new(),
             active,
             visibility,
             visibility_observers: SubscriberSet::new(),
@@ -2476,6 +2488,10 @@ impl Window {
     /// Close this window.
     pub fn remove_window(&mut self) {
         self.removed = true;
+        self.frame_feedback_observers
+            .remove(&())
+            .into_iter()
+            .for_each(drop);
     }
 
     /// Obtain the currently focused [`FocusHandle`]. If no elements are focused, returns `None`.
@@ -3050,6 +3066,63 @@ impl Window {
         subscription
     }
 
+    /// The ID of this window's actual draw traversal, or `None` outside it. Capture immutable painted-content metadata with this ID; submission later reports the token retained with the scene, including when that scene is replayed.
+    pub fn current_draw_id(&self) -> Option<u64> {
+        CURRENT_DRAW_ID
+            .with(|current| current.get())
+            .filter(|(window, _)| *window == self.handle.window_id())
+            .map(|(_, draw)| draw)
+    }
+
+    /// Observes successful scene submissions and exact per-ID terminal outcomes. Returns `None` on unsupported backends/compositors. Keep one subscription per window lifetime and bound any application metadata retained for missing feedback. Missing feedback is unavailable, never a synthetic discard.
+    pub fn observe_frame_feedback(
+        &mut self,
+        cx: &App,
+        mut callback: impl FnMut(FrameFeedbackEvent, &mut Window, &mut App) + 'static,
+    ) -> Option<Subscription> {
+        if self.removed || !self.platform_window.frame_feedback_supported() {
+            return None;
+        }
+        if !self.frame_feedback_hooked {
+            self.frame_feedback_hooked = true;
+            let handle = self.handle;
+            let mut cx = cx.to_async();
+            self.platform_window
+                .on_frame_terminal(Box::new(move |terminal| {
+                    // A terminal event arriving after window removal has no subscriber.
+                    let _ = handle.update(&mut cx, |_, window, cx| {
+                        window.frame_feedback(FrameFeedbackEvent::Terminal(terminal), cx);
+                    });
+                }));
+        }
+        let (subscription, activate) = self.frame_feedback_observers.insert(
+            (),
+            Box::new(move |event, window, cx| {
+                callback(event, window, cx);
+                true
+            }),
+        );
+        activate();
+        Some(subscription)
+    }
+
+    fn frame_feedback(&mut self, event: FrameFeedbackEvent, cx: &mut App) {
+        self.frame_feedback_observers
+            .clone()
+            .retain(&(), |callback| {
+                if self.removed {
+                    return false;
+                }
+                callback(event, self, cx) && !self.removed
+            });
+        if self.removed {
+            self.frame_feedback_observers
+                .remove(&())
+                .into_iter()
+                .for_each(drop);
+        }
+    }
+
     /// Returns the appearance of the current window.
     pub fn appearance(&self) -> WindowAppearance {
         self.appearance
@@ -3552,6 +3625,15 @@ impl Window {
     /// the contents of the new [`Scene`], use [`Self::present`].
     #[profiling::function]
     pub fn draw(&mut self, cx: &mut App) -> ArenaClearNeeded {
+        self.next_draw_id = self
+            .next_draw_id
+            .checked_add(1)
+            .expect("window draw ID exhausted");
+        self.next_frame.draw_id = Some(self.next_draw_id);
+        let previous_draw = CURRENT_DRAW_ID
+            .with(|current| current.replace(Some((self.handle.window_id(), self.next_draw_id))));
+        let _draw_scope =
+            gpui_util::defer(move || CURRENT_DRAW_ID.with(|current| current.set(previous_draw)));
         // Drain every draw in profiler builds so a previous frame's
         // first-invalidation timestamp can't be attributed to this one.
         #[cfg(feature = "profiler")]
@@ -3732,12 +3814,24 @@ impl Window {
     }
 
     #[profiling::function]
-    fn present(&mut self) {
+    fn present(&mut self, cx: &mut App) {
+        if let Some(event) = self.submit_scene() {
+            self.frame_feedback(event, cx);
+        }
+    }
+
+    fn submit_scene(&mut self) -> Option<FrameFeedbackEvent> {
         #[cfg(feature = "profiler")]
         let _foreground_turn = profiler::journal::foreground_turn();
         #[cfg(feature = "profiler")]
         let present_start = Instant::now();
-        self.platform_window.draw(&self.rendered_frame.scene);
+        let receipt = if self.frame_feedback_hooked {
+            self.platform_window
+                .draw_with_feedback(&self.rendered_frame.scene)
+        } else {
+            self.platform_window.draw(&self.rendered_frame.scene);
+            None
+        };
         #[cfg(feature = "profiler")]
         self.window_profiler.record_present(
             present_start,
@@ -3747,13 +3841,22 @@ impl Window {
         );
         self.needs_present.set(false);
         profiling::finish_frame!();
+        Some(FrameFeedbackEvent::Submitted {
+            draw_id: self.rendered_frame.draw_id?,
+            frame_id: receipt?,
+        })
     }
 
     /// Presents the most recently drawn frame if it hasn't been presented yet.
     #[cfg(all(test, feature = "profiler"))]
     pub fn present_if_needed(&mut self) {
         if self.needs_present.get() {
-            self.present();
+            // This legacy profiler-only helper has no App argument for event delivery. Feedback-aware tests must use the actual native request path.
+            assert!(
+                !self.frame_feedback_hooked,
+                "feedback requires the native frame request path"
+            );
+            let _ = self.submit_scene();
         }
     }
 
@@ -8173,6 +8276,16 @@ fn with_element_arena_erased(callback: &mut dyn FnMut(&mut Arena)) -> Result<(),
     }
 }
 
+impl Drop for Window {
+    fn drop(&mut self) {
+        // Subscription handles can outlive the window and retain the subscriber set. Clear its callbacks so their captured content records cannot outlive it.
+        self.frame_feedback_observers
+            .remove(&())
+            .into_iter()
+            .for_each(drop);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -8839,6 +8952,406 @@ mod tests {
             .unwrap();
 
         assert_eq!(notified.get(), 1);
+    }
+
+    // Paint observations are independent of submission receipts and later model values.
+    struct FeedbackView {
+        revision: Rc<Cell<u64>>,
+        painted: Rc<RefCell<Vec<(u64, u64)>>>,
+        panic_paint: Rc<Cell<bool>>,
+    }
+
+    impl Render for FeedbackView {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let revision = self.revision.get();
+            let painted = self.painted.clone();
+            let panic_paint = self.panic_paint.clone();
+            canvas(
+                |_, _, _| {},
+                move |bounds, _, window, _| {
+                    assert!(!panic_paint.get(), "intentional feedback paint failure");
+                    window.paint_quad(crate::fill(
+                        bounds,
+                        hsla(revision as f32 / 100., 1., 0.5, 1.),
+                    ));
+                    painted.borrow_mut().push((
+                        window.current_draw_id().expect("paint has a draw ID"),
+                        revision,
+                    ));
+                },
+            )
+            .size_full()
+        }
+    }
+
+    fn feedback_terminal(id: u64) -> crate::FrameTerminal {
+        crate::FrameTerminal {
+            frame_id: id,
+            outcome: crate::FrameOutcome::Presented(crate::PresentationTime {
+                timestamp: Some(Duration::from_millis(id * 16)),
+                clock_id: Some(1),
+            }),
+        }
+    }
+
+    #[gpui::test]
+    fn frame_feedback_retains_scene_draw_across_submission_retry_and_replacement(
+        cx: &mut TestAppContext,
+    ) {
+        use crate::FrameFeedbackEvent::{Submitted, Terminal};
+        let revision = Rc::new(Cell::new(10));
+        let painted = Rc::new(RefCell::new(Vec::new()));
+        let window = cx.add_window({
+            let revision = revision.clone();
+            let painted = painted.clone();
+            move |_, _| FeedbackView {
+                revision,
+                painted,
+                panic_paint: Rc::new(Cell::new(false)),
+            }
+        });
+        let native = cx.test_window(window.into());
+        // Drain initial window dirtiness before testing a retained, unmodified scene.
+        native.simulate_frame_request(RequestFrameOptions {
+            require_presentation: true,
+            ..Default::default()
+        });
+        let visual = crate::VisualTestContext::from_window(window.into(), cx);
+        visual.enable_frame_feedback();
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let _subscription = window
+            .update(cx, {
+                let events = events.clone();
+                move |_, window, cx| {
+                    assert_eq!(window.current_draw_id(), None);
+                    window
+                        .observe_frame_feedback(cx, move |event, window, _| {
+                            assert_eq!(window.current_draw_id(), None);
+                            events.borrow_mut().push(event);
+                        })
+                        .unwrap()
+                }
+            })
+            .unwrap();
+        let first_draw = painted.borrow().last().unwrap().0;
+        // A mutable model change without paint cannot relabel the retained scene.
+        revision.set(20);
+        visual.simulate_frame_request(RequestFrameOptions {
+            require_presentation: true,
+            ..Default::default()
+        });
+        assert_eq!(
+            *events.borrow(),
+            vec![Submitted {
+                draw_id: first_draw,
+                frame_id: 1
+            }]
+        );
+        let paint_count = painted.borrow().len();
+        visual.simulate_frame_request(RequestFrameOptions {
+            require_presentation: true,
+            ..Default::default()
+        });
+        assert_eq!(
+            painted.borrow().len(),
+            paint_count,
+            "retained scene must not repaint"
+        );
+        assert_eq!(
+            events.borrow()[1],
+            Submitted {
+                draw_id: first_draw,
+                frame_id: 2
+            }
+        );
+        assert_eq!(painted.borrow().last().unwrap().1, 10);
+
+        // Actual draw A is replaced before submission by actual draw B.
+        let draw_a = AnyWindowHandle::from(window)
+            .update(cx, |_, window, cx| {
+                window.refresh();
+                window.draw(cx).clear(cx);
+                window.rendered_frame.draw_id.unwrap()
+            })
+            .unwrap();
+        revision.set(30);
+        let draw_b = AnyWindowHandle::from(window)
+            .update(cx, |_, window, cx| {
+                window.refresh();
+                window.draw(cx).clear(cx);
+                window.rendered_frame.draw_id.unwrap()
+            })
+            .unwrap();
+        assert_ne!(draw_a, draw_b);
+        let count = events.borrow().len();
+        visual.skip_next_present();
+        visual.simulate_frame_request(RequestFrameOptions {
+            require_presentation: true,
+            ..Default::default()
+        });
+        assert_eq!(
+            events.borrow().len(),
+            count,
+            "failed present/recovery skip has no receipt"
+        );
+        visual.simulate_frame_request(RequestFrameOptions {
+            require_presentation: true,
+            ..Default::default()
+        });
+        assert_eq!(
+            events.borrow()[count],
+            Submitted {
+                draw_id: draw_b,
+                frame_id: 3
+            }
+        );
+        assert!(
+            !events
+                .borrow()
+                .iter()
+                .any(|event| matches!(event, Submitted { draw_id, .. } if *draw_id == draw_a))
+        );
+        assert_eq!(*painted.borrow().last().unwrap(), (draw_b, 30));
+
+        for id in [2, 1, 2, 0, 99, 3] {
+            visual.simulate_frame_terminal(feedback_terminal(id));
+        }
+        assert_eq!(
+            &events.borrow()[count + 1..],
+            &[
+                Terminal(feedback_terminal(2)),
+                Terminal(feedback_terminal(1)),
+                Terminal(feedback_terminal(3))
+            ]
+        );
+        assert_eq!(
+            window
+                .update(cx, |_, window, _| window
+                    .presented_frames()
+                    .unwrap()
+                    .presented)
+                .unwrap(),
+            3
+        );
+    }
+
+    #[gpui::test]
+    fn frame_feedback_discard_drop_reentrant_observer_and_window_close(cx: &mut TestAppContext) {
+        use crate::{FrameFeedbackEvent, FrameOutcome, FrameTerminal};
+        let window = cx.add_window(|_, _| EmptyView);
+        let native = cx.test_window(window.into());
+        assert!(
+            window
+                .update(cx, |_, window, cx| window
+                    .observe_frame_feedback(cx, |_, _, _| {}))
+                .unwrap()
+                .is_none()
+        );
+        native.enable_frame_feedback();
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let subscription = Rc::new(RefCell::new(None::<crate::Subscription>));
+        let replacement = Rc::new(RefCell::new(None));
+        let replacement_events = Rc::new(RefCell::new(Vec::new()));
+        let lifecycle = Rc::new(());
+        let weak_lifecycle = Rc::downgrade(&lifecycle);
+        let snapshots = Rc::new(Cell::new(0));
+        let _old_observer = window
+            .update(cx, {
+                let snapshots = snapshots.clone();
+                move |_, window, cx| {
+                    window
+                        .observe_frame_presented(cx, move |_, _| snapshots.set(snapshots.get() + 1))
+                }
+            })
+            .unwrap();
+        *subscription.borrow_mut() = window
+            .update(cx, {
+                let events = events.clone();
+                let subscription = subscription.clone();
+                let replacement = replacement.clone();
+                let replacement_events = replacement_events.clone();
+                move |_, window, cx| {
+                    window.observe_frame_feedback(cx, move |event, window, cx| {
+                        events.borrow_mut().push(event);
+                        if matches!(event, FrameFeedbackEvent::Terminal(_)) {
+                            subscription.borrow_mut().take();
+                            let lifecycle = lifecycle.clone();
+                            let replacement_events = replacement_events.clone();
+                            *replacement.borrow_mut() =
+                                window.observe_frame_feedback(cx, move |event, _, _| {
+                                    let _ = &lifecycle;
+                                    replacement_events.borrow_mut().push(event);
+                                });
+                        }
+                    })
+                }
+            })
+            .unwrap();
+        native.simulate_frame_request(RequestFrameOptions {
+            require_presentation: true,
+            ..Default::default()
+        });
+        let discarded = FrameTerminal {
+            frame_id: 1,
+            outcome: FrameOutcome::Discarded,
+        };
+        native.simulate_frame_terminal(discarded);
+        assert_eq!(
+            events.borrow().last(),
+            Some(&FrameFeedbackEvent::Terminal(discarded))
+        );
+        assert!(subscription.borrow().is_none());
+        assert_eq!(snapshots.get(), 0);
+        let count = events.borrow().len();
+        native.simulate_frame_request(RequestFrameOptions {
+            require_presentation: true,
+            ..Default::default()
+        });
+        native.simulate_frame_terminal(feedback_terminal(2));
+        assert_eq!(
+            events.borrow().len(),
+            count,
+            "dropped observer must stay dropped"
+        );
+        assert_eq!(snapshots.get(), 1, "old snapshot observer must coexist");
+        assert!(
+            matches!(
+                replacement_events.borrow().as_slice(),
+                [
+                    FrameFeedbackEvent::Submitted { draw_id, frame_id: 2 },
+                    FrameFeedbackEvent::Terminal(terminal)
+                ] if *draw_id > 0 && *terminal == feedback_terminal(2)
+            ),
+            "replacement observer must receive subsequent Submitted and Terminal"
+        );
+        assert!(replacement.borrow().is_some());
+        assert!(weak_lifecycle.upgrade().is_some());
+        native.simulate_frame_request(RequestFrameOptions {
+            require_presentation: true,
+            ..Default::default()
+        });
+        assert!(matches!(
+            replacement_events.borrow().last(),
+            Some(FrameFeedbackEvent::Submitted { frame_id: 3, .. })
+        ));
+        let replacement_count = replacement_events.borrow().len();
+        window
+            .update(cx, |_, window, _| window.remove_window())
+            .unwrap();
+        assert!(
+            weak_lifecycle.upgrade().is_none(),
+            "window removal releases observer captures"
+        );
+        // A real unanswered submission arrives through the retained backend after close.
+        native.simulate_frame_terminal(feedback_terminal(3));
+        // The public context also safely ignores terminal delivery to a removed window.
+        cx.simulate_frame_terminal(window.into(), feedback_terminal(3));
+        assert_eq!(events.borrow().len(), count);
+        assert_eq!(
+            replacement_events.borrow().len(),
+            replacement_count,
+            "closed window must not deliver terminal feedback to replacement"
+        );
+    }
+
+    #[gpui::test]
+    fn frame_feedback_ids_are_window_local_and_draw_scope_unwinds(cx: &mut TestAppContext) {
+        let a = cx.add_window(|_, _| EmptyView);
+        let b = cx.add_window(|_, _| EmptyView);
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let mut subscriptions = Vec::new();
+        for (label, handle) in [("a", a), ("b", b)] {
+            cx.test_window(handle.into()).enable_frame_feedback();
+            subscriptions.push(
+                handle
+                    .update(cx, {
+                        let seen = seen.clone();
+                        move |_, window, cx| {
+                            window
+                                .observe_frame_feedback(cx, move |event, _, _| {
+                                    seen.borrow_mut().push((label, event))
+                                })
+                                .unwrap()
+                        }
+                    })
+                    .unwrap(),
+            );
+            cx.test_window(handle.into())
+                .simulate_frame_request(RequestFrameOptions {
+                    require_presentation: true,
+                    ..Default::default()
+                });
+        }
+        assert_eq!(seen.borrow().len(), 2);
+        assert_eq!(seen.borrow()[0].0, "a");
+        assert_eq!(seen.borrow()[1].0, "b");
+        for (_, event) in seen.borrow().iter() {
+            assert!(matches!(
+                event,
+                crate::FrameFeedbackEvent::Submitted { frame_id: 1, .. }
+            ));
+        }
+        // The actual draw scope guard, not an injected notification, must clear on panic.
+        let panic_paint = Rc::new(Cell::new(false));
+        let c = cx.add_window({
+            let panic_paint = panic_paint.clone();
+            move |_, _| FeedbackView {
+                revision: Rc::new(Cell::new(0)),
+                painted: Rc::new(RefCell::new(Vec::new())),
+                panic_paint,
+            }
+        });
+        let native = cx.test_window(c.into());
+        native.simulate_frame_request(RequestFrameOptions {
+            require_presentation: true,
+            ..Default::default()
+        });
+        native.enable_frame_feedback();
+        let retained = c
+            .update(cx, |_, window, _| {
+                assert!(
+                    !window.rendered_frame.scene.quads.is_empty(),
+                    "the fixture must paint real scene content"
+                );
+                window.rendered_frame.draw_id.unwrap()
+            })
+            .unwrap();
+        let receipts = Rc::new(RefCell::new(Vec::new()));
+        let _subscription = c
+            .update(cx, {
+                let receipts = receipts.clone();
+                move |_, window, cx| {
+                    window
+                        .observe_frame_feedback(cx, move |event, _, _| {
+                            receipts.borrow_mut().push(event)
+                        })
+                        .unwrap()
+                }
+            })
+            .unwrap();
+        panic_paint.set(true);
+        let result = AnyWindowHandle::from(c)
+            .update(cx, |_, window, cx| {
+                window.refresh();
+                let result =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| window.draw(cx)));
+                assert_eq!(window.current_draw_id(), None);
+                result.is_err()
+            })
+            .unwrap();
+        assert!(result);
+        native.simulate_frame_request(RequestFrameOptions {
+            require_presentation: true,
+            ..Default::default()
+        });
+        assert_eq!(
+            *receipts.borrow(),
+            vec![crate::FrameFeedbackEvent::Submitted {
+                draw_id: retained,
+                frame_id: 1
+            }],
+            "an incomplete newer draw cannot relabel the previous retained scene"
+        );
     }
 
     #[gpui::test]

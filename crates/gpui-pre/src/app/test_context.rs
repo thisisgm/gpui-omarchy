@@ -462,6 +462,41 @@ impl TestAppContext {
         self.test_window(window_handle).simulate_resize(size);
     }
 
+    /// Enables successful-submit receipts and typed terminal feedback for this test window.
+    pub fn enable_frame_feedback(&self, window: AnyWindowHandle) {
+        self.test_window(window).enable_frame_feedback();
+    }
+
+    /// Drives the actual native request callback, including draw and successful submission.
+    pub fn simulate_frame_request(
+        &self,
+        window: AnyWindowHandle,
+        options: crate::RequestFrameOptions,
+    ) {
+        self.test_window(window).simulate_frame_request(options);
+    }
+
+    /// Skips the next backend present, which must produce no successful-submit receipt.
+    pub fn skip_next_present(&self, window: AnyWindowHandle) {
+        self.test_window(window).skip_next_present();
+    }
+
+    /// Delivers typed compositor feedback for an actually submitted test-window frame. Unknown, duplicate and unsubmitted IDs are ignored by the TestWindow adapter.
+    pub fn simulate_frame_terminal(&self, window: AnyWindowHandle, terminal: crate::FrameTerminal) {
+        // Match native surface lookup: late feedback for a closed window is ignored. Release the App borrow before the real backend callback enters a Window update.
+        let native = self
+            .app
+            .borrow_mut()
+            .windows
+            .get_mut(window.id)
+            .and_then(|slot| slot.as_deref_mut())
+            .and_then(|window| window.platform_window.as_test())
+            .map(|native| native.clone());
+        if let Some(native) = native {
+            native.simulate_frame_terminal(terminal);
+        }
+    }
+
     /// Simulates a change in whether the platform is presenting the window.
     pub fn simulate_window_visibility_change(
         &self,
@@ -1003,6 +1038,26 @@ impl VisualTestContext {
         self.simulate_window_resize(self.window, size)
     }
 
+    /// Enables successful-submit receipts and typed terminal feedback for this test window.
+    pub fn enable_frame_feedback(&self) {
+        self.cx.enable_frame_feedback(self.window);
+    }
+
+    /// Drives this window's actual native draw/submission callback.
+    pub fn simulate_frame_request(&self, options: crate::RequestFrameOptions) {
+        self.cx.simulate_frame_request(self.window, options);
+    }
+
+    /// Skips this window's next backend present without fabricating a submission.
+    pub fn skip_next_present(&self) {
+        self.cx.skip_next_present(self.window);
+    }
+
+    /// Delivers typed compositor feedback for an actually submitted frame of this window.
+    pub fn simulate_frame_terminal(&self, terminal: crate::FrameTerminal) {
+        self.cx.simulate_frame_terminal(self.window, terminal);
+    }
+
     /// Simulates a change in whether the platform is presenting this window.
     pub fn simulate_visibility_change(&self, visibility: WindowVisibility) {
         self.simulate_window_visibility_change(self.window, visibility);
@@ -1275,12 +1330,179 @@ impl AnyWindowHandle {
 #[cfg(test)]
 mod tests {
     use crate::{
-        PathPromptOptions, SystemNotification, SystemNotificationAction,
-        SystemNotificationResponse, TestAppContext,
+        DevicePixels, FrameFeedbackEvent, FrameOutcome, FrameTerminal, HeadlessAtlas,
+        PathPromptOptions, Platform, PlatformAtlas, PlatformHeadlessRenderer, PlatformWindow,
+        RequestFrameOptions, Scene, Size, SystemNotification, SystemNotificationAction,
+        SystemNotificationResponse, TestAppContext, TestPlatform,
     };
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::path::PathBuf;
     use std::rc::Rc;
+    use std::sync::Arc;
+
+    struct FeedbackRenderer {
+        fails: Rc<Cell<bool>>,
+        calls: Rc<Cell<usize>>,
+        atlas: Arc<HeadlessAtlas>,
+    }
+
+    impl PlatformHeadlessRenderer for FeedbackRenderer {
+        fn render_scene_to_image(
+            &mut self,
+            _: &Scene,
+            _: Size<DevicePixels>,
+        ) -> anyhow::Result<image::RgbaImage> {
+            anyhow::bail!("feedback regression must use actual submission, not image capture")
+        }
+
+        fn render_scene(&mut self, _: &Scene, _: Size<DevicePixels>) -> anyhow::Result<()> {
+            self.calls.set(self.calls.get() + 1);
+            anyhow::ensure!(!self.fails.get(), "intentional GPU submission failure");
+            Ok(())
+        }
+
+        fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
+            self.atlas.clone()
+        }
+    }
+
+    fn feedback_renderer_context(
+        cx: &TestAppContext,
+        fails: Rc<Cell<bool>>,
+        calls: Rc<Cell<usize>>,
+    ) -> TestAppContext {
+        let platform = TestPlatform::with_platform(
+            cx.background_executor.clone(),
+            cx.foreground_executor.clone(),
+            cx.test_platform.text_system(),
+            Some(Box::new(move || {
+                let renderer: Box<dyn PlatformHeadlessRenderer> = Box::new(FeedbackRenderer {
+                    fails: fails.clone(),
+                    calls: calls.clone(),
+                    atlas: Arc::new(HeadlessAtlas::default()),
+                });
+                Ok(Some(renderer))
+            })),
+        );
+        TestAppContext::build_with_platform(
+            cx.dispatcher.clone(),
+            cx.fn_name,
+            cx.background_executor.clone(),
+            cx.foreground_executor.clone(),
+            platform,
+        )
+    }
+
+    #[gpui::test]
+    fn frame_feedback_renderer_failure_has_no_backend_receipt_or_terminal(cx: &mut TestAppContext) {
+        let fails = Rc::new(Cell::new(true));
+        let calls = Rc::new(Cell::new(0));
+        let mut cx = feedback_renderer_context(cx, fails.clone(), calls.clone());
+        let window = cx.add_window(|_, _| crate::Empty);
+        let native = cx.test_window(window.into());
+        assert!(!native.frame_feedback_supported());
+        assert_eq!(native.presented_frames(), None);
+        native.enable_frame_feedback();
+        let terminals = Rc::new(RefCell::new(Vec::new()));
+        native.on_frame_terminal(Box::new({
+            let terminals = terminals.clone();
+            move |terminal| terminals.borrow_mut().push(terminal)
+        }));
+        let before = calls.get();
+        let receipt = native.draw_with_feedback(&Scene::default());
+        assert_eq!(calls.get(), before + 1, "real renderer must be called");
+        let discarded = FrameTerminal {
+            frame_id: 1,
+            outcome: FrameOutcome::Discarded,
+        };
+        native.simulate_frame_terminal(discarded);
+        assert!(
+            terminals.borrow().is_empty(),
+            "failed render must not create pending terminal feedback"
+        );
+        assert_eq!(receipt, None, "failed render must not produce a receipt");
+        assert_eq!(native.presented_frames().unwrap().committed, 0);
+        fails.set(false);
+        assert_eq!(native.draw_with_feedback(&Scene::default()), Some(1));
+        assert_eq!(calls.get(), before + 2);
+        native.simulate_frame_terminal(discarded);
+        assert_eq!(terminals.borrow().as_slice(), &[discarded]);
+        native.simulate_frame_terminal(discarded);
+        assert_eq!(terminals.borrow().as_slice(), &[discarded]);
+        cx.quit();
+    }
+
+    #[gpui::test]
+    fn frame_feedback_renderer_failure_is_not_a_window_submission(cx: &mut TestAppContext) {
+        let fails = Rc::new(Cell::new(true));
+        let calls = Rc::new(Cell::new(0));
+        let mut cx = feedback_renderer_context(cx, fails.clone(), calls.clone());
+        let window = cx.add_window(|_, _| crate::Empty);
+        cx.enable_frame_feedback(window.into());
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let _subscription = window
+            .update(&mut cx, {
+                let events = events.clone();
+                move |_, window, cx| {
+                    window
+                        .observe_frame_feedback(cx, move |event, _, _| {
+                            events.borrow_mut().push(event);
+                        })
+                        .unwrap()
+                }
+            })
+            .unwrap();
+        let before = calls.get();
+        cx.simulate_frame_request(
+            window.into(),
+            RequestFrameOptions {
+                require_presentation: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            calls.get(),
+            before + 1,
+            "native callback must reach real renderer"
+        );
+        assert!(
+            events.borrow().is_empty(),
+            "failed render must not emit Submitted"
+        );
+        assert_eq!(
+            cx.test_window(window.into())
+                .presented_frames()
+                .unwrap()
+                .committed,
+            0
+        );
+        let discarded = FrameTerminal {
+            frame_id: 1,
+            outcome: FrameOutcome::Discarded,
+        };
+        cx.simulate_frame_terminal(window.into(), discarded);
+        assert!(
+            events.borrow().is_empty(),
+            "failed render has no terminal association"
+        );
+        fails.set(false);
+        cx.simulate_frame_request(
+            window.into(),
+            RequestFrameOptions {
+                require_presentation: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(calls.get(), before + 2);
+        assert!(matches!(
+            events.borrow().as_slice(),
+            [FrameFeedbackEvent::Submitted { draw_id, frame_id: 1 }] if *draw_id > 0
+        ));
+        cx.simulate_frame_terminal(window.into(), discarded);
+        assert_eq!(events.borrow().len(), 2);
+        assert_eq!(events.borrow()[1], FrameFeedbackEvent::Terminal(discarded));
+        cx.quit();
+    }
 
     #[gpui::test]
     async fn test_system_notifications_require_identity_and_replace_matching_tags(

@@ -40,7 +40,7 @@ use crate::linux::wayland::{
 use crate::linux::{Globals, Output, WaylandClientStatePtr, get_window};
 use gpui::{
     AnyWindowHandle, Bounds, Capslock, Decorations, DevicePixels, ExternalDragPayload,
-    FrameRequestSource, GpuSpecs, Modifiers, Pixels, PlatformAtlas, PlatformDisplay,
+    FrameRequestSource, FrameTerminal, GpuSpecs, Modifiers, Pixels, PlatformAtlas, PlatformDisplay,
     PlatformFrameSignal, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
     PresentedFrames, PromptButton, PromptLevel, RequestFrameOptions, ResizeEdge, Scene, Size,
     Tiling, WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea,
@@ -66,6 +66,7 @@ pub(crate) struct Callbacks {
     appearance_changed: Option<Box<dyn FnMut()>>,
     button_layout_changed: Option<Box<dyn FnMut()>>,
     frame_presented: Option<Box<dyn FnMut()>>,
+    frame_terminal: Option<Rc<RefCell<Box<dyn FnMut(FrameTerminal)>>>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -725,12 +726,61 @@ fn run_frame_presented(callbacks: &RefCell<Callbacks>) {
     }
 }
 
+// Clone the callback slot before invocation; replacement during delivery remains installed.
+fn run_frame_terminal(callbacks: &RefCell<Callbacks>, event: FrameTerminal) {
+    let callback = callbacks.borrow().frame_terminal.clone();
+    if let Some(callback) = callback {
+        callback.borrow_mut()(event);
+    }
+}
+
 #[cfg(test)]
 mod frame_presented_callback_tests {
     use std::cell::{Cell, RefCell};
     use std::rc::Rc;
 
     use super::{Callbacks, run_frame_presented};
+
+    #[test]
+    fn terminal_feedback_callback_replacement_and_snapshot_coexist() {
+        use super::{FrameTerminal, run_frame_terminal};
+        use gpui::FrameOutcome;
+        let callbacks = Rc::new(RefCell::new(Callbacks::default()));
+        let terminals = Rc::new(Cell::new(0));
+        let snapshots = Rc::new(Cell::new(0));
+        callbacks.borrow_mut().frame_presented = Some(Box::new({
+            let snapshots = snapshots.clone();
+            move || snapshots.set(snapshots.get() + 1)
+        }));
+        callbacks.borrow_mut().frame_terminal = Some(Rc::new(RefCell::new(Box::new({
+            let weak = Rc::downgrade(&callbacks);
+            let terminals = terminals.clone();
+            move |_| {
+                terminals.set(terminals.get() + 1);
+                let replacement = terminals.clone();
+                weak.upgrade().unwrap().borrow_mut().frame_terminal =
+                    Some(Rc::new(RefCell::new(Box::new(move |_| {
+                        replacement.set(replacement.get() + 10);
+                    }))));
+            }
+        }))));
+        let event = FrameTerminal {
+            frame_id: 1,
+            outcome: FrameOutcome::Discarded,
+        };
+        run_frame_terminal(&callbacks, event);
+        run_frame_presented(&callbacks);
+        run_frame_terminal(&callbacks, event);
+        assert_eq!(terminals.get(), 11, "replacement must remain installed");
+        assert_eq!(snapshots.get(), 1);
+        callbacks.borrow_mut().frame_terminal = None;
+        run_frame_terminal(&callbacks, event);
+        assert_eq!(
+            terminals.get(),
+            11,
+            "removed callback must not be resurrected"
+        );
+    }
 
     #[test]
     fn frame_presented_observer_may_register_another_callback() {
@@ -1086,12 +1136,26 @@ impl WaylandWindowStatePtr {
         }
     }
 
-    pub fn frame_feedback(&self, frame: u64, feedback: FrameFeedback, clock_id: u32) {
-        let advanced = self
-            .state
-            .borrow_mut()
-            .presented_frames
-            .feedback(frame, feedback, clock_id);
+    pub fn frame_feedback(
+        &self,
+        data: &FrameFeedbackData,
+        feedback: FrameFeedback,
+        clock_id: Option<u32>,
+    ) {
+        let (terminal, advanced) = {
+            let mut state = self.state.borrow_mut();
+            let terminal = state.presented_frames.terminal(data, feedback, clock_id);
+            let advanced = terminal.is_some()
+                && state.presented_frames.feedback(
+                    data.frame(),
+                    feedback,
+                    clock_id.unwrap_or(libc::CLOCK_MONOTONIC as u32),
+                );
+            (terminal, advanced)
+        };
+        if let Some(terminal) = terminal {
+            run_frame_terminal(&self.callbacks, terminal);
+        }
         if advanced {
             run_frame_presented(&self.callbacks);
         }
@@ -2099,10 +2163,22 @@ impl PlatformWindow for WaylandWindow {
     }
 
     fn draw(&self, scene: &Scene) {
+        let _ = self.draw_with_feedback(scene);
+    }
+
+    fn frame_feedback_supported(&self) -> bool {
+        self.borrow().globals.presentation.is_some()
+    }
+
+    fn on_frame_terminal(&self, callback: Box<dyn FnMut(FrameTerminal)>) {
+        self.0.callbacks.borrow_mut().frame_terminal = Some(Rc::new(RefCell::new(callback)));
+    }
+
+    fn draw_with_feedback(&self, scene: &Scene) -> Option<u64> {
         let mut state = self.borrow_mut();
         let state = &mut *state;
         let Some(renderer) = &mut state.renderer else {
-            return;
+            return None;
         };
 
         if renderer.device_lost() {
@@ -2124,7 +2200,7 @@ impl PlatformWindow for WaylandWindow {
             }
 
             state.redraw_requested = true;
-            return;
+            return None;
         }
 
         // Surface state changed during this GPUI tick is included in this presentation.
@@ -2144,7 +2220,7 @@ impl PlatformWindow for WaylandWindow {
             })
         });
         let presented = renderer.draw(scene);
-        state
+        let receipt = state
             .presented_frames
             .finish_present(presented, frame_feedback);
         if presented {
@@ -2158,6 +2234,7 @@ impl PlatformWindow for WaylandWindow {
         if renderer.needs_redraw() {
             state.redraw_requested = true;
         }
+        receipt
     }
 
     fn schedule_frame(&self) {

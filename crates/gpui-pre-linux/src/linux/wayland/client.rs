@@ -81,7 +81,7 @@ use xkbcommon::xkb::{self, KEYMAP_COMPILE_NO_FLAGS, Keycode};
 
 use super::{
     display::{WaylandDisplay, refresh_interval_from_millihertz},
-    presentation::{FrameFeedback, FrameFeedbackData, presentation_timestamp},
+    presentation::{FrameFeedback, FrameFeedbackData},
     window::{ImeInput, WaylandWindowStatePtr},
 };
 
@@ -419,7 +419,7 @@ pub(crate) struct WaylandClientState {
     pub common: Rc<RefCell<LinuxCommon>>,
     ime_enabled: Option<bool>,
     // The clockid_t of wp_presentation timestamps, sent once on bind.
-    presentation_clock_id: u32,
+    presentation_clock_id: Option<u32>,
 }
 
 type DragState = super::drag::DragState<DataOffer<WlDataOffer>, WaylandWindowStatePtr>;
@@ -1127,7 +1127,7 @@ impl WaylandConnection {
             },
             registrations: Vec::new(),
             ime_enabled: None,
-            presentation_clock_id: libc::CLOCK_MONOTONIC as u32,
+            presentation_clock_id: None,
         }));
 
         // From here on, `Drop` removes whatever was registered if a later step fails.
@@ -1789,7 +1789,7 @@ impl Dispatch<wp_presentation::WpPresentation, ()> for WaylandClientStatePtr {
         _: &QueueHandle<Self>,
     ) {
         if let wp_presentation::Event::ClockId { clk_id } = event {
-            this.get_client().borrow_mut().presentation_clock_id = clk_id;
+            this.get_client().borrow_mut().presentation_clock_id = Some(clk_id);
         }
     }
 }
@@ -1811,7 +1811,7 @@ impl Dispatch<wp_presentation_feedback::WpPresentationFeedback, FrameFeedbackDat
                 tv_sec_lo,
                 tv_nsec,
                 ..
-            } => FrameFeedback::Presented(presentation_timestamp(tv_sec_hi, tv_sec_lo, tv_nsec)),
+            } => FrameFeedback::presented(tv_sec_hi, tv_sec_lo, tv_nsec),
             wp_presentation_feedback::Event::Discarded => FrameFeedback::Discarded,
             _ => return,
         };
@@ -1823,7 +1823,7 @@ impl Dispatch<wp_presentation_feedback::WpPresentationFeedback, FrameFeedbackDat
         };
         drop(state);
 
-        window.frame_feedback(data.frame(), feedback, clock_id);
+        window.frame_feedback(data, feedback, clock_id);
     }
 }
 

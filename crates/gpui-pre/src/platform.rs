@@ -1073,6 +1073,47 @@ pub struct PresentedFrames {
     pub clock_id: u32,
 }
 
+/// A compositor presentation time. Each field is independently unavailable.
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub struct PresentationTime {
+    /// A structurally valid timestamp in the compositor's clock domain.
+    pub timestamp: Option<Duration>,
+    /// The clock ID actually announced by the compositor, never an assumed default. Comparability to a caller's input or application clock requires separate validation.
+    pub clock_id: Option<u32>,
+}
+
+/// The compositor's terminal outcome for one successfully committed frame.
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub enum FrameOutcome {
+    /// The frame was presented, possibly without usable timing information.
+    Presented(PresentationTime),
+    /// The compositor discarded this frame without presenting it.
+    Discarded,
+}
+
+/// One terminal outcome. IDs are nonzero and scoped to the live window.
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub struct FrameTerminal {
+    /// The successful commit ID, in the same namespace as [`PresentedFrames`].
+    pub frame_id: u64,
+    /// What the compositor reported for this exact commit.
+    pub outcome: FrameOutcome,
+}
+
+/// Successful scene submission and per-ID terminal feedback for a window.
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub enum FrameFeedbackEvent {
+    /// The retained scene's draw was successfully committed with feedback association.
+    Submitted {
+        /// The ID retained with that scene, not a later draw or model revision.
+        draw_id: u64,
+        /// The successful commit ID, local to this live window.
+        frame_id: u64,
+    },
+    /// A terminal result, including older commits delivered out of order.
+    Terminal(FrameTerminal),
+}
+
 /// Preserves the first platform frame request time across coalesced notifications.
 ///
 /// Producers may record from a platform thread without waiting for the UI thread.
@@ -1315,6 +1356,17 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn on_appearance_changed(&self, callback: Box<dyn FnMut()>);
     fn on_button_layout_changed(&self, _callback: Box<dyn FnMut()>) {}
     fn draw(&self, scene: &Scene);
+    /// Whether this window supports successful-submit receipts and per-ID terminal feedback.
+    fn frame_feedback_supported(&self) -> bool {
+        false
+    }
+    /// Draws exactly once, returning this scene's successful commit ID when associated. Failure, recovery skips and unsupported feedback return `None`.
+    fn draw_with_feedback(&self, scene: &Scene) -> Option<u64> {
+        self.draw(scene);
+        None
+    }
+    /// Registers terminal feedback, outside platform state borrows. Submitted receipts are returned by [`Self::draw_with_feedback`] before terminal callbacks can run.
+    fn on_frame_terminal(&self, _callback: Box<dyn FnMut(FrameTerminal)>) {}
     fn schedule_frame(&self) {}
     /// Presentation feedback, or `None` where the platform or compositor reports none.
     fn presented_frames(&self) -> Option<PresentedFrames> {
