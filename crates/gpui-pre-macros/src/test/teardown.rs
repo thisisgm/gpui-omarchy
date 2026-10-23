@@ -26,18 +26,23 @@ pub(super) fn wrap(
     refcounts: TokenStream,
 ) -> TokenStream {
     quote! {
+        struct __GpuiCleanupFailure {
+            _previous: std::mem::ManuallyDrop<Option<Box<dyn std::any::Any + Send>>>,
+            _cleanup: std::mem::ManuallyDrop<Box<dyn std::any::Any + Send>>,
+        }
+
         fn __gpui_cleanup(
             failure: &mut Option<Box<dyn std::any::Any + Send>>,
             cleanup: impl FnOnce(),
         ) {
             if let Err(error) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(cleanup)) {
-                if failure.is_none() {
-                    *failure = Some(error);
-                } else {
-                    eprintln!("additional test cleanup panic; preserving first panic");
-                    // A secondary panic payload may itself panic when dropped.
-                    std::mem::forget(error);
-                }
+                // An opaque payload prevents expected body panics from masking failed cleanup.
+                // Retain payloads without running potentially panicking destructors.
+                let previous = failure.take();
+                *failure = Some(Box::new(__GpuiCleanupFailure {
+                    _previous: std::mem::ManuallyDrop::new(previous),
+                    _cleanup: std::mem::ManuallyDrop::new(error),
+                }));
             }
         }
 

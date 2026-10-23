@@ -179,3 +179,62 @@ fn fd_lifetime_macro_cleans_up_every_context_on_body_panic() {
     assert_original_panic(catch_unwind(AssertUnwindSafe(multiple_context_fixture)));
     assert_contexts_released(2);
 }
+
+#[gpui::test]
+#[should_panic]
+fn cleanup_without_body_fixture(first: &mut TestAppContext, second: &mut TestAppContext) {
+    reset();
+    first.on_quit(|| panic!("fd-lifetime-cleanup-panic"));
+    second.on_quit(|| QUIT_HOOKS.with(|count| count.set(count.get() + 1)));
+    second.update(observe_shutdown);
+}
+
+#[test]
+fn fd_lifetime_cleanup_failure_still_shuts_down_the_other_context() {
+    assert!(catch_unwind(AssertUnwindSafe(cleanup_without_body_fixture)).is_err());
+    QUIT_HOOKS.with(|count| assert_eq!(count.get(), 1, "later context quit hook ran"));
+    SHUTDOWNS.with(|count| assert_eq!(count.get(), 1, "later App shutdown ran"));
+}
+
+#[gpui::test]
+#[should_panic(expected = "fd-lifetime-body-panic")]
+fn expected_body_cleanup_fixture(first: &mut TestAppContext, second: &mut TestAppContext) {
+    if std::env::var_os("GPUI_FD_CLEANUP_NEGATIVE_CHILD").as_deref()
+        == Some(std::ffi::OsStr::new("1"))
+    {
+        first.on_quit(|| panic!("fd-lifetime-cleanup-panic"));
+        second.on_quit(|| eprintln!("fd-lifetime-second-context-cleaned"));
+    }
+    panic!("fd-lifetime-body-panic");
+}
+
+#[test]
+fn fd_lifetime_expected_body_does_not_accept_cleanup_failure() {
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "expected_body_cleanup_fixture",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("GPUI_FD_CLEANUP_NEGATIVE_CHILD", "1")
+        .output()
+        .expect("the same test binary starts the exact negative fixture");
+    let body = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !output.status.success(),
+        "matching expected body panic hid cleanup failure:\n{body}"
+    );
+    assert!(
+        body.contains("fd-lifetime-second-context-cleaned"),
+        "remaining teardown was skipped:\n{body}"
+    );
+    assert!(
+        body.contains("test result: FAILED. 0 passed; 1 failed;"),
+        "the exact expected-panic fixture must fail:\n{body}"
+    );
+}
