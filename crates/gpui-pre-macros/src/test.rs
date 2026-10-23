@@ -10,6 +10,8 @@ use syn::{
     spanned::Spanned,
 };
 
+mod teardown;
+
 struct Args {
     seeds: Vec<u64>,
     max_retries: usize,
@@ -134,6 +136,7 @@ fn generate_test_function(
         // based on its parameter list.
         let mut cx_vars = proc_macro2::TokenStream::new();
         let mut cx_teardowns = proc_macro2::TokenStream::new();
+        let mut cx_refcounts = proc_macro2::TokenStream::new();
         let mut inner_fn_args = proc_macro2::TokenStream::new();
         for (ix, arg) in inner_fn.sig.inputs.iter().enumerate() {
             if let FnArg::Typed(arg) = arg {
@@ -160,18 +163,17 @@ fn generate_test_function(
                         last_segment.map(|s| s.ident.to_string()).as_deref()
                     {
                         let cx_varname = format_ident!("cx_{}", ix);
+                        let refcounts_var = format_ident!("__gpui_refcounts_{}", ix);
                         cx_vars.extend(quote!(
                             let mut #cx_varname = gpui::TestAppContext::build(
                                 dispatcher.clone(),
                                 Some(stringify!(#outer_fn_name)),
                             );
-                            let _entity_refcounts = #cx_varname.app.borrow().ref_counts_drop_handle();
+                            let #refcounts_var = #cx_varname.app.borrow().ref_counts_drop_handle();
                         ));
-                        cx_teardowns.extend(quote!(
-                            #cx_varname.run_until_parked();
-                            #cx_varname.update(|cx| { cx.background_executor().forbid_parking(); cx.quit(); });
-                            #cx_varname.run_until_parked();
-                            drop(#cx_varname);
+                        cx_teardowns.extend(teardown::context(&cx_varname, None));
+                        cx_refcounts.extend(quote!(
+                            __gpui_cleanup(&mut __gpui_failure, || drop(#refcounts_var));
                         ));
                         inner_fn_args.extend(quote!(&mut #cx_varname,));
                         continue;
@@ -182,6 +184,12 @@ fn generate_test_function(
             return Err(error_with_message("invalid function signature", arg));
         }
 
+        let run_body = teardown::wrap(
+            quote!(gpui::ForegroundExecutor::new(exec.clone()).block_test(#inner_fn_name(#inner_fn_args));),
+            quote!(__gpui_cleanup(&mut __gpui_failure, || drop(exec));),
+            cx_teardowns,
+            cx_refcounts,
+        );
         parse_quote! {
             #[test]
             fn #outer_fn_name() {
@@ -194,15 +202,7 @@ fn generate_test_function(
                     &mut |dispatcher, _seed| {
                         let exec = std::sync::Arc::new(dispatcher.clone());
                         #cx_vars
-                        gpui::ForegroundExecutor::new(exec.clone()).block_test(#inner_fn_name(#inner_fn_args));
-                        drop(exec);
-                        #cx_teardowns
-                        // Ideally we would only drop cancelled tasks, that way we could detect leaks due to task <-> entity
-                        // cycles as cancelled tasks will be dropped properly once the runnable gets run again
-                        //
-                        // async-task does not give us the power to do this just yet though
-                        dispatcher.drain_tasks();
-                        drop(dispatcher);
+                        #run_body
                     },
                     #on_failure_fn_name
                 );
@@ -213,6 +213,7 @@ fn generate_test_function(
         // based on its parameter list.
         let mut cx_vars = proc_macro2::TokenStream::new();
         let mut cx_teardowns = proc_macro2::TokenStream::new();
+        let mut cx_refcounts = proc_macro2::TokenStream::new();
         let mut inner_fn_args = proc_macro2::TokenStream::new();
         for (ix, arg) in inner_fn.sig.inputs.iter().enumerate() {
             if let FnArg::Typed(arg) = arg {
@@ -230,6 +231,7 @@ fn generate_test_function(
                     match last_segment.map(|s| s.ident.to_string()).as_deref() {
                         Some("App") => {
                             let cx_varname = format_ident!("cx_{}", ix);
+                            let refcounts_var = format_ident!("__gpui_refcounts_{}", ix);
                             let cx_varname_lock = format_ident!("cx_{}_lock", ix);
                             cx_vars.extend(quote!(
                                 let mut #cx_varname = gpui::TestAppContext::build(
@@ -237,32 +239,29 @@ fn generate_test_function(
                                    Some(stringify!(#outer_fn_name))
                                 );
                                 let mut #cx_varname_lock = #cx_varname.app.borrow_mut();
-                                let _entity_refcounts = #cx_varname_lock.ref_counts_drop_handle();
+                                let #refcounts_var = #cx_varname_lock.ref_counts_drop_handle();
                             ));
                             inner_fn_args.extend(quote!(&mut #cx_varname_lock,));
-                            cx_teardowns.extend(quote!(
-                                    drop(#cx_varname_lock);
-                                    #cx_varname.run_until_parked();
-                                    #cx_varname.update(|cx| { cx.background_executor().forbid_parking(); cx.quit(); });
-                                    #cx_varname.run_until_parked();
-                                    drop(#cx_varname);
-                                ));
+                            cx_teardowns
+                                .extend(teardown::context(&cx_varname, Some(&cx_varname_lock)));
+                            cx_refcounts.extend(quote!(
+                                __gpui_cleanup(&mut __gpui_failure, || drop(#refcounts_var));
+                            ));
                             continue;
                         }
                         Some("TestAppContext") => {
                             let cx_varname = format_ident!("cx_{}", ix);
+                            let refcounts_var = format_ident!("__gpui_refcounts_{}", ix);
                             cx_vars.extend(quote!(
                                 let mut #cx_varname = gpui::TestAppContext::build(
                                     dispatcher.clone(),
                                     Some(stringify!(#outer_fn_name))
                                 );
-                                let _entity_refcounts = #cx_varname.app.borrow().ref_counts_drop_handle();
+                                let #refcounts_var = #cx_varname.app.borrow().ref_counts_drop_handle();
                             ));
-                            cx_teardowns.extend(quote!(
-                                #cx_varname.run_until_parked();
-                                #cx_varname.update(|cx| { cx.background_executor().forbid_parking(); cx.quit(); });
-                                #cx_varname.run_until_parked();
-                                drop(#cx_varname);
+                            cx_teardowns.extend(teardown::context(&cx_varname, None));
+                            cx_refcounts.extend(quote!(
+                                __gpui_cleanup(&mut __gpui_failure, || drop(#refcounts_var));
                             ));
                             inner_fn_args.extend(quote!(&mut #cx_varname,));
                             continue;
@@ -275,6 +274,12 @@ fn generate_test_function(
             return Err(error_with_message("invalid function signature", arg));
         }
 
+        let run_body = teardown::wrap(
+            quote!(#inner_fn_name(#inner_fn_args);),
+            quote!(),
+            cx_teardowns,
+            cx_refcounts,
+        );
         parse_quote! {
             #[test]
             fn #outer_fn_name() {
@@ -286,14 +291,7 @@ fn generate_test_function(
                     #max_retries,
                     &mut |dispatcher, _seed| {
                         #cx_vars
-                        #inner_fn_name(#inner_fn_args);
-                        #cx_teardowns
-                        // Ideally we would only drop cancelled tasks, that way we could detect leaks due to task <-> entity
-                        // cycles as cancelled tasks will be dropped properly once they runnable gets run again
-                        //
-                        // async-task does not give us the power to do this just yet though
-                        dispatcher.drain_tasks();
-                        drop(dispatcher);
+                        #run_body
                     },
                     #on_failure_fn_name,
                 );

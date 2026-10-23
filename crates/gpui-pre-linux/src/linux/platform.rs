@@ -186,10 +186,12 @@ impl LinuxCommon {
     ) -> anyhow::Result<()> {
         loop_handle
             .insert_source(main_receiver, {
-                let loop_handle = loop_handle.clone();
+                let loop_handle = loop_handle.downgrade();
                 let common = common.clone();
                 move |event, _, _| {
-                    if let calloop::channel::Event::Msg(runnable) = event {
+                    if let calloop::channel::Event::Msg(runnable) = event
+                        && let Some(loop_handle) = loop_handle.upgrade()
+                    {
                         let common = common.clone();
                         loop_handle.insert_idle(move |_| {
                             let location = runnable.metadata().location;
@@ -2159,3 +2161,7 @@ mod display_mode_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "platform/fd_lifetime_tests.rs"]
+mod fd_lifetime_tests;

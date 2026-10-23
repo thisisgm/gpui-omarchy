@@ -369,3 +369,7 @@ mod tests {
         assert!(data.got_closed);
     }
 }
+
+#[cfg(test)]
+#[path = "dispatcher/fd_lifetime_tests.rs"]
+mod fd_lifetime_tests;

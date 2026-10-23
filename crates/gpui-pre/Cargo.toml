@@ -720,3 +720,8 @@ priority = -1
 [lints.rust.unexpected_cfgs]
 level = "allow"
 priority = 0
+
+[[test]]
+name = "fd_lifetime"
+path = "tests/fd_lifetime.rs"
+required-features = ["test-support"]
