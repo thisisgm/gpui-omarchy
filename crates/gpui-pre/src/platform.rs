@@ -2139,6 +2139,12 @@ impl PlatformInputHandler {
             .flatten()
     }
 
+    pub fn set_ime_cursor_visible(&mut self, visible: bool) {
+        self.cx
+            .update(|window, cx| self.handler.set_ime_cursor_visible(visible, window, cx))
+            .ok();
+    }
+
     #[cfg_attr(target_os = "windows", allow(dead_code))]
     pub fn marked_text_range(&mut self) -> Option<Range<usize>> {
         self.cx
@@ -2282,7 +2288,7 @@ impl PlatformInputHandler {
     }
 
     /// See [`InputHandler::set_selected_text_range`].
-    pub fn set_selected_text_range(&mut self, range_utf16: Range<usize>) {
+    pub fn set_selected_text_range(&mut self, range_utf16: UTF16Selection) {
         self.cx
             .update(|window, cx| {
                 self.handler
@@ -2369,6 +2375,9 @@ pub struct UTF16Selection {
 ///
 /// <https://developer.apple.com/documentation/appkit/nstextinputclient>
 pub trait InputHandler: 'static {
+    /// Show or hide the caret during IME preedit; editors may override the default no-op.
+    fn set_ime_cursor_visible(&mut self, _visible: bool, _window: &mut Window, _cx: &mut App) {}
+
     /// Get the range of the user's currently selected text, if any
     /// Corresponds to [selectedRange()](https://developer.apple.com/documentation/appkit/nstextinputclient/1438242-selectedrange)
     ///
@@ -2473,7 +2482,7 @@ pub trait InputHandler: 'static {
     /// range_utf16 is in terms of UTF-16 characters, from 0 to the length of the document
     fn set_selected_text_range(
         &mut self,
-        _range_utf16: Range<usize>,
+        _range_utf16: UTF16Selection,
         _window: &mut Window,
         _cx: &mut App,
     ) {

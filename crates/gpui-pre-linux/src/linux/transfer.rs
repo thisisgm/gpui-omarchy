@@ -22,6 +22,8 @@ pub(crate) const BYTE_LIMIT: usize = 64 * 1024 * 1024;
 pub(crate) const PATH_LIMIT: usize = 100_000;
 pub(crate) const TRANSFER_TIMEOUT: Duration = Duration::from_secs(2);
 pub(crate) const TYPE_LIMIT: usize = 64;
+// X selection requests that GTK lists as drag targets; reading DELETE asks the source to delete its data, and GTK never closes that pipe.
+const REQUEST_TARGETS: [&str; 5] = ["DELETE", "MULTIPLE", "SAVE_TARGETS", "TARGETS", "TIMESTAMP"];
 pub(crate) type Cancel = Arc<AtomicBool>;
 #[derive(Clone, Default)]
 pub(crate) struct TransferPool(Arc<AtomicUsize>);
@@ -355,7 +357,11 @@ pub(crate) fn selected_types(offered: &[String], arbitrary: bool) -> Vec<String>
                 || mime == URI_LIST
                 || TEXT_TYPES.contains(&mime.as_str())
                 || ImageFormat::iter().any(|format| format.mime_type() == mime);
-            if !standard && !mime.starts_with("pid/") && !types.contains(mime) {
+            if !standard
+                && !mime.starts_with("pid/")
+                && !REQUEST_TARGETS.contains(&mime.as_str())
+                && !types.contains(mime)
+            {
                 types.push(mime.clone());
             }
         }
@@ -436,6 +442,11 @@ mod tests {
         thread,
     };
 
+    #[test]
+    fn gtk_delete_request_is_never_read_as_data() {
+        let offered = [URI_LIST.to_owned(), "DELETE".to_owned()];
+        assert_eq!(selected_types(&offered, true), [URI_LIST]);
+    }
     fn pipe() -> (File, File) {
         let (read, write) = UnixStream::pair().unwrap();
         (

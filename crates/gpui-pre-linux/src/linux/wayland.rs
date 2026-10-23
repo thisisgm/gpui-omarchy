@@ -3,9 +3,13 @@ mod clipboard;
 mod cursor;
 mod display;
 mod drag;
+mod ime;
+mod ime_context;
+mod ime_events;
 mod opaque_region;
 mod popup;
 mod presentation;
+mod scroll;
 mod serial;
 mod window;
 

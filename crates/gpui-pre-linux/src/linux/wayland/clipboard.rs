@@ -10,7 +10,10 @@ use std::{
     },
     time::Instant,
 };
-use wayland_client::{Connection, protocol::wl_data_offer::WlDataOffer};
+use wayland_client::{
+    Connection,
+    protocol::{wl_data_device_manager::DndAction, wl_data_offer::WlDataOffer},
+};
 use wayland_protocols::wp::primary_selection::zv1::client::zwp_primary_selection_offer_v1::ZwpPrimarySelectionOfferV1;
 
 pub(crate) trait ReceiveData: Clone {
@@ -44,6 +47,8 @@ impl<T: ReceiveData> Drop for OfferLife<T> {
 pub(crate) struct DataOffer<T: ReceiveData> {
     pub inner: T,
     pub mime_types: Vec<String>,
+    // The actions a drag source allows, sent before Enter; None when the compositor never sent them.
+    pub source_actions: Option<DndAction>,
     _life: Arc<OfferLife<T>>,
 }
 impl<T: ReceiveData> DataOffer<T> {
@@ -52,6 +57,7 @@ impl<T: ReceiveData> DataOffer<T> {
             _life: Arc::new(OfferLife(inner.clone())),
             inner,
             mime_types: Vec::new(),
+            source_actions: None,
         }
     }
     pub fn add_mime_type(&mut self, mime_type: String) {
@@ -739,7 +745,7 @@ mod pending_read_tests {
         let mut selection: Selection<Offer> = Selection::default();
         selection.set_offer(Some(echo("UTF8_STRING".into())));
         let mut drag = super::super::drag::DragState::default();
-        drag.begin(1, 2, gpui::Point::default(), vec![]);
+        drag.begin(1, 2, gpui::Point::default(), vec![], 0);
         selection.cancel = drag.cancel.clone();
         let result = completed(&mut selection, &pool);
         drag.pending = Some(result.slot.clone());

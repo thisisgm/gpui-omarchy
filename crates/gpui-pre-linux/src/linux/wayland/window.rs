@@ -881,7 +881,8 @@ enum FrameLoop {
 }
 
 pub(crate) struct WaylandWindow(pub WaylandWindowStatePtr);
-pub enum ImeInput {
+pub(crate) enum ImeInput {
+    Apply(super::ime::ImeBatch),
     InsertText(String),
     SetMarkedText(String),
     UnmarkText,
@@ -1619,22 +1620,7 @@ impl WaylandWindowStatePtr {
         let mut state = self.state.borrow_mut();
         if let Some(mut input_handler) = state.input_handler.take() {
             drop(state);
-            match ime {
-                ImeInput::InsertText(text) => {
-                    input_handler.replace_text_in_range(None, &text);
-                }
-                ImeInput::SetMarkedText(text) => {
-                    input_handler.replace_and_mark_text_in_range(None, &text, None);
-                }
-                ImeInput::UnmarkText => {
-                    input_handler.unmark_text();
-                }
-                ImeInput::DeleteText => {
-                    if let Some(marked) = input_handler.marked_text_range() {
-                        input_handler.replace_text_in_range(Some(marked), "");
-                    }
-                }
-            }
+            super::ime_context::handle(&mut input_handler, ime);
             self.state.borrow_mut().input_handler = Some(input_handler);
         }
     }
@@ -1648,6 +1634,15 @@ impl WaylandWindowStatePtr {
             self.state.borrow_mut().input_handler = Some(input_handler);
         }
         bounds
+    }
+
+    pub fn get_ime_context(&self) -> Option<super::ime_context::SurroundingText> {
+        let mut state = self.state.borrow_mut();
+        let mut handler = state.input_handler.take()?;
+        drop(state);
+        let context = super::ime_context::surrounding(&mut handler);
+        self.state.borrow_mut().input_handler = Some(handler);
+        context
     }
 
     pub fn set_size_and_scale(&self, size: Option<Size<Pixels>>, scale: Option<f32>) {
@@ -2397,11 +2392,14 @@ impl PlatformWindow for WaylandWindow {
     }
 
     fn update_ime_position(&self, bounds: Bounds<Pixels>) {
-        let state = self.borrow();
-        if !state.active {
-            return;
-        }
-        state.client.update_ime_position(bounds);
+        let (client, surface) = {
+            let state = self.borrow();
+            if !state.active {
+                return;
+            }
+            (state.client.clone(), state.surface.id())
+        };
+        client.update_ime_position(surface, bounds);
     }
 
     fn gpu_specs(&self) -> Option<GpuSpecs> {
