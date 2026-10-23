@@ -36,8 +36,7 @@ pub(super) fn wrap(
             cleanup: impl FnOnce(),
         ) {
             if let Err(error) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(cleanup)) {
-                // An opaque payload prevents expected body panics from masking failed cleanup.
-                // Retain payloads without running potentially panicking destructors.
+                // Retain failed cleanup distinctly without running payload destructors.
                 let previous = failure.take();
                 *failure = Some(Box::new(__GpuiCleanupFailure {
                     _previous: std::mem::ManuallyDrop::new(previous),
