@@ -67,7 +67,12 @@ pub(crate) struct Callbacks {
     button_layout_changed: Option<Box<dyn FnMut()>>,
     frame_presented: Option<Box<dyn FnMut()>>,
     frame_terminal: Option<Rc<RefCell<Box<dyn FnMut(FrameTerminal)>>>>,
-    gpu_completion: Option<Rc<RefCell<Box<dyn FnMut(GpuCompletion)>>>>,
+}
+
+#[derive(Default)]
+struct GpuCompletionCallback {
+    callback: RefCell<Option<Rc<RefCell<Box<dyn FnMut(GpuCompletion)>>>>>,
+    enabled: Cell<bool>,
 }
 
 /// CLOCK_MONOTONIC now, the clock presentation feedback and GPU completion share.
@@ -569,6 +574,8 @@ impl WaylandSurfaceState {
 pub struct WaylandWindowStatePtr {
     state: Rc<RefCell<WaylandWindowState>>,
     callbacks: Rc<RefCell<Callbacks>>,
+    // Frame requests hold callbacks mutably through registration and draw.
+    gpu_completion: Rc<GpuCompletionCallback>,
     frame_loop: Rc<Cell<FrameLoop>>,
     frame_ping: Ping,
     scheduled_frame_at: Rc<Cell<Option<Instant>>>,
@@ -748,6 +755,10 @@ fn run_frame_terminal(callbacks: &RefCell<Callbacks>, event: FrameTerminal) {
         callback.borrow_mut()(event);
     }
 }
+
+#[cfg(test)]
+#[path = "gpu_completion_tests.rs"]
+mod frame_presented_callback_gpu_fence_tests;
 
 #[cfg(test)]
 mod frame_presented_callback_tests {
@@ -1012,6 +1023,7 @@ impl WaylandWindow {
                 parent,
             )?)),
             callbacks: Rc::new(RefCell::new(Callbacks::default())),
+            gpu_completion: Rc::new(GpuCompletionCallback::default()),
             frame_loop: Rc::new(Cell::new(FrameLoop::Unconfigured)),
             frame_ping,
             scheduled_frame_at: Rc::new(Cell::new(None)),
@@ -1186,7 +1198,7 @@ impl WaylandWindowStatePtr {
         if lost > 0 {
             log::debug!("dropped {lost} unretained GPU completions");
         }
-        let callback = self.callbacks.borrow().gpu_completion.clone();
+        let callback = self.gpu_completion.callback.borrow().clone();
         if let Some(callback) = callback {
             for completion in completions {
                 callback.borrow_mut()(completion);
@@ -2203,8 +2215,10 @@ impl PlatformWindow for WaylandWindow {
     }
 
     fn on_gpu_completion(&self, callback: Option<Box<dyn FnMut(GpuCompletion)>>) {
-        self.0.callbacks.borrow_mut().gpu_completion =
+        let enabled = callback.is_some();
+        *self.0.gpu_completion.callback.borrow_mut() =
             callback.map(|callback| Rc::new(RefCell::new(callback)));
+        self.0.gpu_completion.enabled.set(enabled);
     }
 
     fn draw_with_feedback(&self, scene: &Scene) -> Option<u64> {
@@ -2257,7 +2271,7 @@ impl PlatformWindow for WaylandWindow {
             .presented_frames
             .finish_present(presented, frame_feedback);
         if let (true, Some(frame_id)) = (presented, receipt)
-            && self.0.callbacks.borrow().gpu_completion.is_some()
+            && self.0.gpu_completion.enabled.get()
         {
             let ping = self.0.frame_ping.clone();
             renderer.track_gpu_completion(
