@@ -1,5 +1,5 @@
 use std::{
-    cell::{RefCell, RefMut},
+    cell::{Cell, RefCell, RefMut},
     hash::Hash,
     os::{
         fd::{FromRawFd as _, RawFd},
@@ -400,6 +400,7 @@ pub(crate) struct WaylandClientState {
     compose_state: Option<xkb::compose::State>,
     drag: DragState,
     external_drag: Option<ExternalDrag>,
+    pending_drag_end: Rc<Cell<bool>>,
     click: ClickState,
     repeat: KeyRepeat,
     pub modifiers: Modifiers,
@@ -626,6 +627,10 @@ impl WaylandClientStatePtr {
         self.start_drag_session(surface, payload, DragOrigin::Pointer)
     }
 
+    pub fn can_start_external_drag(&self) -> bool {
+        !self.get_client().borrow().pending_drag_end.get()
+    }
+
     /// A keyboard-origin drag: no button held, the pointer resting over this window, started with the newest
     /// key or pointer press serial. Whether a compositor accepts that serial for wl_data_device.start_drag is
     /// the compositor's to decide; a refusal arrives as the source's cancelled event.
@@ -668,9 +673,12 @@ impl WaylandClientStatePtr {
                 .store(true, std::sync::atomic::Ordering::Release);
         }
         drag.source.destroy();
+        let loop_handle = state.loop_handle.clone();
+        let pending_drag_end = state.pending_drag_end.clone();
         drop(state);
-        drag.window
-            .handle_input(PlatformInput::FileDrop(FileDropEvent::Ended));
+        dispatch_drag_ended(&loop_handle, pending_drag_end, move |input| {
+            drag.window.handle_input(input)
+        });
         true
     }
 
@@ -707,7 +715,7 @@ impl WaylandClientStatePtr {
             state.button_pressed,
             pointer_here,
             keys_here,
-            state.external_drag.is_some(),
+            state.external_drag.is_some() || state.pending_drag_end.get(),
             &state.serial_tracker,
         ) else {
             return false;
@@ -1174,6 +1182,7 @@ impl WaylandConnection {
             compose_state: None,
             drag: DragState::new(hyprland),
             external_drag: None,
+            pending_drag_end: Rc::new(Cell::new(false)),
             click: ClickState {
                 last_click: Instant::now(),
                 last_mouse_button: None,
@@ -3727,9 +3736,144 @@ impl WaylandClientStatePtr {
     }
 }
 
+fn dispatch_drag_ended(
+    loop_handle: &LoopHandle<'static, ()>,
+    pending: Rc<Cell<bool>>,
+    dispatch: impl FnOnce(PlatformInput) + 'static,
+) {
+    // App-driven cancellation still holds the App and Window until this dispatch returns.
+    pending.set(true);
+    loop_handle.insert_idle(move |_| {
+        dispatch(PlatformInput::FileDrop(FileDropEvent::Ended));
+        pending.set(false);
+    });
+}
+
 #[cfg(test)]
 mod drag_origin_tests {
     use super::{drag_serial, DragOrigin, MouseButton, SerialKind, SerialTracker};
+
+    #[gpui::test]
+    fn keyboard_drag_cancel_delivers_ended_after_app_update(cx: &mut gpui::TestAppContext) {
+        use gpui::{AppContext as _, CursorStyle, Empty, ExternalDragPayload, FileDragPaths};
+        use std::cell::Cell;
+
+        let window = cx.add_window(|_, _| Empty);
+        let native = cx.test_window(window.into());
+        native.set_start_external_drag_result(true);
+        let mut event_loop = calloop::EventLoop::try_new().unwrap();
+        let loop_handle = event_loop.handle();
+        let delivered = super::Rc::new(Cell::new(0));
+        let pending = super::Rc::new(Cell::new(false));
+        let resolved = super::Rc::new(Cell::new(0));
+        native.set_external_drag_ready_handler({
+            let pending = pending.clone();
+            move || !pending.get()
+        });
+        native.set_cancel_external_drag_handler({
+            let mut live = true;
+            let delivered = delivered.clone();
+            let app = super::Rc::downgrade(&cx.app);
+            let pending = pending.clone();
+            move |native| {
+                if !std::mem::take(&mut live) {
+                    return false;
+                }
+                let mut native = native.clone();
+                let delivered = delivered.clone();
+                let app = app.clone();
+                super::dispatch_drag_ended(&loop_handle, pending.clone(), move |input| {
+                    assert!(matches!(
+                        input,
+                        super::PlatformInput::FileDrop(super::FileDropEvent::Ended)
+                    ));
+                    native.simulate_input(input);
+                    assert!(
+                        app.upgrade().unwrap().try_borrow_mut().is_ok(),
+                        "Ended re-entered the input callback while the App was borrowed"
+                    );
+                    delivered.set(delivered.get() + 1);
+                });
+                true
+            }
+        });
+        cx.update_window(window.into(), |_, window, cx| {
+            let view = cx.new(|_| Empty);
+            cx.start_drag(
+                (),
+                view,
+                gpui::point(gpui::px(0.), gpui::px(0.)),
+                Some(Box::new(|_, _| {
+                    Some(ExternalDragPayload::Files(FileDragPaths::new([(
+                        std::path::PathBuf::from("/tmp/keyboard-drag-cancel"),
+                        false,
+                    )])))
+                })),
+            );
+            assert!(window.start_keyboard_external_drag(cx));
+            assert!(!cx.has_active_drag());
+            assert!(window.cancel_drag(cx));
+            assert!(!window.cancel_drag(cx), "the native session is consumed once");
+            assert_eq!(delivered.get(), 0, "Ended must not re-enter the App update");
+            assert!(pending.get(), "native hand-off must wait for the old Ended");
+            let view = cx.new(|_| Empty);
+            let resolver_calls = resolved.clone();
+            cx.start_drag(
+                "replacement",
+                view,
+                gpui::point(gpui::px(0.), gpui::px(0.)),
+                Some(Box::new(move |_, _| {
+                    resolver_calls.set(resolver_calls.get() + 1);
+                    Some(ExternalDragPayload::Files(FileDragPaths::new([(
+                        std::path::PathBuf::from("/tmp/replacement-drag"),
+                        false,
+                    )])))
+                })),
+            );
+            assert!(cx.set_active_drag_cursor_style(CursorStyle::Crosshair, window));
+            window.dispatch_event(
+                super::PlatformInput::MouseMove(gpui::MouseMoveEvent {
+                    position: gpui::point(gpui::px(-1.), gpui::px(-1.)),
+                    pressed_button: Some(MouseButton::Left),
+                    modifiers: Default::default(),
+                }),
+                cx,
+            );
+            assert_eq!(resolved.get(), 0, "pending Ended must not consume a pointer resolver");
+            assert!(!window.start_keyboard_external_drag(cx));
+            assert!(cx.has_active_drag(), "the replacement remains available for retry");
+        })
+        .unwrap();
+        event_loop
+            .dispatch(std::time::Duration::ZERO, &mut ())
+            .unwrap();
+        assert_eq!(delivered.get(), 1);
+        assert!(!pending.get(), "native hand-off resumes after Ended dispatch");
+        cx.update_window(window.into(), |_, window, cx| {
+            assert!(cx.has_active_drag(), "old Ended must preserve the replacement drag");
+            assert!(window.start_keyboard_external_drag(cx));
+        })
+        .unwrap();
+        let mut native = native;
+        native.simulate_input(super::PlatformInput::FileDrop(
+            super::FileDropEvent::Entered {
+                position: gpui::point(gpui::px(10.), gpui::px(10.)),
+                paths: gpui::ExternalPaths(
+                    [std::path::PathBuf::from("/tmp/replacement-drag")]
+                        .into_iter()
+                        .collect(),
+                ),
+            },
+        ));
+        cx.update(|cx| {
+            assert_eq!(cx.active_drag_cursor_style(), Some(CursorStyle::Crosshair));
+        });
+        assert_eq!(resolved.get(), 1, "the refused hand-off keeps its resolved payload");
+        event_loop
+            .dispatch(std::time::Duration::ZERO, &mut ())
+            .unwrap();
+        assert_eq!(delivered.get(), 1, "Ended must be delivered only once");
+    }
 
     fn tracker(mouse: Option<u32>, key: Option<u32>) -> SerialTracker {
         let mut serials = SerialTracker::new();

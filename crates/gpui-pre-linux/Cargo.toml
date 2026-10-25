@@ -272,6 +272,13 @@ version = "0.8"
 optional = true
 default-features = false
 
+[target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dev-dependencies.gpui]
+path = "../gpui-pre"
+version = "=0.3.9"
+features = ["test-support"]
+default-features = false
+package = "gpui-pre"
+
 [lints.clippy]
 dbg_macro = "deny"
 declare_interior_mutable_const = "deny"

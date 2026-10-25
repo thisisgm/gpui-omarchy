@@ -65,6 +65,8 @@ pub(crate) struct TestWindowState {
     external_drag_payloads: Vec<crate::ExternalDragPayload>,
     keyboard_drag_payloads: Vec<crate::ExternalDragPayload>,
     cancelled_drags: usize,
+    cancel_external_drag_handler: Option<Box<dyn FnMut(&TestWindow) -> bool>>,
+    external_drag_ready_handler: Option<Rc<dyn Fn() -> bool>>,
     start_external_drag_result: bool,
 }
 
@@ -148,6 +150,8 @@ impl TestWindow {
             external_drag_payloads: Vec::new(),
             keyboard_drag_payloads: Vec::new(),
             cancelled_drags: 0,
+            cancel_external_drag_handler: None,
+            external_drag_ready_handler: None,
             start_external_drag_result: false,
         })))
     }
@@ -387,6 +391,16 @@ impl TestWindow {
 
     pub fn set_start_external_drag_result(&self, result: bool) {
         self.0.lock().start_external_drag_result = result;
+    }
+
+    /// Installs platform-specific cancellation delivery for native drag regression tests.
+    pub fn set_cancel_external_drag_handler(&self, handler: impl FnMut(&TestWindow) -> bool + 'static) {
+        self.0.lock().cancel_external_drag_handler = Some(Box::new(handler));
+    }
+
+    /// Simulates a platform waiting for an earlier drag's completion dispatch.
+    pub fn set_external_drag_ready_handler(&self, handler: impl Fn() -> bool + 'static) {
+        self.0.lock().external_drag_ready_handler = Some(Rc::new(handler));
     }
 }
 
@@ -703,7 +717,8 @@ impl PlatformWindow for TestWindow {
     }
 
     fn can_start_external_drag(&self) -> bool {
-        true
+        let handler = self.0.lock().external_drag_ready_handler.clone();
+        handler.is_none_or(|handler| handler())
     }
 
     fn start_external_drag(&self, payload: &crate::ExternalDragPayload) -> bool {
@@ -715,19 +730,32 @@ impl PlatformWindow for TestWindow {
                 state.external_drag_files.extend_from_slice(paths.entries());
             }
         }
-        state.start_external_drag_result
+        let result = state.start_external_drag_result;
+        drop(state);
+        result && self.can_start_external_drag()
     }
 
     fn start_keyboard_external_drag(&self, payload: &crate::ExternalDragPayload) -> bool {
         let mut state = self.0.lock();
         state.keyboard_drag_payloads.push(payload.clone());
-        state.start_external_drag_result
+        let result = state.start_external_drag_result;
+        drop(state);
+        result && self.can_start_external_drag()
     }
 
     fn cancel_external_drag(&self) -> bool {
         let mut state = self.0.lock();
         state.cancelled_drags += 1;
-        state.start_external_drag_result
+        let result = state.start_external_drag_result;
+        let handler = state.cancel_external_drag_handler.take();
+        drop(state);
+        if let Some(mut handler) = handler {
+            let result = handler(self);
+            self.0.lock().cancel_external_drag_handler = Some(handler);
+            result
+        } else {
+            result
+        }
     }
 
     fn update_ime_position(&self, _bounds: Bounds<Pixels>) {}

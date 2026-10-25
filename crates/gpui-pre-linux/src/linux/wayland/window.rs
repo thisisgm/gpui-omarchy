@@ -2327,7 +2327,7 @@ impl PlatformWindow for WaylandWindow {
     }
 
     fn can_start_external_drag(&self) -> bool {
-        true
+        self.borrow().client.can_start_external_drag()
     }
 
     fn start_external_drag(&self, payload: &ExternalDragPayload) -> bool {
