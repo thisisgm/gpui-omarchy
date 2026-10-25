@@ -63,6 +63,8 @@ pub(crate) struct TestWindowState {
     appearance: WindowAppearance,
     external_drag_files: Vec<(PathBuf, bool)>,
     external_drag_payloads: Vec<crate::ExternalDragPayload>,
+    keyboard_drag_payloads: Vec<crate::ExternalDragPayload>,
+    cancelled_drags: usize,
     start_external_drag_result: bool,
 }
 
@@ -144,6 +146,8 @@ impl TestWindow {
             appearance: WindowAppearance::Light,
             external_drag_files: Vec::new(),
             external_drag_payloads: Vec::new(),
+            keyboard_drag_payloads: Vec::new(),
+            cancelled_drags: 0,
             start_external_drag_result: false,
         })))
     }
@@ -371,6 +375,14 @@ impl TestWindow {
 
     pub fn external_drag_files(&self) -> Vec<(PathBuf, bool)> {
         self.0.lock().external_drag_files.clone()
+    }
+
+    pub fn cancelled_drags(&self) -> usize {
+        self.0.lock().cancelled_drags
+    }
+
+    pub fn keyboard_drag_payloads(&self) -> Vec<crate::ExternalDragPayload> {
+        self.0.lock().keyboard_drag_payloads.clone()
     }
 
     pub fn set_start_external_drag_result(&self, result: bool) {
@@ -703,6 +715,18 @@ impl PlatformWindow for TestWindow {
                 state.external_drag_files.extend_from_slice(paths.entries());
             }
         }
+        state.start_external_drag_result
+    }
+
+    fn start_keyboard_external_drag(&self, payload: &crate::ExternalDragPayload) -> bool {
+        let mut state = self.0.lock();
+        state.keyboard_drag_payloads.push(payload.clone());
+        state.start_external_drag_result
+    }
+
+    fn cancel_external_drag(&self) -> bool {
+        let mut state = self.0.lock();
+        state.cancelled_drags += 1;
         state.start_external_drag_result
     }
 

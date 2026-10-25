@@ -432,6 +432,37 @@ pub(crate) struct WaylandClientState {
 
 type DragState = super::drag::DragState<DataOffer<WlDataOffer>, WaylandWindowStatePtr>;
 
+/// What lifted a native drag: a held left button, or a key with the pointer left where it is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DragOrigin {
+    Pointer,
+    Keyboard,
+}
+
+/// The serial a drag starts with, or None when this origin may not start one now: a pointer drag needs the left
+/// button held over the window and uses its press serial; a keyboard drag needs no button held, keyboard focus
+/// and the pointer over the window, and uses the newest key or pointer press serial.
+pub(crate) fn drag_serial(
+    origin: DragOrigin,
+    button: Option<MouseButton>,
+    pointer_here: bool,
+    keys_here: bool,
+    busy: bool,
+    serials: &SerialTracker,
+) -> Option<u32> {
+    if busy || !pointer_here {
+        return None;
+    }
+    match origin {
+        DragOrigin::Pointer => (button == Some(MouseButton::Left))
+            .then(|| serials.get(SerialKind::MousePress).as_raw()),
+        DragOrigin::Keyboard if button.is_none() && keys_here => {
+            serials.selection_serial().map(|serial| serial.as_raw())
+        }
+        DragOrigin::Keyboard => None,
+    }
+}
+
 pub(crate) struct ExternalDrag {
     source: wl_data_source::WlDataSource,
     window: WaylandWindowStatePtr,
@@ -592,6 +623,63 @@ impl WaylandClientStatePtr {
         surface: &wl_surface::WlSurface,
         payload: &ExternalDragPayload,
     ) -> bool {
+        self.start_drag_session(surface, payload, DragOrigin::Pointer)
+    }
+
+    /// A keyboard-origin drag: no button held, the pointer resting over this window, started with the newest
+    /// key or pointer press serial. Whether a compositor accepts that serial for wl_data_device.start_drag is
+    /// the compositor's to decide; a refusal arrives as the source's cancelled event.
+    pub fn start_keyboard_external_drag(
+        &self,
+        surface: &wl_surface::WlSurface,
+        payload: &ExternalDragPayload,
+    ) -> bool {
+        self.start_drag_session(surface, payload, DragOrigin::Keyboard)
+    }
+
+    /// Ends this surface's live drag source as the source's own Cancelled event would: the session reports
+    /// Cancelled, the source is destroyed and the window hears FileDropEvent::Ended. Whether the compositor then
+    /// ends its pointer-side drag at once is the compositor's (wl_data_source.destroy during a drag).
+    pub fn cancel_external_drag(&self, surface: &wl_surface::WlSurface) -> bool {
+        let client = self.get_client();
+        let mut state = client.borrow_mut();
+        let Some(window) = get_window(&mut state, &surface.id()) else {
+            return false;
+        };
+        if !state
+            .external_drag
+            .as_ref()
+            .is_some_and(|drag| drag.window.ptr_eq(&window))
+        {
+            return false;
+        }
+        let drag = state.external_drag.take().unwrap();
+        crate::linux::transfer::notify_drag(
+            &state.common,
+            gpui::NativeDragEvent {
+                source_id: drag.source_id,
+                action: drag.action,
+                phase: gpui::NativeDragPhase::Cancelled,
+            },
+        );
+        if let Some(source) = drag.source.data::<SourceData>() {
+            source
+                .cancel
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        drag.source.destroy();
+        drop(state);
+        drag.window
+            .handle_input(PlatformInput::FileDrop(FileDropEvent::Ended));
+        true
+    }
+
+    fn start_drag_session(
+        &self,
+        surface: &wl_surface::WlSurface,
+        payload: &ExternalDragPayload,
+        origin: DragOrigin,
+    ) -> bool {
         let client = self.get_client();
         let mut state = client.borrow_mut();
 
@@ -606,15 +694,24 @@ impl WaylandClientStatePtr {
             return false;
         };
 
-        if state.button_pressed != Some(MouseButton::Left)
-            || state
-                .mouse_focused_window
-                .as_ref()
-                .is_none_or(|focused| !focused.ptr_eq(&window))
-            || state.external_drag.is_some()
-        {
+        let pointer_here = state
+            .mouse_focused_window
+            .as_ref()
+            .is_some_and(|focused| focused.ptr_eq(&window));
+        let keys_here = state
+            .keyboard_focused_window
+            .as_ref()
+            .is_some_and(|focused| focused.ptr_eq(&window));
+        let Some(serial) = drag_serial(
+            origin,
+            state.button_pressed,
+            pointer_here,
+            keys_here,
+            state.external_drag.is_some(),
+            &state.serial_tracker,
+        ) else {
             return false;
-        }
+        };
         let legacy = matches!(payload, ExternalDragPayload::Files(_));
         let (payload, actions, source_id) = match payload {
             ExternalDragPayload::Files(paths) => {
@@ -665,7 +762,6 @@ impl WaylandClientStatePtr {
         {
             return false;
         }
-        let serial = state.serial_tracker.get(SerialKind::MousePress);
         let source = data_device_manager.create_data_source(
             &state.globals.qh,
             SourceData {
@@ -710,7 +806,7 @@ impl WaylandClientStatePtr {
             source.destroy();
             return false;
         }
-        data_device.start_drag(Some(&source), surface, None, serial.as_raw());
+        data_device.start_drag(Some(&source), surface, None, serial);
         state.drag.native_started();
         state.external_drag = Some(ExternalDrag {
             source,
@@ -3628,5 +3724,46 @@ impl WaylandClientStatePtr {
             }));
         }
         client.borrow_mut().drag.submit(generation, accepted);
+    }
+}
+
+#[cfg(test)]
+mod drag_origin_tests {
+    use super::{drag_serial, DragOrigin, MouseButton, SerialKind, SerialTracker};
+
+    fn tracker(mouse: Option<u32>, key: Option<u32>) -> SerialTracker {
+        let mut serials = SerialTracker::new();
+        if let Some(mouse) = mouse {
+            serials.update(SerialKind::MousePress, mouse);
+        }
+        if let Some(key) = key {
+            serials.update(SerialKind::KeyPress, key);
+        }
+        serials
+    }
+
+    #[test]
+    fn pointer_drag_keeps_the_held_button_rule_and_press_serial() {
+        let serials = tracker(Some(7), Some(9));
+        let left = Some(MouseButton::Left);
+        assert_eq!(drag_serial(DragOrigin::Pointer, left, true, true, false, &serials), Some(7));
+        assert_eq!(drag_serial(DragOrigin::Pointer, None, true, true, false, &serials), None);
+        assert_eq!(drag_serial(DragOrigin::Pointer, left, false, true, false, &serials), None);
+        assert_eq!(drag_serial(DragOrigin::Pointer, left, true, true, true, &serials), None);
+    }
+
+    #[test]
+    fn keyboard_drag_needs_no_button_and_uses_the_newest_press_serial() {
+        let key_last = tracker(Some(7), Some(9));
+        assert_eq!(drag_serial(DragOrigin::Keyboard, None, true, true, false, &key_last), Some(9));
+        let mut mouse_last = tracker(Some(7), Some(9));
+        mouse_last.update(SerialKind::MousePress, 11);
+        assert_eq!(drag_serial(DragOrigin::Keyboard, None, true, true, false, &mouse_last), Some(11));
+        let left = Some(MouseButton::Left);
+        assert_eq!(drag_serial(DragOrigin::Keyboard, left, true, true, false, &key_last), None);
+        assert_eq!(drag_serial(DragOrigin::Keyboard, None, true, false, false, &key_last), None);
+        assert_eq!(drag_serial(DragOrigin::Keyboard, None, false, true, false, &key_last), None);
+        assert_eq!(drag_serial(DragOrigin::Keyboard, None, true, true, true, &key_last), None);
+        assert_eq!(drag_serial(DragOrigin::Keyboard, None, true, true, false, &tracker(None, None)), None);
     }
 }

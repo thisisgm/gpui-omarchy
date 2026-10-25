@@ -1445,6 +1445,14 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn start_external_drag(&self, _payload: &ExternalDragPayload) -> bool {
         false
     }
+    /// Starts a native drag with no pointer button held, for a keyboard-origin lift; the pointer does not move.
+    fn start_keyboard_external_drag(&self, _payload: &ExternalDragPayload) -> bool {
+        false
+    }
+    /// Cancels this window's live native drag, as the user's Escape; false when it holds none.
+    fn cancel_external_drag(&self) -> bool {
+        false
+    }
     fn start_window_resize(&self, _edge: ResizeEdge) {}
     fn set_exclusive_zone(&self, _zone: Pixels) {}
     #[cfg(all(target_os = "linux", feature = "wayland"))]

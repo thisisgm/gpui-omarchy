@@ -2335,6 +2335,16 @@ impl PlatformWindow for WaylandWindow {
         state.client.start_external_drag(&state.surface, payload)
     }
 
+    fn start_keyboard_external_drag(&self, payload: &ExternalDragPayload) -> bool {
+        let state = self.borrow();
+        state.client.start_keyboard_external_drag(&state.surface, payload)
+    }
+
+    fn cancel_external_drag(&self) -> bool {
+        let state = self.borrow();
+        state.client.cancel_external_drag(&state.surface)
+    }
+
     fn start_window_resize(&self, edge: gpui::ResizeEdge) {
         let state = self.borrow();
         if let Some(toplevel) = state.surface_state.toplevel() {

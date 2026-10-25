@@ -2930,6 +2930,25 @@ impl App {
         self.active_drag.as_ref().and_then(|drag| drag.cursor_style)
     }
 
+    /// Starts an in-app drag of `value` without a pointer gesture, drawn by `view` at `cursor_offset` from the pointer.
+    /// A later drop dispatches to `on_drop::<T>` exactly as a pointer drag's does; `external_payload` is what
+    /// [`Window::start_keyboard_external_drag`] or a pointer leaving the window hands the platform.
+    pub fn start_drag<T: 'static, W: Render>(
+        &mut self,
+        value: T,
+        view: Entity<W>,
+        cursor_offset: Point<Pixels>,
+        external_payload: Option<ExternalDragPayloadSource>,
+    ) {
+        self.active_drag = Some(AnyDrag {
+            view: view.into(),
+            value: Arc::new(value),
+            cursor_offset,
+            cursor_style: None,
+            external_payload_source: external_payload,
+        });
+    }
+
     /// Stops active drag and clears any related effects.
     pub fn stop_active_drag(&mut self, window: &mut Window) -> bool {
         if self.active_drag.is_some() {
