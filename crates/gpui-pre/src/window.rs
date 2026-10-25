@@ -10,10 +10,10 @@ use crate::{
     Capslock, Context, Corners, CursorHideMode, CursorStyle, Decorations, DevicePixels,
     DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity,
     EntityId, EventEmitter, FileDropEvent, FontId, FrameFeedbackEvent, Global, GlobalElementId,
-    GlyphId, GpuSpecs, Hsla, InputHandler, InputPreference, IsZero, KeyBinding, KeyContext,
-    KeyDownEvent, KeyEvent, Keystroke, KeystrokeEvent, LayoutId, LineLayout, LineLayoutIndex,
-    Modifiers, ModifiersChangedEvent, MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent,
-    MouseUpEvent, Path, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput,
+    GlyphId, GpuCompletion, GpuSpecs, Hsla, InputHandler, InputPreference, IsZero, KeyBinding,
+    KeyContext, KeyDownEvent, KeyEvent, Keystroke, KeystrokeEvent, LayoutId, LineLayout,
+    LineLayoutIndex, Modifiers, ModifiersChangedEvent, MonochromeSprite, MouseButton, MouseEvent,
+    MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput,
     PlatformInputHandler, PlatformWindow, Point, PolychromeSprite, PresentedFrames, Priority,
     PromptButton, PromptLevel, Quad, Render, RenderGlyphParams, RenderImage, RenderImageParams,
     RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X,
@@ -1279,6 +1279,9 @@ pub struct Window {
     pub(crate) frame_presented_observers: SubscriberSet<(), AnyObserver>,
     frame_presented_hooked: bool,
     frame_feedback_hooked: bool,
+    gpu_completion_hooked: bool,
+    gpu_completion_observers:
+        SubscriberSet<(), Box<dyn FnMut(GpuCompletion, &mut Window, &mut App) -> bool>>,
     frame_feedback_observers:
         SubscriberSet<(), Box<dyn FnMut(FrameFeedbackEvent, &mut Window, &mut App) -> bool>>,
     active: Rc<Cell<bool>>,
@@ -2185,6 +2188,8 @@ impl Window {
             frame_presented_observers: SubscriberSet::new(),
             frame_presented_hooked: false,
             frame_feedback_hooked: false,
+            gpu_completion_hooked: false,
+            gpu_completion_observers: SubscriberSet::new(),
             frame_feedback_observers: SubscriberSet::new(),
             active,
             visibility,
@@ -2489,6 +2494,10 @@ impl Window {
     pub fn remove_window(&mut self) {
         self.removed = true;
         self.frame_feedback_observers
+            .remove(&())
+            .into_iter()
+            .for_each(drop);
+        self.gpu_completion_observers
             .remove(&())
             .into_iter()
             .for_each(drop);
@@ -3104,6 +3113,53 @@ impl Window {
         );
         activate();
         Some(subscription)
+    }
+
+    /// Observes per-frame GPU completion. Returns `None` where the backend has no frame feedback; the fence watcher runs only while observed.
+    pub fn observe_gpu_completion(
+        &mut self,
+        cx: &App,
+        mut callback: impl FnMut(GpuCompletion, &mut Window, &mut App) + 'static,
+    ) -> Option<Subscription> {
+        if self.removed || !self.platform_window.frame_feedback_supported() {
+            return None;
+        }
+        if !self.gpu_completion_hooked {
+            self.gpu_completion_hooked = true;
+            let handle = self.handle;
+            let mut cx = cx.to_async();
+            self.platform_window
+                .on_gpu_completion(Some(Box::new(move |completion| {
+                    let _ = handle.update(&mut cx, |_, window, cx| {
+                        window.gpu_completion(completion, cx);
+                    });
+                })));
+        }
+        let (subscription, activate) = self.gpu_completion_observers.insert(
+            (),
+            Box::new(move |completion, window, cx| {
+                callback(completion, window, cx);
+                true
+            }),
+        );
+        activate();
+        Some(subscription)
+    }
+
+    fn gpu_completion(&mut self, completion: GpuCompletion, cx: &mut App) {
+        let mut live = 0;
+        self.gpu_completion_observers
+            .clone()
+            .retain(&(), |callback| {
+                let keep = !self.removed && callback(completion, self, cx);
+                live += usize::from(keep);
+                keep
+            });
+        // The last observer left, so the platform stops tracking frames until someone observes again.
+        if live == 0 && self.gpu_completion_hooked {
+            self.gpu_completion_hooked = false;
+            self.platform_window.on_gpu_completion(None);
+        }
     }
 
     fn frame_feedback(&mut self, event: FrameFeedbackEvent, cx: &mut App) {

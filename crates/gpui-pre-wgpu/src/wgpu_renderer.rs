@@ -262,6 +262,12 @@ pub struct WgpuRenderer {
     observed_error_generation: u64,
     last_surface_error: Option<String>,
     needs_redraw: bool,
+    /// The device's shared fence watcher, taken on first use and again after device recovery.
+    #[cfg(not(target_family = "wasm"))]
+    gpu_fence: Option<(Arc<crate::gpu_fence::GpuFence>, Arc<wgpu::Device>)>,
+    /// This window's GPU completions, which outlive any one device's watcher.
+    #[cfg(not(target_family = "wasm"))]
+    gpu_completions: Arc<crate::GpuCompletionSink>,
 }
 
 impl WgpuRenderer {
@@ -523,6 +529,10 @@ impl WgpuRenderer {
             observed_error_generation: 0,
             last_surface_error: None,
             needs_redraw: false,
+            #[cfg(not(target_family = "wasm"))]
+            gpu_fence: None,
+            #[cfg(not(target_family = "wasm"))]
+            gpu_completions: Arc::default(),
         })
     }
 }
@@ -2240,6 +2250,41 @@ impl WgpuRenderer {
     /// Returns true if the GPU device was lost and recovery is needed.
     pub fn device_lost(&self) -> bool {
         self.device_errors.device_lost()
+    }
+
+    /// Watches the GPU work submitted so far, which includes a frame [`Self::draw`] just presented.
+    #[cfg(not(target_family = "wasm"))]
+    pub fn track_gpu_completion(
+        &mut self,
+        frame_id: u64,
+        submitted_at: std::time::Duration,
+        clock: crate::FenceClock,
+        wake: Arc<dyn Fn() + Send + Sync>,
+    ) {
+        let Some(core) = self.core() else {
+            return;
+        };
+        let device = Arc::clone(&core.resources().device);
+        let queue = Arc::clone(&core.resources().queue);
+        if !matches!(&self.gpu_fence, Some((_, watched)) if Arc::ptr_eq(watched, &device)) {
+            // Frames an old watcher still holds resolve, go stale or are reported unobserved when it drops.
+            self.gpu_fence = match crate::gpu_fence::fence_for(&device, clock) {
+                Ok(fence) => Some((fence, device)),
+                Err(error) => {
+                    warn!("GPU completion watcher could not start: {error}");
+                    None
+                }
+            };
+        }
+        if let Some((fence, _)) = &self.gpu_fence {
+            fence.track(&queue, frame_id, submitted_at, &self.gpu_completions, wake);
+        }
+    }
+
+    /// GPU completions observed since the last drain, and how many were dropped unretained.
+    #[cfg(not(target_family = "wasm"))]
+    pub fn drain_gpu_completions(&self) -> (Vec<gpui::GpuCompletion>, usize) {
+        self.gpu_completions.drain()
     }
 
     /// Returns true if a redraw is needed because GPU state was cleared.

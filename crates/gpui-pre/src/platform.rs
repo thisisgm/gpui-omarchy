@@ -1114,6 +1114,21 @@ pub enum FrameFeedbackEvent {
     Terminal(FrameTerminal),
 }
 
+/// When the GPU finished one committed frame's work, bracketed on a clock the platform names; never a submit or present time.
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub struct GpuCompletion {
+    /// The successful commit ID, in the same namespace as [`FrameTerminal::frame_id`].
+    pub frame_id: u64,
+    /// When the backend returned from submitting and presenting this frame.
+    pub submitted_at: Duration,
+    /// A watcher poll that started after registration missed the fence at this time, or `None` where none did.
+    pub not_before: Option<Duration>,
+    /// The fence was seen signalled at this time, or `None` if completion was never observed.
+    pub completed_at: Option<Duration>,
+    /// The `clockid_t` of every timestamp here.
+    pub clock_id: u32,
+}
+
 /// Preserves the first platform frame request time across coalesced notifications.
 ///
 /// Producers may record from a platform thread without waiting for the UI thread.
@@ -1367,6 +1382,8 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     }
     /// Registers terminal feedback, outside platform state borrows. Submitted receipts are returned by [`Self::draw_with_feedback`] before terminal callbacks can run.
     fn on_frame_terminal(&self, _callback: Box<dyn FnMut(FrameTerminal)>) {}
+    /// Starts (`Some`) or stops (`None`) per-frame GPU completion; backends without a fence watcher never call it.
+    fn on_gpu_completion(&self, _callback: Option<Box<dyn FnMut(GpuCompletion)>>) {}
     fn schedule_frame(&self) {}
     /// Presentation feedback, or `None` where the platform or compositor reports none.
     fn presented_frames(&self) -> Option<PresentedFrames> {

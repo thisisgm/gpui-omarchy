@@ -4,7 +4,7 @@ use std::{
     ptr::NonNull,
     rc::Rc,
     sync::Arc,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use calloop::ping::Ping;
@@ -40,16 +40,16 @@ use crate::linux::wayland::{
 use crate::linux::{Globals, Output, WaylandClientStatePtr, get_window};
 use gpui::{
     AnyWindowHandle, Bounds, Capslock, Decorations, DevicePixels, ExternalDragPayload,
-    FrameRequestSource, FrameTerminal, GpuSpecs, Modifiers, Pixels, PlatformAtlas, PlatformDisplay,
-    PlatformFrameSignal, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
-    PresentedFrames, PromptButton, PromptLevel, RequestFrameOptions, ResizeEdge, Scene, Size,
-    Tiling, WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea,
+    FrameRequestSource, FrameTerminal, GpuCompletion, GpuSpecs, Modifiers, Pixels, PlatformAtlas,
+    PlatformDisplay, PlatformFrameSignal, PlatformInput, PlatformInputHandler, PlatformWindow,
+    Point, PresentedFrames, PromptButton, PromptLevel, RequestFrameOptions, ResizeEdge, Scene,
+    Size, Tiling, WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea,
     WindowControls, WindowDecorations, WindowKind, WindowParams, WindowVisibility,
     layer_shell::{Anchor, LayerShellNotSupportedError},
     popup::PopupOptions,
     px, size,
 };
-use gpui_wgpu::{CompositorGpuHint, WgpuRenderer, WgpuSurfaceConfig, wgpu};
+use gpui_wgpu::{CompositorGpuHint, FenceClock, WgpuRenderer, WgpuSurfaceConfig, wgpu};
 
 #[derive(Default)]
 pub(crate) struct Callbacks {
@@ -67,6 +67,21 @@ pub(crate) struct Callbacks {
     button_layout_changed: Option<Box<dyn FnMut()>>,
     frame_presented: Option<Box<dyn FnMut()>>,
     frame_terminal: Option<Rc<RefCell<Box<dyn FnMut(FrameTerminal)>>>>,
+    gpu_completion: Option<Rc<RefCell<Box<dyn FnMut(GpuCompletion)>>>>,
+}
+
+/// CLOCK_MONOTONIC now, the clock presentation feedback and GPU completion share.
+fn monotonic() -> Duration {
+    let mut time = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: clock_gettime fills the struct it is given.
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut time) };
+    Duration::new(
+        time.tv_sec.max(0) as u64,
+        time.tv_nsec.clamp(0, 999_999_999) as u32,
+    )
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1162,7 +1177,25 @@ impl WaylandWindowStatePtr {
         }
     }
 
+    /// Delivers GPU completions the fence watcher queued; its ping lands here.
+    fn deliver_gpu_completions(&self) {
+        let (completions, lost) = match &self.state.borrow().renderer {
+            Some(renderer) => renderer.drain_gpu_completions(),
+            None => return,
+        };
+        if lost > 0 {
+            log::debug!("dropped {lost} unretained GPU completions");
+        }
+        let callback = self.callbacks.borrow().gpu_completion.clone();
+        if let Some(callback) = callback {
+            for completion in completions {
+                callback.borrow_mut()(completion);
+            }
+        }
+    }
+
     pub fn scheduled_frame_fired(&self) {
+        self.deliver_gpu_completions();
         if self.frame_loop.get() == FrameLoop::Scheduled {
             self.frame(
                 self.scheduled_frame_at.take(),
@@ -2169,6 +2202,11 @@ impl PlatformWindow for WaylandWindow {
         self.0.callbacks.borrow_mut().frame_terminal = Some(Rc::new(RefCell::new(callback)));
     }
 
+    fn on_gpu_completion(&self, callback: Option<Box<dyn FnMut(GpuCompletion)>>) {
+        self.0.callbacks.borrow_mut().gpu_completion =
+            callback.map(|callback| Rc::new(RefCell::new(callback)));
+    }
+
     fn draw_with_feedback(&self, scene: &Scene) -> Option<u64> {
         let mut state = self.borrow_mut();
         let state = &mut *state;
@@ -2218,6 +2256,20 @@ impl PlatformWindow for WaylandWindow {
         let receipt = state
             .presented_frames
             .finish_present(presented, frame_feedback);
+        if let (true, Some(frame_id)) = (presented, receipt)
+            && self.0.callbacks.borrow().gpu_completion.is_some()
+        {
+            let ping = self.0.frame_ping.clone();
+            renderer.track_gpu_completion(
+                frame_id,
+                monotonic(),
+                FenceClock {
+                    now: monotonic,
+                    clock_id: libc::CLOCK_MONOTONIC as u32,
+                },
+                Arc::new(move || ping.ping()),
+            );
+        }
         if presented {
             state.presentation = PresentationState::Presented;
             self.0.frame_loop.set(FrameLoop::AwaitingCallback);
