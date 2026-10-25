@@ -723,6 +723,7 @@ impl PlatformWindow for TestWindow {
 
     fn start_external_drag(&self, payload: &crate::ExternalDragPayload) -> bool {
         let mut state = self.0.lock();
+        // Capture the immutable image with its payload, including refused promotion attempts.
         state.external_drag_payloads.push(payload.clone());
         match payload {
             crate::ExternalDragPayload::Mime(_) => (),

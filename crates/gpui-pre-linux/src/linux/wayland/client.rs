@@ -1,3 +1,7 @@
+#[path = "drag_icon.rs"]
+mod drag_icon;
+use drag_icon::DragIcon;
+
 use std::{
     cell::{Cell, RefCell, RefMut},
     hash::Hash,
@@ -401,6 +405,7 @@ pub(crate) struct WaylandClientState {
     drag: DragState,
     external_drag: Option<ExternalDrag>,
     pending_drag_end: Rc<Cell<bool>>,
+    retired_drag_icons: Vec<DragIcon>,
     click: ClickState,
     repeat: KeyRepeat,
     pub modifiers: Modifiers,
@@ -466,6 +471,7 @@ pub(crate) fn drag_serial(
 
 pub(crate) struct ExternalDrag {
     source: wl_data_source::WlDataSource,
+    icon: Option<DragIcon>,
     window: WaylandWindowStatePtr,
     source_id: u64,
     action: Option<gpui::NativeDragAction>,
@@ -658,7 +664,7 @@ impl WaylandClientStatePtr {
         {
             return false;
         }
-        let drag = state.external_drag.take().unwrap();
+        let mut drag = state.external_drag.take().unwrap();
         crate::linux::transfer::notify_drag(
             &state.common,
             gpui::NativeDragEvent {
@@ -673,6 +679,7 @@ impl WaylandClientStatePtr {
                 .store(true, std::sync::atomic::Ordering::Release);
         }
         drag.source.destroy();
+        state.retire_drag_icon(drag.icon.take());
         let loop_handle = state.loop_handle.clone();
         let pending_drag_end = state.pending_drag_end.clone();
         drop(state);
@@ -720,6 +727,10 @@ impl WaylandClientStatePtr {
         ) else {
             return false;
         };
+        // An image never costs the drag: past the retired-icon cap the files go without one.
+        let image = payload
+            .image()
+            .filter(|_| drag_icon::icon_allowed(state.retired_drag_icons.len()));
         let legacy = matches!(payload, ExternalDragPayload::Files(_));
         let (payload, actions, source_id) = match payload {
             ExternalDragPayload::Files(paths) => {
@@ -814,10 +825,29 @@ impl WaylandClientStatePtr {
             source.destroy();
             return false;
         }
-        data_device.start_drag(Some(&source), surface, None, serial);
+        let icon = match image
+            .map(|image| DragIcon::new(&state.globals, image))
+            .transpose()
+        {
+            Ok(icon) => icon,
+            Err(error) => {
+                log::error!("Unable to create native drag image: {error}");
+                None
+            }
+        };
+        data_device.start_drag(
+            Some(&source),
+            surface,
+            icon.as_ref().map(DragIcon::surface),
+            serial,
+        );
+        if let Some(icon) = &icon {
+            icon.surface().commit();
+        }
         state.drag.native_started();
         state.external_drag = Some(ExternalDrag {
             source,
+            icon,
             window,
             source_id,
             action: None,
@@ -896,6 +926,28 @@ impl WaylandClientStatePtr {
         let client = self.get_client();
         let mut state = client.borrow_mut();
         let closed_window = state.windows.remove(surface_id).unwrap();
+        if state
+            .external_drag
+            .as_ref()
+            .is_some_and(|drag| drag.window.ptr_eq(&closed_window))
+        {
+            let mut drag = state.external_drag.take().unwrap();
+            if let Some(source) = drag.source.data::<SourceData>() {
+                source
+                    .cancel
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
+            drag.source.destroy();
+            state.retire_drag_icon(drag.icon.take());
+            crate::linux::transfer::notify_drag(
+                &state.common,
+                gpui::NativeDragEvent {
+                    source_id: drag.source_id,
+                    action: drag.action,
+                    phase: gpui::NativeDragPhase::Cancelled,
+                },
+            );
+        }
         if let Some(window) = state.mouse_focused_window.take()
             && !window.ptr_eq(&closed_window)
         {
@@ -915,6 +967,15 @@ impl WaylandClientStatePtr {
 }
 
 impl WaylandClientState {
+    fn retire_drag_icon(&mut self, icon: Option<DragIcon>) {
+        if let Some(mut icon) = icon {
+            icon.finish();
+            if !icon.done() {
+                self.retired_drag_icons.push(icon);
+            }
+        }
+    }
+
     fn hide_cursor_until_mouse_moves(&mut self) {
         if self.cursor_hidden_window.is_some() {
             return;
@@ -987,6 +1048,16 @@ impl Drop for WaylandConnection {
         }
 
         let mut state = self.0.borrow_mut();
+        if let Some(mut drag) = state.external_drag.take() {
+            if let Some(source) = drag.source.data::<SourceData>() {
+                source
+                    .cancel
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
+            drag.source.destroy();
+            state.retire_drag_icon(drag.icon.take());
+        }
+        state.retired_drag_icons.clear();
         state.windows.clear();
 
         if let Some(wl_pointer) = &state.wl_pointer {
@@ -1183,6 +1254,7 @@ impl WaylandConnection {
             drag: DragState::new(hyprland),
             external_drag: None,
             pending_drag_end: Rc::new(Cell::new(false)),
+            retired_drag_icons: Vec::new(),
             click: ClickState {
                 last_click: Instant::now(),
                 last_mouse_button: None,
@@ -1865,7 +1937,33 @@ delegate_noop!(WaylandClientStatePtr: ignore wl_data_device_manager::WlDataDevic
 delegate_noop!(WaylandClientStatePtr: ignore zwp_primary_selection_device_manager_v1::ZwpPrimarySelectionDeviceManagerV1);
 delegate_noop!(WaylandClientStatePtr: ignore wl_shm::WlShm);
 delegate_noop!(WaylandClientStatePtr: ignore wl_shm_pool::WlShmPool);
-delegate_noop!(WaylandClientStatePtr: ignore wl_buffer::WlBuffer);
+impl Dispatch<wl_buffer::WlBuffer, ()> for WaylandClientStatePtr {
+    fn event(
+        this: &mut Self,
+        buffer: &wl_buffer::WlBuffer,
+        event: wl_buffer::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if !matches!(event, wl_buffer::Event::Release) {
+            return;
+        }
+        let client = this.get_client();
+        let mut state = client.borrow_mut();
+        if let Some(icon) = state
+            .external_drag
+            .as_mut()
+            .and_then(|drag| drag.icon.as_mut())
+        {
+            icon.release(buffer);
+        }
+        for icon in &mut state.retired_drag_icons {
+            icon.release(buffer);
+        }
+        state.retired_drag_icons.retain(|icon| !icon.done());
+    }
+}
 delegate_noop!(WaylandClientStatePtr: ignore wl_region::WlRegion);
 delegate_noop!(WaylandClientStatePtr: ignore wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1);
 delegate_noop!(WaylandClientStatePtr: ignore zxdg_decoration_manager_v1::ZxdgDecorationManagerV1);
@@ -3278,7 +3376,8 @@ impl Dispatch<wl_data_source::WlDataSource, SourceData> for WaylandClientStatePt
                     phase,
                     gpui::NativeDragPhase::Finished | gpui::NativeDragPhase::Cancelled
                 ) {
-                    let drag = state.external_drag.take().unwrap();
+                    let mut drag = state.external_drag.take().unwrap();
+                    state.retire_drag_icon(drag.icon.take());
                     source
                         .cancel
                         .store(true, std::sync::atomic::Ordering::Release);

@@ -45,6 +45,7 @@ pub struct MimePayload {
     representations: Arc<[MimeRepresentation]>,
     intent: SelectionIntent,
     offered_types: Arc<[String]>,
+    pub(crate) drag_image: Option<crate::ExternalDragImage>,
 }
 
 impl MimePayload {
@@ -72,6 +73,7 @@ impl MimePayload {
             representations: unique.into(),
             intent,
             offered_types,
+            drag_image: None,
         }
     }
 

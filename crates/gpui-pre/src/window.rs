@@ -9588,8 +9588,125 @@ mod tests {
         assert_eq!(child_bounds.get().size, size(px(300.), px(200.)));
     }
 
+    // Keeps the regression executable on the accepted payload-only base; production methods win when present.
+    #[allow(dead_code)]
+    trait PayloadOnlyImageProbe: Sized {
+        fn with_image(
+            self,
+            _: std::sync::Arc<[u8]>,
+            _: u32,
+            _: u32,
+            _: u32,
+            _: (i32, i32),
+        ) -> Result<Self, &'static str> {
+            Ok(self)
+        }
+        fn image(&self) -> Option<&PayloadOnlyImage> {
+            None
+        }
+    }
+    impl PayloadOnlyImageProbe for ExternalDragPayload {}
+
+    #[allow(dead_code)]
+    struct PayloadOnlyImage;
+    #[allow(dead_code)]
+    impl PayloadOnlyImage {
+        fn rgba(&self) -> &std::sync::Arc<[u8]> {
+            unreachable!("base has no image")
+        }
+        fn width(&self) -> u32 {
+            unreachable!("base has no image")
+        }
+        fn height(&self) -> u32 {
+            unreachable!("base has no image")
+        }
+        fn scale(&self) -> u32 {
+            unreachable!("base has no image")
+        }
+        fn hotspot(&self) -> (i32, i32) {
+            unreachable!("base has no image")
+        }
+    }
+
+    fn drag_image_pixels() -> std::sync::Arc<[u8]> {
+        [255, 0, 0, 255, 0, 255, 0, 128, 0, 0, 255, 64, 0, 0, 0, 0].into()
+    }
+
+    #[test]
+    fn external_drag_image_limits_and_payload_only_compatibility() {
+        let payload =
+            || ExternalDragPayload::Files(FileDragPaths::new([(PathBuf::from("/file"), false)]));
+        assert!(
+            payload().image().is_none(),
+            "payload-only callers remain valid"
+        );
+        let pixels = drag_image_pixels();
+        for (width, height, scale, hotspot) in [
+            (0, 2, 1, (0, 0)),
+            (2, 0, 1, (0, 0)),
+            (1025, 2, 1, (0, 0)),
+            (2, 1025, 1, (0, 0)),
+            (2, 2, 0, (0, 0)),
+            (2, 2, 9, (0, 0)),
+            (2, 2, 1, (-1, 0)),
+            (2, 2, 1, (0, -1)),
+            (2, 2, 1, (2, 0)),
+            (2, 2, 1, (0, 2)),
+            (2, 2, 2, (1, 0)),
+            (u32::MAX, u32::MAX, 1, (0, 0)),
+        ] {
+            assert!(
+                payload()
+                    .with_image(pixels.clone(), width, height, scale, hotspot)
+                    .is_err(),
+                "invalid drag image accepted: {width}x{height} scale={scale} hotspot={hotspot:?}"
+            );
+        }
+        assert!(
+            payload()
+                .with_image(vec![0; 15].into(), 2, 2, 1, (0, 0))
+                .is_err()
+        );
+        assert!(
+            payload()
+                .with_image(vec![0; 17].into(), 2, 2, 1, (0, 0))
+                .is_err()
+        );
+        let image_payload = payload()
+            .with_image(pixels.clone(), 2, 2, 2, (0, 0))
+            .unwrap();
+        let image = image_payload
+            .image()
+            .expect("image must survive payload construction");
+        assert!(std::sync::Arc::ptr_eq(image.rgba(), &pixels));
+        assert_eq!(
+            (
+                image.width(),
+                image.height(),
+                image.scale(),
+                image.hotspot()
+            ),
+            (2, 2, 2, (0, 0))
+        );
+        let mime = ExternalDragPayload::Mime(crate::NativeDragPayload {
+            data: crate::MimePayload::new(
+                [crate::MimeRepresentation::new(
+                    "text/plain",
+                    b"file".as_slice(),
+                )],
+                crate::SelectionIntent::Copy,
+            ),
+            actions: Default::default(),
+            source_id: 7,
+        });
+        assert!(mime.image().is_none());
+        let mime = mime.with_image(pixels.clone(), 2, 2, 1, (1, 1)).unwrap();
+        assert_eq!(mime.image().unwrap().rgba().as_ref(), pixels.as_ref());
+    }
+
     struct FileDragView {
         path: PathBuf,
+        with_image: bool,
         observed_drag_moves: Rc<RefCell<Vec<Point<Pixels>>>>,
         observed_drops: Rc<RefCell<Vec<PathBuf>>>,
     }
@@ -9607,15 +9724,27 @@ mod tests {
 
     impl Render for FileDragView {
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let with_image = self.with_image;
             div()
                 .id("file-drag")
                 .size_full()
                 .on_drag(self.path.clone(), |_, _, _, cx| cx.new(|_| Empty))
-                .external_drag_payload(|path: &PathBuf, _, _| {
-                    Some(ExternalDragPayload::Files(FileDragPaths::new([(
-                        path.clone(),
-                        true,
-                    )])))
+                .external_drag_payload(move |path: &PathBuf, _, _| {
+                    let payload =
+                        ExternalDragPayload::Files(FileDragPaths::new([(path.clone(), true)]));
+                    Some(if with_image {
+                        payload
+                            .with_image(
+                                drag_image_pixels().as_ref().repeat(4).into(),
+                                4,
+                                4,
+                                2,
+                                (1, 1),
+                            )
+                            .unwrap()
+                    } else {
+                        payload
+                    })
                 })
                 .on_drag_move({
                     let observed_drag_moves = self.observed_drag_moves.clone();
@@ -9645,6 +9774,7 @@ mod tests {
                 let path = path.clone();
                 move |_, _| FileDragView {
                     path,
+                    with_image: false,
                     observed_drag_moves: Rc::new(RefCell::new(Vec::new())),
                     observed_drops,
                 }
@@ -9704,6 +9834,7 @@ mod tests {
                 let path = path.clone();
                 move |_, _| FileDragView {
                     path,
+                    with_image: false,
                     observed_drag_moves: Rc::new(RefCell::new(Vec::new())),
                     observed_drops: Rc::new(RefCell::new(Vec::new())),
                 }
@@ -9750,7 +9881,12 @@ mod tests {
             observed_drops: Rc<RefCell<Vec<PathBuf>>>,
         }
 
-        fn start_drag(cx: &mut TestAppContext, path: PathBuf, platform_result: bool) -> Drag {
+        fn start_drag(
+            cx: &mut TestAppContext,
+            path: PathBuf,
+            platform_result: bool,
+            with_image: bool,
+        ) -> Drag {
             let observed_drag_moves = Rc::new(RefCell::new(Vec::new()));
             let observed_drops = Rc::new(RefCell::new(Vec::new()));
             let window: AnyWindowHandle = cx
@@ -9759,6 +9895,7 @@ mod tests {
                     let observed_drops = observed_drops.clone();
                     move |_, _| FileDragView {
                         path,
+                        with_image,
                         observed_drag_moves,
                         observed_drops,
                     }
@@ -9805,7 +9942,7 @@ mod tests {
         }
 
         let successful_path = PathBuf::from("/tmp/successful-drag");
-        let successful = start_drag(cx, successful_path.clone(), true);
+        let successful = start_drag(cx, successful_path.clone(), true, true);
         let outside_position = point(px(-1.), px(20.));
         let update_result = cx.update_window(successful.window, |_, window, cx| {
             window.dispatch_event(
@@ -9826,6 +9963,28 @@ mod tests {
         assert_eq!(
             cx.test_window(successful.window).external_drag_files(),
             [(successful_path.clone(), true)]
+        );
+        let captured = cx.test_window(successful.window).external_drag_payloads();
+        assert_eq!(
+            captured.len(),
+            1,
+            "promotion must produce one native request"
+        );
+        let image = captured[0]
+            .image()
+            .expect("native promotion dropped the drag image");
+        assert_eq!(
+            image.rgba().as_ref(),
+            drag_image_pixels().as_ref().repeat(4)
+        );
+        assert_eq!(
+            (
+                image.width(),
+                image.height(),
+                image.scale(),
+                image.hotspot()
+            ),
+            (4, 4, 2, (1, 1))
         );
         // Views must still see the move that leaves the window, otherwise they never learn to tear
         // down the drag state they built up while the pointer was inside.
@@ -9986,7 +10145,7 @@ mod tests {
         );
 
         let cancelled_path = PathBuf::from("/tmp/cancelled-drag");
-        let cancelled = start_drag(cx, cancelled_path.clone(), true);
+        let cancelled = start_drag(cx, cancelled_path.clone(), true, true);
         let update_result = cx.update_window(cancelled.window, |_, window, cx| {
             window.dispatch_event(
                 MouseMoveEvent {
@@ -10022,7 +10181,7 @@ mod tests {
         assert!(!cx.update(|cx| cx.end_platform_drag(cancelled.window.window_id())));
 
         let removed_path = PathBuf::from("/tmp/removed-window-drag");
-        let removed = start_drag(cx, removed_path, true);
+        let removed = start_drag(cx, removed_path, true, true);
         let removed_window_id = removed.window.window_id();
         let update_result = cx.update_window(removed.window, |_, window, cx| {
             window.dispatch_event(
@@ -10044,7 +10203,7 @@ mod tests {
         assert!(!cx.update(|cx| cx.end_platform_drag(removed_window_id)));
 
         let failed_path = PathBuf::from("/tmp/failed-drag");
-        let failed = start_drag(cx, failed_path.clone(), false);
+        let failed = start_drag(cx, failed_path.clone(), false, true);
         let update_result = cx.update_window(failed.window, |_, window, cx| {
             for x_position in [-1., -2.] {
                 window.dispatch_event(
@@ -10067,6 +10226,43 @@ mod tests {
             cx.test_window(failed.window).external_drag_files(),
             [(failed_path, true)]
         );
+        assert_eq!(
+            cx.test_window(successful.window)
+                .external_drag_payloads()
+                .len(),
+            1
+        );
+        assert_eq!(
+            cx.test_window(failed.window).external_drag_payloads().len(),
+            1
+        );
+        cx.update_window(failed.window, |_, window, cx| {
+            assert!(cx.stop_active_drag(window));
+        })
+        .unwrap();
+        let legacy_path = PathBuf::from("/tmp/payload-only-drag");
+        let legacy = start_drag(cx, legacy_path.clone(), true, false);
+        cx.update_window(legacy.window, |_, window, cx| {
+            window.dispatch_event(
+                MouseMoveEvent {
+                    position: outside_position,
+                    pressed_button: Some(MouseButton::Left),
+                    modifiers: Default::default(),
+                }
+                .to_platform_input(),
+                cx,
+            );
+            assert!(cx.active_drag.is_none());
+            window.dispatch_event(FileDropEvent::Ended.to_platform_input(), cx);
+        })
+        .unwrap();
+        assert_eq!(
+            cx.test_window(legacy.window).external_drag_files(),
+            [(legacy_path, true)]
+        );
+        let legacy_capture = cx.test_window(legacy.window).external_drag_payloads();
+        assert_eq!(legacy_capture.len(), 1);
+        assert!(legacy_capture[0].image().is_none());
     }
 
     struct FocusForwarder {

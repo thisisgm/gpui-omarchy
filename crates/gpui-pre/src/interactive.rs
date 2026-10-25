@@ -3,7 +3,7 @@ use crate::{
     Point, Render, TouchDragEvent, Window, point, seal::Sealed,
 };
 use smallvec::SmallVec;
-use std::{any::Any, fmt::Debug, ops::Deref, path::PathBuf};
+use std::{any::Any, fmt::Debug, ops::Deref, path::PathBuf, sync::Arc};
 
 /// An event from a platform input source.
 pub trait InputEvent: Sealed + 'static {
@@ -700,6 +700,75 @@ impl ExternalPaths {
     }
 }
 
+/// Immutable, straight-alpha RGBA8 pixels for an outgoing drag icon.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ExternalDragImage {
+    rgba: Arc<[u8]>,
+    width: u32,
+    height: u32,
+    scale: u32,
+    hotspot: (i32, i32),
+}
+
+impl ExternalDragImage {
+    /// Captures at most 1024 by 1024 pixels, with an integer buffer scale from 1 through 8.
+    pub fn new(
+        rgba: Arc<[u8]>,
+        width: u32,
+        height: u32,
+        scale: u32,
+        hotspot: (i32, i32),
+    ) -> Result<Self, &'static str> {
+        if width == 0 || height == 0 || width > 1024 || height > 1024 {
+            return Err("drag image dimensions must be between 1 and 1024 pixels");
+        }
+        if !(1..=8).contains(&scale)
+            || !width.is_multiple_of(scale)
+            || !height.is_multiple_of(scale)
+        {
+            return Err("drag image scale must divide its dimensions and be between 1 and 8");
+        }
+        if rgba.len() != width as usize * height as usize * 4 {
+            return Err("drag image must contain exactly four RGBA bytes per pixel");
+        }
+        if hotspot.0 < 0
+            || hotspot.1 < 0
+            || hotspot.0 as u32 >= width / scale
+            || hotspot.1 as u32 >= height / scale
+        {
+            return Err("drag image hotspot must be within its logical bounds");
+        }
+        Ok(Self {
+            rgba,
+            width,
+            height,
+            scale,
+            hotspot,
+        })
+    }
+
+    /// The immutable, straight-alpha RGBA8 pixel bytes.
+    pub fn rgba(&self) -> &Arc<[u8]> {
+        &self.rgba
+    }
+    /// Width in buffer pixels.
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+    /// Height in buffer pixels.
+    pub fn height(&self) -> u32 {
+        self.height
+    }
+    /// Number of buffer pixels per logical surface pixel.
+    pub fn scale(&self) -> u32 {
+        self.scale
+    }
+    /// Pointer hotspot in logical surface coordinates.
+    pub fn hotspot(&self) -> (i32, i32) {
+        self.hotspot
+    }
+}
+
 /// Data offered to the platform when an internal drag leaves the window and is
 /// promoted to a native drag session.
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -710,15 +779,42 @@ pub enum ExternalDragPayload {
     Mime(crate::NativeDragPayload),
 }
 
+impl ExternalDragPayload {
+    /// Adds validated pixels without changing the drag's data or action policy.
+    pub fn with_image(
+        mut self,
+        rgba: Arc<[u8]>,
+        width: u32,
+        height: u32,
+        scale: u32,
+        hotspot: (i32, i32),
+    ) -> Result<Self, &'static str> {
+        let image = ExternalDragImage::new(rgba, width, height, scale, hotspot)?;
+        match &mut self {
+            Self::Files(paths) => paths.1 = Some(image),
+            Self::Mime(payload) => payload.data.drag_image = Some(image),
+        }
+        Ok(self)
+    }
+
+    /// Image captured for this gesture, if the caller supplied one.
+    pub fn image(&self) -> Option<&ExternalDragImage> {
+        match self {
+            Self::Files(paths) => paths.1.as_ref(),
+            Self::Mime(payload) => payload.data.drag_image.as_ref(),
+        }
+    }
+}
+
 /// Paths handed to the platform for a native file drag. Directory metadata is
 /// provided by the caller to avoid querying it when the platform drag starts.
 #[derive(Debug, Clone, Default, Eq, PartialEq)]
-pub struct FileDragPaths(SmallVec<[(PathBuf, bool); 2]>);
+pub struct FileDragPaths(SmallVec<[(PathBuf, bool); 2]>, Option<ExternalDragImage>);
 
 impl FileDragPaths {
     /// Creates a native file-drag payload from paths paired with whether each path is a directory.
     pub fn new(entries: impl IntoIterator<Item = (PathBuf, bool)>) -> Self {
-        Self(entries.into_iter().collect())
+        Self(entries.into_iter().collect(), None)
     }
 
     /// The dragged paths, each paired with whether it is a directory.

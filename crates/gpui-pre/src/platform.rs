@@ -1442,6 +1442,7 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn can_start_external_drag(&self) -> bool {
         false
     }
+    // Payloads may carry a validated image; platforms without outgoing drag support still refuse them.
     fn start_external_drag(&self, _payload: &ExternalDragPayload) -> bool {
         false
     }
