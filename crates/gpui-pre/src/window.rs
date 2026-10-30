@@ -6536,6 +6536,7 @@ impl Window {
                         key_char: None,
                         modifiers: Modifiers::default(),
                         is_keypad: false,
+                        us_key: None,
                     });
                 }
             }

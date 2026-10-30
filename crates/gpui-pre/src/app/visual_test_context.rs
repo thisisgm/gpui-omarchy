@@ -248,6 +248,7 @@ impl VisualTestAppContext {
                 key: key.clone(),
                 key_char: Some(key),
                 is_keypad: false,
+                us_key: None,
             };
             self.dispatch_keystroke(window, keystroke);
         }

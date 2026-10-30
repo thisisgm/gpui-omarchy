@@ -196,6 +196,7 @@ impl ImeWindow for WaylandWindowStatePtr {
                 key: text.clone(),
                 key_char: Some(text),
                 is_keypad: false,
+                us_key: None,
             },
             is_held: false,
             prefer_character_input: false,

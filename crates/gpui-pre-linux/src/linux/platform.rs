@@ -1550,8 +1550,9 @@ pub(super) fn keystroke_from_xkb(
     };
 
     // A non-Latin group reports the US key at each main-block position, so shortcuts keep their physical keys.
-    let key = match guess_ascii(keycode, modifiers.shift) {
-        Some(us) if !latin => us.to_string(),
+    let us_key = guess_ascii(keycode, modifiers.shift).map(String::from);
+    let key = match &us_key {
+        Some(us) if !latin => us.clone(),
         _ => key,
     };
 
@@ -1573,6 +1574,7 @@ pub(super) fn keystroke_from_xkb(
         key,
         key_char,
         is_keypad: key_sym.is_keypad_key(),
+        us_key,
     }
 }
 
@@ -1981,6 +1983,7 @@ impl PlatformKeyboardMapper for LinuxKeyboardMapper {
         let keycap = self.keycap(keycode, us, held.shift, &event);
         let inner = gpui::Keystroke {
             key_char: None,
+            us_key: None,
             ..event
         };
         // A keycap that is not the US character needs the Shift its level takes shown.
@@ -3153,6 +3156,7 @@ mod i50_xkb_tests {
                             key: target.to_string(),
                             key_char: None,
                             is_keypad: false,
+                            us_key: None,
                         };
                         let resolved = mapper.map_key_equivalent(canonical.clone(), true);
                         let expected = if latin && lower.is_ascii_alphabetic() {
@@ -3280,6 +3284,62 @@ mod i50_xkb_tests {
             };
             assert_eq!(guess_ascii(code, true), Some(shifted));
         }
+    }
+
+    #[test]
+    fn i50_xkb_us_key() {
+        let us_key =
+            |keymap: &xkb::Keymap, mods: &[&str], key: &str| press(keymap, 0, mods, key).us_key;
+        let azerty = pc105("fr", "");
+        let one = press(&azerty, 0, &[], "AE01");
+        assert_eq!(one.key, "&", "AZERTY prints & on the 1 key");
+        assert_eq!(one.us_key.as_deref(), Some("1"));
+        assert_eq!(us_key(&azerty, &[CTRL], "AE01").as_deref(), Some("1"));
+        assert_eq!(us_key(&azerty, &[SHIFT], "AE01").as_deref(), Some("!"));
+        assert_eq!(
+            us_key(&azerty, &[CTRL, SHIFT], "AE10").as_deref(),
+            Some(")")
+        );
+        assert_eq!(us_key(&azerty, &[], "AD01").as_deref(), Some("q"));
+        assert_eq!(us_key(&azerty, &[SHIFT], "AD01").as_deref(), Some("q"));
+        let russian = pc105("ru,us", "");
+        let t = press(&russian, 0, &[], "AD05");
+        assert_eq!(t.key_char.as_deref(), Some("е"));
+        assert_eq!(t.us_key.as_deref(), Some("t"));
+        assert_eq!(us_key(&russian, &[CTRL], "AD05").as_deref(), Some("t"));
+        let arabic = pc105("ara", "");
+        assert_eq!(us_key(&arabic, &[SHIFT], "AB10").as_deref(), Some("?"));
+        let us = pc105("us", "");
+        for &(raw, lower, upper) in &US_POSITIONS {
+            for mods in SHORTCUT_MODS {
+                let shifted = mods.contains(&SHIFT) && !lower.is_ascii_alphabetic();
+                let expected = if shifted { upper } else { lower };
+                let event = press_code(&azerty, 0, mods, Keycode::new(raw));
+                assert_eq!(
+                    event.us_key,
+                    Some(expected.to_string()),
+                    "fr keycode {raw} {mods:?}"
+                );
+                let event = press_code(&us, 0, mods, Keycode::new(raw));
+                assert_eq!(
+                    event.us_key,
+                    Some(expected.to_string()),
+                    "us keycode {raw} {mods:?}"
+                );
+            }
+        }
+        for key in ["LSGT", "RTRN", "SPCE", "TAB", "ESC", "LEFT", "FK01", "KP1"] {
+            assert_eq!(
+                us_key(&azerty, &[], key),
+                None,
+                "{key} is outside the main block"
+            );
+        }
+        assert_eq!(
+            mapped(&azerty, 0, "ctrl-1", true).inner().us_key,
+            None,
+            "bindings carry no typed position"
+        );
     }
 
     // Writes every event of every installer group, for the matrix comparison kept beside the unit's evidence.

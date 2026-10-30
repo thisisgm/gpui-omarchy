@@ -35,6 +35,10 @@ pub struct Keystroke {
     /// `==` and `Hash` include it, so match a typed keystroke to bindings with `should_match`.
     #[serde(default)]
     pub is_keypad: bool,
+
+    /// US-layout character of a typed main-block key, Shift applied except to letters, else None; `==` and `Hash` include it, so match with `should_match`.
+    #[serde(default)]
+    pub us_key: Option<String>,
 }
 
 /// Represents a keystroke that can be used in keybindings and displayed to the user.
@@ -225,6 +229,7 @@ impl Keystroke {
             key,
             key_char,
             is_keypad: false,
+            us_key: None,
         })
     }
 
