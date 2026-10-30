@@ -6222,9 +6222,7 @@ impl Window {
         }
     }
 
-    /// Hands this window's active drag to the platform as a keyboard-origin native drag: no button is held and the
-    /// pointer stays where it is. False when there is no drag, no payload or the platform refuses; the payload
-    /// resolver runs at most once either way, and a refused drag stays an in-app drag.
+    /// A synchronous platform refusal leaves the drag in-app; a later compositor cancel ends it as Cancelled.
     pub fn start_keyboard_external_drag(&mut self, cx: &mut App) -> bool {
         let Some(payload_source) = cx
             .active_drag
@@ -6236,21 +6234,21 @@ impl Window {
         let Some(payload) = payload_source(self, cx) else {
             return false;
         };
-        if self.platform_window.start_keyboard_external_drag(&payload)
-            && cx.hand_active_drag_to_platform(self.handle.window_id())
-        {
-            self.refresh();
-            return true;
-        }
-        // A refused hand-off keeps the resolved payload, so a retry or a later pointer promotion can still go native.
-        if let Some(drag) = cx.active_drag.as_mut() {
+        // The resolver had the App, so the drag it served may be gone; never start a native drag nothing owns.
+        let Some(drag) = cx.active_drag.as_mut() else {
+            return false;
+        };
+        if !self.platform_window.start_keyboard_external_drag(&payload) {
+            // Kept resolved, so a retry or a later pointer promotion can still go native.
             drag.external_payload_source = Some(Box::new(move |_, _| Some(payload)));
+            return false;
         }
-        false
+        cx.hand_active_drag_to_platform(self.handle.window_id());
+        self.refresh();
+        true
     }
 
-    /// Ends this window's drag wherever it lives, in-app or handed to the platform, as Escape must; false when
-    /// there is none.
+    /// Ends this window's drag, in-app or native, as Escape must; this side does what FileDropEvent::Ended would.
     pub fn cancel_drag(&mut self, cx: &mut App) -> bool {
         let native = self.platform_window.cancel_external_drag();
         let owned = cx.end_platform_drag(self.handle.window_id());
@@ -9764,7 +9762,9 @@ mod tests {
     fn keyboard_drag_starts_without_a_pointer_gesture(cx: &mut TestAppContext) {
         fn payload(path: PathBuf) -> crate::ExternalDragPayloadSource {
             Box::new(move |_, _| {
-                Some(ExternalDragPayload::Files(FileDragPaths::new([(path, false)])))
+                Some(ExternalDragPayload::Files(FileDragPaths::new([(
+                    path, false,
+                )])))
             })
         }
         let observed_drops = Rc::new(RefCell::new(Vec::new()));
@@ -9786,15 +9786,27 @@ mod tests {
         let refused = cx.update_window(window, |_, window, cx| {
             window.draw(cx).clear(cx);
             window.dispatch_event(
-                MouseMoveEvent { position: at, pressed_button: None, modifiers: Default::default() }
-                    .to_platform_input(),
+                MouseMoveEvent {
+                    position: at,
+                    pressed_button: None,
+                    modifiers: Default::default(),
+                }
+                .to_platform_input(),
                 cx,
             );
             let view = cx.new(|_| Empty);
-            cx.start_drag(path.clone(), view, point(px(0.), px(0.)), Some(payload(path.clone())));
+            cx.start_drag(
+                path.clone(),
+                view,
+                point(px(0.), px(0.)),
+                Some(payload(path.clone())),
+            );
             assert!(cx.has_active_drag());
             assert!(!window.start_keyboard_external_drag(cx));
-            assert!(cx.has_active_drag(), "a refused platform drag stays in the app");
+            assert!(
+                cx.has_active_drag(),
+                "a refused platform drag stays in the app"
+            );
             window.dispatch_event(
                 crate::MouseUpEvent {
                     position: at,
@@ -9818,10 +9830,18 @@ mod tests {
         cx.test_window(window).set_start_external_drag_result(true);
         let accepted = cx.update_window(window, |_, window, cx| {
             let view = cx.new(|_| Empty);
-            cx.start_drag(path.clone(), view, point(px(0.), px(0.)), Some(payload(path.clone())));
+            cx.start_drag(
+                path.clone(),
+                view,
+                point(px(0.), px(0.)),
+                Some(payload(path.clone())),
+            );
             assert!(window.start_keyboard_external_drag(cx));
             assert!(!cx.has_active_drag(), "the platform owns the drag");
-            assert!(!window.start_keyboard_external_drag(cx), "one hand-off per drag");
+            assert!(
+                !window.start_keyboard_external_drag(cx),
+                "one hand-off per drag"
+            );
         });
         assert!(accepted.is_ok(), "{accepted:?}");
         assert_eq!(cx.test_window(window).keyboard_drag_payloads().len(), 2);
@@ -9854,7 +9874,10 @@ mod tests {
                 point(px(0.), px(0.)),
                 Some(Box::new(move |_, _| {
                     counter.set(counter.get() + 1);
-                    Some(ExternalDragPayload::Files(FileDragPaths::new([(payload_path, false)])))
+                    Some(ExternalDragPayload::Files(FileDragPaths::new([(
+                        payload_path,
+                        false,
+                    )])))
                 })),
             );
             assert!(!window.start_keyboard_external_drag(cx));
@@ -9862,16 +9885,79 @@ mod tests {
         assert!(refused.is_ok(), "{refused:?}");
         cx.test_window(window).set_start_external_drag_result(true);
         let retried = cx.update_window(window, |_, window, cx| {
-            assert!(window.start_keyboard_external_drag(cx), "a refused drag keeps its payload for a retry");
+            assert!(
+                window.start_keyboard_external_drag(cx),
+                "a refused drag keeps its payload for a retry"
+            );
             assert!(!cx.has_active_drag());
-            assert!(window.cancel_drag(cx), "Escape reaches the platform-owned drag");
+            assert!(
+                window.cancel_drag(cx),
+                "Escape reaches the platform-owned drag"
+            );
             assert!(!cx.has_active_drag());
-            assert!(!window.start_keyboard_external_drag(cx), "nothing is left to hand off");
+            assert!(
+                !cx.restore_platform_drag(window.handle.window_id()),
+                "the App's platform-owned record is gone"
+            );
+            assert!(
+                !window.cancel_drag(cx),
+                "a second Escape finds no drag anywhere"
+            );
+            assert!(
+                !window.start_keyboard_external_drag(cx),
+                "nothing is left to hand off"
+            );
         });
         assert!(retried.is_ok(), "{retried:?}");
-        assert_eq!(resolved.get(), 1, "the resolver ran once across the refusal and the retry");
+        assert_eq!(
+            resolved.get(),
+            1,
+            "the resolver ran once across the refusal and the retry"
+        );
         assert_eq!(cx.test_window(window).keyboard_drag_payloads().len(), 2);
-        assert_eq!(cx.test_window(window).cancelled_drags(), 1);
+        assert_eq!(cx.test_window(window).cancelled_drags(), 2);
+    }
+
+    #[gpui::test]
+    fn keyboard_drag_never_starts_when_the_resolver_drops_the_drag(cx: &mut TestAppContext) {
+        let path = PathBuf::from("/tmp/keyboard-dropped");
+        let window: AnyWindowHandle = cx
+            .add_window({
+                let path = path.clone();
+                move |_, _| FileDragView {
+                    path,
+                    with_image: false,
+                    observed_drag_moves: Rc::new(RefCell::new(Vec::new())),
+                    observed_drops: Rc::new(RefCell::new(Vec::new())),
+                }
+            })
+            .into();
+        cx.test_window(window).set_start_external_drag_result(true);
+        let result = cx.update_window(window, |_, window, cx| {
+            window.draw(cx).clear(cx);
+            let view = cx.new(|_| Empty);
+            let payload_path = path.clone();
+            cx.start_drag(
+                path.clone(),
+                view,
+                point(px(0.), px(0.)),
+                Some(Box::new(move |window, cx| {
+                    cx.stop_active_drag(window);
+                    Some(ExternalDragPayload::Files(FileDragPaths::new([(
+                        payload_path,
+                        false,
+                    )])))
+                })),
+            );
+            assert!(!window.start_keyboard_external_drag(cx));
+            assert!(!cx.has_active_drag());
+            assert!(!window.cancel_drag(cx), "no native drag was started");
+        });
+        assert!(result.is_ok(), "{result:?}");
+        assert!(
+            cx.test_window(window).keyboard_drag_payloads().is_empty(),
+            "the platform was never asked"
+        );
     }
 
     #[gpui::test]

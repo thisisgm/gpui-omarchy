@@ -1774,7 +1774,12 @@ mod tests {
                 underline: None,
                 strikethrough: None,
             };
-            let cached_old = window.shape_line("m骨".into(), gpui::px(14.), &[run.clone()], None);
+            let cached_old = window.shape_line(
+                "m骨".into(),
+                gpui::px(14.),
+                std::slice::from_ref(&run),
+                None,
+            );
             let wrapper = first.line_wrapper(gpui::font("Epoch Latin"), gpui::px(14.));
             let generation = prepared.token().generation();
             first.install_text_epoch(&prepared)?;
@@ -1971,7 +1976,7 @@ mod tests {
                 inner: CosmicTextSystem::new_without_system_fonts("Epoch Latin"),
             })));
             let prepared = fixture.prepare(&source, "ja_JP.UTF-8")?;
-            let adder = source.clone();
+            let adder = source;
             let worker = std::thread::spawn(move || {
                 adder.add_fonts(vec![font("Epoch Added", false, 0, 0).into()])
             });

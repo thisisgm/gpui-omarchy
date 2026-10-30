@@ -445,15 +445,14 @@ pub(crate) enum DragOrigin {
     Keyboard,
 }
 
-/// The serial a drag starts with, or None when this origin may not start one now: a pointer drag needs the left
-/// button held over the window and uses its press serial; a keyboard drag needs no button held, keyboard focus
-/// and the pointer over the window, and uses the newest key or pointer press serial.
+/// A keyboard drag is Hyprland only: other compositors silently ignore a start_drag serial without a held button.
 pub(crate) fn drag_serial(
     origin: DragOrigin,
     button: Option<MouseButton>,
     pointer_here: bool,
     keys_here: bool,
     busy: bool,
+    hyprland: bool,
     serials: &SerialTracker,
 ) -> Option<u32> {
     if busy || !pointer_here {
@@ -462,7 +461,7 @@ pub(crate) fn drag_serial(
     match origin {
         DragOrigin::Pointer => (button == Some(MouseButton::Left))
             .then(|| serials.get(SerialKind::MousePress).as_raw()),
-        DragOrigin::Keyboard if button.is_none() && keys_here => {
+        DragOrigin::Keyboard if hyprland && button.is_none() && keys_here => {
             serials.selection_serial().map(|serial| serial.as_raw())
         }
         DragOrigin::Keyboard => None,
@@ -637,9 +636,7 @@ impl WaylandClientStatePtr {
         !self.get_client().borrow().pending_drag_end.get()
     }
 
-    /// A keyboard-origin drag: no button held, the pointer resting over this window, started with the newest
-    /// key or pointer press serial. Whether a compositor accepts that serial for wl_data_device.start_drag is
-    /// the compositor's to decide; a refusal arrives as the source's cancelled event.
+    /// Hyprland only (see drag_serial); a later compositor cancel arrives as the source's cancelled event.
     pub fn start_keyboard_external_drag(
         &self,
         surface: &wl_surface::WlSurface,
@@ -648,9 +645,8 @@ impl WaylandClientStatePtr {
         self.start_drag_session(surface, payload, DragOrigin::Keyboard)
     }
 
-    /// Ends this surface's live drag source as the source's own Cancelled event would: the session reports
-    /// Cancelled, the source is destroyed and the window hears FileDropEvent::Ended. Whether the compositor then
-    /// ends its pointer-side drag at once is the compositor's (wl_data_source.destroy during a drag).
+    /// FileDropEvent::Ended goes out from the event loop: the caller runs inside an App update, where the window's
+    /// input callback cannot.
     pub fn cancel_external_drag(&self, surface: &wl_surface::WlSurface) -> bool {
         let client = self.get_client();
         let mut state = client.borrow_mut();
@@ -723,6 +719,7 @@ impl WaylandClientStatePtr {
             pointer_here,
             keys_here,
             state.external_drag.is_some() || state.pending_drag_end.get(),
+            state.drag.is_hyprland(),
             &state.serial_tracker,
         ) else {
             return false;
@@ -3854,7 +3851,7 @@ fn dispatch_drag_ended(
 
 #[cfg(test)]
 mod drag_origin_tests {
-    use super::{drag_serial, DragOrigin, MouseButton, SerialKind, SerialTracker};
+    use super::{DragOrigin, MouseButton, SerialKind, SerialTracker, drag_serial};
 
     #[gpui::test]
     fn keyboard_drag_cancel_delivers_ended_after_app_update(cx: &mut gpui::TestAppContext) {
@@ -3993,24 +3990,164 @@ mod drag_origin_tests {
     fn pointer_drag_keeps_the_held_button_rule_and_press_serial() {
         let serials = tracker(Some(7), Some(9));
         let left = Some(MouseButton::Left);
-        assert_eq!(drag_serial(DragOrigin::Pointer, left, true, true, false, &serials), Some(7));
-        assert_eq!(drag_serial(DragOrigin::Pointer, None, true, true, false, &serials), None);
-        assert_eq!(drag_serial(DragOrigin::Pointer, left, false, true, false, &serials), None);
-        assert_eq!(drag_serial(DragOrigin::Pointer, left, true, true, true, &serials), None);
+        for hyprland in [true, false] {
+            assert_eq!(
+                drag_serial(
+                    DragOrigin::Pointer,
+                    left,
+                    true,
+                    true,
+                    false,
+                    hyprland,
+                    &serials
+                ),
+                Some(7)
+            );
+            assert_eq!(
+                drag_serial(
+                    DragOrigin::Pointer,
+                    None,
+                    true,
+                    true,
+                    false,
+                    hyprland,
+                    &serials
+                ),
+                None
+            );
+            assert_eq!(
+                drag_serial(
+                    DragOrigin::Pointer,
+                    left,
+                    false,
+                    true,
+                    false,
+                    hyprland,
+                    &serials
+                ),
+                None
+            );
+            assert_eq!(
+                drag_serial(
+                    DragOrigin::Pointer,
+                    left,
+                    true,
+                    true,
+                    true,
+                    hyprland,
+                    &serials
+                ),
+                None
+            );
+        }
     }
 
     #[test]
     fn keyboard_drag_needs_no_button_and_uses_the_newest_press_serial() {
         let key_last = tracker(Some(7), Some(9));
-        assert_eq!(drag_serial(DragOrigin::Keyboard, None, true, true, false, &key_last), Some(9));
+        assert_eq!(
+            drag_serial(
+                DragOrigin::Keyboard,
+                None,
+                true,
+                true,
+                false,
+                true,
+                &key_last
+            ),
+            Some(9)
+        );
         let mut mouse_last = tracker(Some(7), Some(9));
         mouse_last.update(SerialKind::MousePress, 11);
-        assert_eq!(drag_serial(DragOrigin::Keyboard, None, true, true, false, &mouse_last), Some(11));
+        assert_eq!(
+            drag_serial(
+                DragOrigin::Keyboard,
+                None,
+                true,
+                true,
+                false,
+                true,
+                &mouse_last
+            ),
+            Some(11)
+        );
         let left = Some(MouseButton::Left);
-        assert_eq!(drag_serial(DragOrigin::Keyboard, left, true, true, false, &key_last), None);
-        assert_eq!(drag_serial(DragOrigin::Keyboard, None, true, false, false, &key_last), None);
-        assert_eq!(drag_serial(DragOrigin::Keyboard, None, false, true, false, &key_last), None);
-        assert_eq!(drag_serial(DragOrigin::Keyboard, None, true, true, true, &key_last), None);
-        assert_eq!(drag_serial(DragOrigin::Keyboard, None, true, true, false, &tracker(None, None)), None);
+        assert_eq!(
+            drag_serial(
+                DragOrigin::Keyboard,
+                left,
+                true,
+                true,
+                false,
+                true,
+                &key_last
+            ),
+            None
+        );
+        assert_eq!(
+            drag_serial(
+                DragOrigin::Keyboard,
+                None,
+                true,
+                false,
+                false,
+                true,
+                &key_last
+            ),
+            None
+        );
+        assert_eq!(
+            drag_serial(
+                DragOrigin::Keyboard,
+                None,
+                false,
+                true,
+                false,
+                true,
+                &key_last
+            ),
+            None
+        );
+        assert_eq!(
+            drag_serial(
+                DragOrigin::Keyboard,
+                None,
+                true,
+                true,
+                true,
+                true,
+                &key_last
+            ),
+            None
+        );
+        assert_eq!(
+            drag_serial(
+                DragOrigin::Keyboard,
+                None,
+                true,
+                true,
+                false,
+                true,
+                &tracker(None, None)
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn keyboard_drag_is_refused_off_hyprland() {
+        let key_last = tracker(Some(7), Some(9));
+        assert_eq!(
+            drag_serial(
+                DragOrigin::Keyboard,
+                None,
+                true,
+                true,
+                false,
+                false,
+                &key_last
+            ),
+            None
+        );
     }
 }

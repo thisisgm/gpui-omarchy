@@ -2930,9 +2930,7 @@ impl App {
         self.active_drag.as_ref().and_then(|drag| drag.cursor_style)
     }
 
-    /// Starts an in-app drag of `value` without a pointer gesture, drawn by `view` at `cursor_offset` from the pointer.
-    /// A later drop dispatches to `on_drop::<T>` exactly as a pointer drag's does; `external_payload` is what
-    /// [`Window::start_keyboard_external_drag`] or a pointer leaving the window hands the platform.
+    /// Starts an in-app drag without a pointer gesture; it drops through `on_drop::<T>` like a pointer drag.
     pub fn start_drag<T: 'static, W: Render>(
         &mut self,
         value: T,

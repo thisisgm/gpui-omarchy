@@ -65,6 +65,7 @@ pub(crate) struct TestWindowState {
     external_drag_payloads: Vec<crate::ExternalDragPayload>,
     keyboard_drag_payloads: Vec<crate::ExternalDragPayload>,
     cancelled_drags: usize,
+    native_drag_live: bool,
     cancel_external_drag_handler: Option<Box<dyn FnMut(&TestWindow) -> bool>>,
     external_drag_ready_handler: Option<Rc<dyn Fn() -> bool>>,
     start_external_drag_result: bool,
@@ -150,6 +151,7 @@ impl TestWindow {
             external_drag_payloads: Vec::new(),
             keyboard_drag_payloads: Vec::new(),
             cancelled_drags: 0,
+            native_drag_live: false,
             cancel_external_drag_handler: None,
             external_drag_ready_handler: None,
             start_external_drag_result: false,
@@ -733,7 +735,9 @@ impl PlatformWindow for TestWindow {
         }
         let result = state.start_external_drag_result;
         drop(state);
-        result && self.can_start_external_drag()
+        let started = result && self.can_start_external_drag();
+        self.0.lock().native_drag_live |= started;
+        started
     }
 
     fn start_keyboard_external_drag(&self, payload: &crate::ExternalDragPayload) -> bool {
@@ -741,13 +745,15 @@ impl PlatformWindow for TestWindow {
         state.keyboard_drag_payloads.push(payload.clone());
         let result = state.start_external_drag_result;
         drop(state);
-        result && self.can_start_external_drag()
+        let started = result && self.can_start_external_drag();
+        self.0.lock().native_drag_live |= started;
+        started
     }
 
     fn cancel_external_drag(&self) -> bool {
         let mut state = self.0.lock();
         state.cancelled_drags += 1;
-        let result = state.start_external_drag_result;
+        let result = std::mem::take(&mut state.native_drag_live);
         let handler = state.cancel_external_drag_handler.take();
         drop(state);
         if let Some(mut handler) = handler {

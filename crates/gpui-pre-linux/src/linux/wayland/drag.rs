@@ -150,6 +150,10 @@ impl<Offer, Window> DragState<Offer, Window> {
     }
 }
 impl<Offer: NativeOffer, Window> DragState<Offer, Window> {
+    pub fn is_hyprland(&self) -> bool {
+        self.hyprland
+    }
+
     pub fn native_started(&mut self) {
         if self.hyprland && self.dropped {
             self.clear();

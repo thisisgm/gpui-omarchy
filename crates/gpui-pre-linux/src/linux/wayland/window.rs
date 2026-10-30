@@ -2351,7 +2351,9 @@ impl PlatformWindow for WaylandWindow {
 
     fn start_keyboard_external_drag(&self, payload: &ExternalDragPayload) -> bool {
         let state = self.borrow();
-        state.client.start_keyboard_external_drag(&state.surface, payload)
+        state
+            .client
+            .start_keyboard_external_drag(&state.surface, payload)
     }
 
     fn cancel_external_drag(&self) -> bool {
