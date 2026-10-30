@@ -642,6 +642,8 @@ pub struct BackdropBlur {
     pub corner_radii: Corners<ScaledPixels>,
     /// Clips the blurred region.
     pub content_mask: ContentMask<ScaledPixels>,
+    /// How much of the blur is drawn, from the element's opacity.
+    pub opacity: f32,
 }
 
 impl BackdropBlur {
@@ -1041,6 +1043,7 @@ mod tests {
             bounds,
             corner_radii: Corners::default(),
             content_mask: ContentMask { bounds },
+            opacity: 1.,
         }
     }
 
