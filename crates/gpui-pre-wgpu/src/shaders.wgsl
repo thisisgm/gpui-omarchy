@@ -1385,6 +1385,8 @@ struct BackdropParams {
     scale: f32,
     // The gaussian's standard deviation, in source pixels.
     sigma: f32,
+    // How much of the blur the composite pass draws, from the element's opacity.
+    opacity: f32,
 }
 
 @group(1) @binding(0) var<uniform> backdrop: BackdropParams;
@@ -1460,5 +1462,5 @@ fn fs_backdrop_composite(input: BackdropVarying) -> @location(0) vec4<f32> {
     if (any(mask < vec4<f32>(0.0))) {
         coverage = 0.0;
     }
-    return mix(sharp, blurred, coverage);
+    return mix(sharp, blurred, coverage * backdrop.opacity);
 }

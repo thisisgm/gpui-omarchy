@@ -4836,7 +4836,9 @@ impl Window {
     ) {
         self.invalidator.debug_assert_paint();
 
-        if radius <= Pixels::ZERO {
+        // An element fading in fades its blur in with it.
+        let opacity = self.element_opacity();
+        if radius <= Pixels::ZERO || opacity <= 0. {
             return;
         }
         let scale_factor = self.scale_factor();
@@ -4846,6 +4848,7 @@ impl Window {
             bounds: self.snap_bounds(bounds),
             corner_radii: corner_radii.scale(scale_factor),
             content_mask: self.snapped_content_mask(),
+            opacity,
         });
     }
 
