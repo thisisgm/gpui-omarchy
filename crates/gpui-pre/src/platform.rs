@@ -1617,6 +1617,18 @@ pub trait PlatformDispatcher: Send + Sync {
 
 #[expect(missing_docs)]
 pub trait PlatformTextSystem: Send + Sync {
+    /// Returns the namespace shared by this snapshot's font identities.
+    fn text_epoch(&self) -> usize {
+        0
+    }
+    /// Builds an isolated, preloaded locale/font snapshot on the text epoch worker.
+    fn prepare_text_epoch(
+        &self,
+        _config: &crate::TextEpochConfig,
+        _token: &crate::TextEpochToken,
+    ) -> Result<Arc<dyn PlatformTextSystem>> {
+        anyhow::bail!("live text epochs are unsupported by this platform")
+    }
     fn add_fonts(&self, fonts: Vec<Cow<'static, [u8]>>) -> Result<()>;
     /// Installs a nonblocking sink for unresolved grapheme clusters.
     fn set_missing_glyph_sink(&self, _sink: Option<Arc<dyn MissingGlyphSink>>) {}
@@ -1624,6 +1636,10 @@ pub trait PlatformTextSystem: Send + Sync {
     fn all_font_names(&self) -> Vec<String>;
     /// Get the font ID for a font descriptor.
     fn font_id(&self, descriptor: &Font) -> Result<FontId>;
+    /// Returns the selected face's family for diagnostics and deterministic fallback checks.
+    fn font_family_name(&self, _font_id: FontId) -> Option<SharedString> {
+        None
+    }
     /// Prewarm any system font caches needed to shape text.
     fn prewarm_fonts(&self, _font_ids: &[FontId]) {}
     /// Get metrics for a font.
@@ -1905,6 +1921,7 @@ pub trait AtlasBackend {
 pub struct AtlasState<Backend> {
     tiles_by_key: FxHashMap<AtlasKey, AtlasTile>,
     generation: u64,
+    text_epoch: usize,
     pub backend: Backend,
 }
 
@@ -1920,6 +1937,7 @@ impl<Backend> AtlasState<Backend> {
         Self {
             tiles_by_key: FxHashMap::default(),
             generation: next_atlas_generation(),
+            text_epoch: 0,
             backend,
         }
     }
@@ -1952,6 +1970,22 @@ impl<Backend: AtlasBackend> AtlasState<Backend> {
         key: AtlasKey,
         build: &mut dyn FnMut() -> Result<Option<(Size<DevicePixels>, Cow<'a, [u8]>)>>,
     ) -> Result<Option<AtlasTile>> {
+        if let AtlasKey::Glyph(params) = &key {
+            let epoch = params.font_id.text_epoch();
+            anyhow::ensure!(epoch >= self.text_epoch, "stale text epoch atlas insertion");
+            if epoch != self.text_epoch {
+                self.tiles_by_key.retain(|key, tile| {
+                    if matches!(key, AtlasKey::Glyph(_)) {
+                        self.backend.remove(*tile);
+                        false
+                    } else {
+                        true
+                    }
+                });
+                self.text_epoch = epoch;
+                self.generation = next_atlas_generation();
+            }
+        }
         match self.tiles_by_key.entry(key) {
             Entry::Occupied(entry) => Ok(Some(*entry.get())),
             Entry::Vacant(entry) => {

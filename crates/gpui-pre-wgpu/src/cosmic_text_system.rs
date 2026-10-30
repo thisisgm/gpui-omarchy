@@ -8,7 +8,7 @@ use gpui::{
     Bounds, DevicePixels, FallbackFontClass, Font, FontFallbacks, FontFeatures, FontId,
     FontMetrics, FontRun, GlyphId, IsZero as _, LineLayout, MissingGlyph, MissingGlyphSink, Pixels,
     PlatformTextSystem, RenderGlyphParams, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ShapedGlyph,
-    ShapedRun, SharedString, Size, TextRenderingMode, point, size,
+    ShapedRun, SharedString, Size, TextEpochConfig, TextEpochToken, TextRenderingMode, point, size,
 };
 
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
@@ -49,6 +49,9 @@ struct LoadedFontKey {
 }
 
 struct CosmicTextSystemState {
+    generation: usize,
+    custom_fonts: Vec<Arc<Cow<'static, [u8]>>>,
+    preferred_fallbacks: HashMap<(FontId, char), SharedString>,
     font_system: FontSystem,
     scratch: ShapeBuffer,
     swash_scale_context: ScaleContext,
@@ -105,7 +108,8 @@ impl CosmicTextSystem {
         let state = self.0.read();
         let font = state
             .loaded_fonts
-            .get(font_id.0)
+            .get(font_id.local_index())
+            .filter(|_| font_id.text_epoch() == state.generation)
             .context("invalid font ID")?;
         let face = state
             .font_system
@@ -159,6 +163,9 @@ impl CosmicTextSystem {
 
     fn from_font_system(font_system: FontSystem, system_font_fallback: &str) -> Self {
         Self(RwLock::new(CosmicTextSystemState {
+            generation: 0,
+            custom_fonts: Vec::new(),
+            preferred_fallbacks: HashMap::default(),
             font_system,
             scratch: ShapeBuffer::default(),
             swash_scale_context: ScaleContext::new(),
@@ -174,6 +181,13 @@ impl CosmicTextSystem {
     }
 }
 
+/// Bounds raster images kept between a bounds query and its rasterization.
+const MAX_PENDING_GLYPH_IMAGES: usize = 512;
+/// Rejects a locale string too long to be a real BCP 47 tag.
+const MAX_LOCALE_TAG_LEN: usize = 128;
+/// Divides stale-font metrics safely; every other metric of a stale font is zero.
+const STALE_FONT_UNITS_PER_EM: u32 = 1;
+
 /// The BCP 47 tag cosmic-text's script fallback ranks by, from the POSIX locale.
 /// Sample input: LANG="ja_JP.UTF-8" gives "ja-JP"; unset or "C" gives "en-US".
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
@@ -183,19 +197,90 @@ fn locale_from_env() -> String {
         .filter_map(|name| std::env::var(name).ok())
         .find(|value| !value.is_empty())
         .unwrap_or_default();
+    normalize_locale(&posix).unwrap_or_else(|_| "en-US".into())
+}
+
+/// Sample input: "ja_JP.UTF-8@euro" gives "ja-JP"; "C" or "POSIX" gives "en-US".
+fn normalize_locale(posix: &str) -> Result<String> {
     let tag = posix
         .split(['.', '@'])
         .next()
         .unwrap_or_default()
         .replace('_', "-");
-    if tag.is_empty() || tag == "C" || tag == "POSIX" {
-        "en-US".to_string()
-    } else {
-        tag
+    if tag == "C" || tag == "POSIX" {
+        return Ok("en-US".into());
     }
+    anyhow::ensure!(
+        !tag.is_empty()
+            && tag.len() <= MAX_LOCALE_TAG_LEN
+            && tag
+                .split('-')
+                .all(|part| !part.is_empty()
+                    && part.bytes().all(|byte| byte.is_ascii_alphanumeric())),
+        "invalid text locale"
+    );
+    Ok(tag)
 }
 
 impl PlatformTextSystem for CosmicTextSystem {
+    fn text_epoch(&self) -> usize {
+        self.0.read().generation
+    }
+    fn prepare_text_epoch(
+        &self,
+        config: &TextEpochConfig,
+        token: &TextEpochToken,
+    ) -> Result<Arc<dyn PlatformTextSystem>> {
+        let locale = normalize_locale(&config.locale)?;
+        anyhow::ensure!(!config.fonts.is_empty(), "text epoch requires held fonts");
+        let (custom_fonts, system_fallback, missing_glyph_sink) = {
+            let state = self.0.read();
+            (
+                state.custom_fonts.clone(),
+                state.system_font_fallback.clone(),
+                state.missing_glyph_sink.clone(),
+            )
+        };
+        anyhow::ensure!(token.is_current(), "text epoch superseded");
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+        let on_demand = OnDemandFonts::reload(&locale, config.fontconfig_file.as_deref())?;
+        let mut db = cosmic_text::fontdb::Database::new();
+        for source in &custom_fonts {
+            db.load_font_source(cosmic_text::fontdb::Source::Binary(source.clone()));
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+        db.load_system_fonts();
+        let system = Self::from_font_system(
+            FontSystem::new_with_locale_and_db(locale, db),
+            &system_fallback,
+        );
+        {
+            let mut state = system.0.write();
+            state.generation = token.generation();
+            state.custom_fonts = custom_fonts;
+            state.missing_glyph_sink = missing_glyph_sink;
+            #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+            {
+                state.on_demand = Some(on_demand);
+            }
+        }
+        let mut font_ids = Vec::new();
+        for font in &config.fonts {
+            anyhow::ensure!(token.is_current(), "text epoch superseded");
+            font_ids.push(system.font_id(font)?);
+        }
+        {
+            let mut state = system.0.write();
+            #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+            state.prepare_fallbacks(&font_ids, &config.text, token)?;
+            state.prewarm_fonts(&font_ids);
+            #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+            state.on_demand.as_mut().unwrap().freeze();
+        }
+        anyhow::ensure!(token.is_current(), "text epoch superseded");
+        Ok(Arc::new(system))
+    }
+
     fn add_fonts(&self, fonts: Vec<Cow<'static, [u8]>>) -> Result<()> {
         self.0.write().add_fonts(fonts)
     }
@@ -215,8 +300,8 @@ impl PlatformTextSystem for CosmicTextSystem {
             .collect_vec();
         // On demand the database holds only what was used so far; fontconfig's cache lists the rest.
         #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-        if state.on_demand.is_some() {
-            result.extend(crate::fontconfig_on_demand::family_names());
+        if let Some(on_demand) = &state.on_demand {
+            result.extend(on_demand.family_names());
         }
         result.sort_unstable();
         result.dedup();
@@ -244,18 +329,42 @@ impl PlatformTextSystem for CosmicTextSystem {
         Ok(candidates[ix])
     }
 
+    fn font_family_name(&self, id: FontId) -> Option<SharedString> {
+        let state = self.0.read();
+        if id.text_epoch() != state.generation {
+            return None;
+        }
+        let loaded = state.loaded_fonts.get(id.local_index())?;
+        state
+            .font_system
+            .db()
+            .face(loaded.font.id())?
+            .families
+            .first()
+            .map(|family| family.0.clone().into())
+    }
+
     fn prewarm_fonts(&self, font_ids: &[FontId]) {
         self.0.write().prewarm_fonts(font_ids);
     }
 
     fn font_metrics(&self, font_id: FontId) -> FontMetrics {
-        let metrics = self
-            .0
-            .read()
-            .loaded_font(font_id)
-            .font
-            .as_swash()
-            .metrics(&[]);
+        let state = self.0.read();
+        let Some(loaded_font) = state.current_font(font_id) else {
+            log::error!("font metrics requested for {font_id:?} from another text epoch");
+            return FontMetrics {
+                units_per_em: STALE_FONT_UNITS_PER_EM,
+                ascent: 0.,
+                descent: 0.,
+                line_gap: 0.,
+                underline_position: 0.,
+                underline_thickness: 0.,
+                cap_height: 0.,
+                x_height: 0.,
+                bounding_box: Bounds::default(),
+            };
+        };
+        let metrics = loaded_font.font.as_swash().metrics(&[]);
 
         FontMetrics {
             units_per_em: metrics.units_per_em as u32,
@@ -275,7 +384,12 @@ impl PlatformTextSystem for CosmicTextSystem {
 
     fn typographic_bounds(&self, font_id: FontId, glyph_id: GlyphId) -> Result<Bounds<f32>> {
         let lock = self.0.read();
-        let glyph_metrics = lock.loaded_font(font_id).font.as_swash().glyph_metrics(&[]);
+        let glyph_metrics = lock
+            .current_font(font_id)
+            .context("font belongs to another text epoch")?
+            .font
+            .as_swash()
+            .glyph_metrics(&[]);
         let glyph_id = glyph_id.0 as u16;
         Ok(Bounds {
             origin: point(0.0, 0.0),
@@ -320,11 +434,27 @@ impl PlatformTextSystem for CosmicTextSystem {
 }
 
 impl CosmicTextSystemState {
+    fn current_font(&self, font_id: FontId) -> Option<&LoadedFont> {
+        (font_id.text_epoch() == self.generation)
+            .then(|| self.loaded_fonts.get(font_id.local_index()))
+            .flatten()
+    }
+
     fn loaded_font(&self, font_id: FontId) -> &LoadedFont {
-        &self.loaded_fonts[font_id.0]
+        assert_eq!(
+            font_id.text_epoch(),
+            self.generation,
+            "font belongs to another text epoch"
+        );
+        &self.loaded_fonts[font_id.local_index()]
     }
 
     fn font_match_properties(&self, font_id: FontId) -> Option<FontMatchProperties> {
+        if font_id.text_epoch() != self.generation
+            || font_id.local_index() >= self.loaded_fonts.len()
+        {
+            return None;
+        }
         let loaded_font = self.loaded_font(font_id);
         let Some(face) = self.font_system.db().face(loaded_font.font.id()) else {
             log::warn!("font face not found in database for font_id {:?}", font_id);
@@ -366,7 +496,9 @@ impl CosmicTextSystemState {
         self.font_ids_by_family_cache.clear();
         let db = self.font_system.db_mut();
         for bytes in fonts {
-            db.load_font_source(cosmic_text::fontdb::Source::Binary(Arc::new(bytes)));
+            let source = Arc::new(bytes);
+            db.load_font_source(cosmic_text::fontdb::Source::Binary(source.clone()));
+            self.custom_fonts.push(source);
         }
         Ok(())
     }
@@ -417,6 +549,63 @@ impl CosmicTextSystemState {
         loaded
     }
 
+    /// Resolves exact fontconfig families before freezing the snapshot, including collection face identity.
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    fn prepare_fallbacks(
+        &mut self,
+        font_ids: &[FontId],
+        text: &[SharedString],
+        token: &TextEpochToken,
+    ) -> Result<()> {
+        let mut chars = std::collections::BTreeSet::new();
+        for line in text {
+            chars.extend(line.chars());
+        }
+        let mut loaded_paths = std::collections::HashSet::new();
+        for &font_id in font_ids {
+            let properties = self
+                .font_match_properties(font_id)
+                .context("invalid held font")?;
+            for &ch in &chars {
+                anyhow::ensure!(token.is_current(), "text epoch superseded");
+                if ch.is_control()
+                    || matches!(ch, '\u{200c}' | '\u{200d}' | '\u{fe00}'..='\u{fe0f}' | '\u{e0100}'..='\u{e01ef}')
+                    || self.glyph_for_char(font_id, ch).is_some()
+                    || properties
+                        .fallback_chain
+                        .iter()
+                        .any(|(id, _)| self.glyph_for_char(*id, ch).is_some())
+                {
+                    continue;
+                }
+                let matched = self
+                    .on_demand
+                    .as_mut()
+                    .unwrap()
+                    .covering(&properties.primary_family_name, ch)?;
+                let Some((path, family)) = matched else {
+                    log::warn!("no fontconfig face covers U+{:04X}", ch as u32);
+                    continue;
+                };
+                if loaded_paths.insert(path.clone()) {
+                    self.load_font_files(vec![path]);
+                }
+                let family: SharedString = family.into();
+                self.load_on_demand_family(&family);
+                let ids = self.load_family(&family, &FontFeatures::default(), None)?;
+                if !ids.iter().any(|id| self.glyph_for_char(*id, ch).is_some()) {
+                    log::warn!(
+                        "fontconfig family {family} does not cover U+{:04X}",
+                        ch as u32
+                    );
+                    continue;
+                }
+                self.preferred_fallbacks.insert((font_id, ch), family);
+            }
+        }
+        Ok(())
+    }
+
     #[profiling::function]
     fn load_family(
         &mut self,
@@ -453,7 +642,7 @@ impl CosmicTextSystemState {
                     let Some(&fb_id) = fb_ids.first() else {
                         continue;
                     };
-                    let db_id = self.loaded_fonts[fb_id.0].font.id();
+                    let db_id = self.loaded_fonts[fb_id.local_index()].font.id();
                     if let Some(face) = self.font_system.db().face(db_id)
                         && let Some(family) = face.families.first()
                     {
@@ -483,7 +672,8 @@ impl CosmicTextSystemState {
                 font: loaded_font_key.clone(),
             };
             if let Some(&font_id) = self.loaded_font_ids_by_key.get(&key) {
-                self.loaded_fonts[font_id.0].user_fallback_chain = Arc::clone(&user_fallback_chain);
+                self.loaded_fonts[font_id.local_index()].user_fallback_chain =
+                    Arc::clone(&user_fallback_chain);
                 loaded_font_ids.push(font_id);
                 continue;
             }
@@ -513,7 +703,7 @@ impl CosmicTextSystemState {
                 continue;
             };
 
-            let font_id = FontId(self.loaded_fonts.len());
+            let font_id = FontId::for_text_epoch(self.loaded_fonts.len(), self.generation)?;
             loaded_font_ids.push(font_id);
             self.loaded_fonts.push(LoadedFont {
                 font,
@@ -528,7 +718,12 @@ impl CosmicTextSystemState {
     }
 
     fn advance(&self, font_id: FontId, glyph_id: GlyphId) -> Result<Size<f32>> {
-        let glyph_metrics = self.loaded_font(font_id).font.as_swash().glyph_metrics(&[]);
+        let glyph_metrics = self
+            .current_font(font_id)
+            .context("font belongs to another text epoch")?
+            .font
+            .as_swash()
+            .glyph_metrics(&[]);
         Ok(Size {
             width: glyph_metrics.advance_width(glyph_id.0 as u16),
             height: glyph_metrics.advance_height(glyph_id.0 as u16),
@@ -536,6 +731,11 @@ impl CosmicTextSystemState {
     }
 
     fn glyph_for_char(&self, font_id: FontId, ch: char) -> Option<GlyphId> {
+        if font_id.text_epoch() != self.generation
+            || font_id.local_index() >= self.loaded_fonts.len()
+        {
+            return None;
+        }
         let glyph_id = self.loaded_font(font_id).font.as_swash().charmap().map(ch);
         if glyph_id == 0 {
             None
@@ -551,6 +751,9 @@ impl CosmicTextSystemState {
             size: size(image.placement.width.into(), image.placement.height.into()),
         };
         if !bounds.is_zero() {
+            if self.pending_glyph_images.len() >= MAX_PENDING_GLYPH_IMAGES {
+                self.pending_glyph_images.clear();
+            }
             self.pending_glyph_images.insert(params.clone(), image);
         }
         Ok(bounds)
@@ -595,7 +798,14 @@ impl CosmicTextSystemState {
         &mut self,
         params: &RenderGlyphParams,
     ) -> Result<swash::scale::image::Image> {
-        let loaded_font = &self.loaded_fonts[params.font_id.0];
+        anyhow::ensure!(
+            params.font_id.text_epoch() == self.generation,
+            "stale text epoch glyph"
+        );
+        let loaded_font = self
+            .loaded_fonts
+            .get(params.font_id.local_index())
+            .context("invalid font ID")?;
         let font_ref = loaded_font.font.as_swash();
         let pixel_size = f32::from(params.font_size);
 
@@ -651,7 +861,7 @@ impl CosmicTextSystemState {
             .iter()
             .position(|loaded_font| loaded_font.font.id() == id)
         {
-            Ok(FontId(ix))
+            FontId::for_text_epoch(ix, self.generation)
         } else {
             let font = self
                 .font_system
@@ -663,7 +873,7 @@ impl CosmicTextSystemState {
                 .face(id)
                 .context("fallback font face not found in cosmic-text database")?;
 
-            let font_id = FontId(self.loaded_fonts.len());
+            let font_id = FontId::for_text_epoch(self.loaded_fonts.len(), self.generation)?;
             self.loaded_fonts.push(LoadedFont {
                 font,
                 features: CosmicFontFeatures::new(),
@@ -677,6 +887,17 @@ impl CosmicTextSystemState {
 
     #[profiling::function]
     fn layout_line(&mut self, text: &str, font_size: Pixels, font_runs: &[FontRun]) -> LineLayout {
+        if font_runs
+            .iter()
+            .any(|run| run.font_id.text_epoch() != self.generation)
+        {
+            log::error!("layout_line got a font run from another text epoch");
+            return LineLayout {
+                font_size,
+                len: text.len(),
+                ..LineLayout::default()
+            };
+        }
         if contains_paragraph_separator(text) {
             self.layout_line_with_separators(text, font_size, font_runs)
         } else {
@@ -822,6 +1043,17 @@ impl CosmicTextSystemState {
                     Some(ix) => &fallback_attrs[ix],
                 };
                 attrs_list.add_span(span.start..span.end, attrs);
+            }
+            for (offset, grapheme) in text[offs..run_end].grapheme_indices(true) {
+                if let Some(family) = grapheme
+                    .chars()
+                    .find_map(|ch| self.preferred_fallbacks.get(&(run.font_id, ch)))
+                {
+                    attrs_list.add_span(
+                        offs + offset..offs + offset + grapheme.len(),
+                        &primary_attrs.clone().family(Family::Name(family)),
+                    );
+                }
             }
             offs = run_end;
         }
@@ -1001,10 +1233,9 @@ impl CosmicTextSystemState {
     }
 
     fn fallback_font_class(&self, font_id: Option<FontId>) -> FallbackFontClass {
-        let Some(font_id) = font_id else {
+        let Some(loaded_font) = font_id.and_then(|font_id| self.current_font(font_id)) else {
             return FallbackFontClass::Proportional;
         };
-        let loaded_font = self.loaded_font(font_id);
         let is_monospace = self
             .font_system
             .db()
@@ -1236,7 +1467,7 @@ fn pick_covering_slot(
 
 fn charmap_covers(loaded_fonts: &[LoadedFont], id: FontId, ch: char) -> bool {
     loaded_fonts
-        .get(id.0)
+        .get(id.local_index())
         .is_some_and(|loaded| loaded.font.as_swash().charmap().map(ch) != 0)
 }
 
@@ -1301,6 +1532,779 @@ fn check_is_known_emoji_font(postscript_name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    mod locale_epochs {
+        use super::*;
+        use std::{
+            future::Future,
+            path::PathBuf,
+            sync::atomic::{AtomicUsize, Ordering},
+            task::{Context, Poll, Wake, Waker},
+        };
+
+        fn wait<T>(future: impl Future<Output = T>) -> T {
+            struct ThreadWake(std::thread::Thread);
+            impl Wake for ThreadWake {
+                fn wake(self: Arc<Self>) {
+                    self.0.unpark();
+                }
+            }
+            let waker = Waker::from(Arc::new(ThreadWake(std::thread::current())));
+            let mut context = Context::from_waker(&waker);
+            let mut future = std::pin::pin!(future);
+            loop {
+                match future.as_mut().poll(&mut context) {
+                    Poll::Ready(value) => return value,
+                    Poll::Pending => std::thread::park(),
+                }
+            }
+        }
+
+        struct Fixture {
+            root: PathBuf,
+        }
+        impl Fixture {
+            fn new() -> Result<Self> {
+                static NEXT: AtomicUsize = AtomicUsize::new(0);
+                let parent =
+                    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".superpowers/i50-locale");
+                std::fs::create_dir_all(&parent)?;
+                let root = parent.join(format!(
+                    "{}-{}",
+                    std::process::id(),
+                    NEXT.fetch_add(1, Ordering::Relaxed)
+                ));
+                std::fs::create_dir(&root)?;
+                std::fs::write(root.join(".flea-test-sandbox"), b"i50 locale fixture")?;
+                std::fs::create_dir(root.join("fonts"))?;
+                std::fs::create_dir(root.join("cache"))?;
+                std::fs::write(
+                    root.join("fonts/primary.ttf"),
+                    font("Epoch Latin", false, 0, 0),
+                )?;
+                let families = ["JP", "KR", "SC", "TC", "HK"];
+                let header_len = 12 + families.len() * 4;
+                let mut collection = b"ttcf\0\x01\0\0".to_vec();
+                collection.extend((families.len() as u32).to_be_bytes());
+                let mut faces = Vec::new();
+                let mut offset = header_len;
+                for (index, family) in families.iter().enumerate() {
+                    collection.extend((offset as u32).to_be_bytes());
+                    let face = font(
+                        &format!("Noto Sans CJK {family}"),
+                        true,
+                        index as u16,
+                        offset,
+                    );
+                    offset += face.len();
+                    faces.push(face);
+                }
+                for face in faces {
+                    collection.extend(face);
+                }
+                std::fs::write(root.join("fonts/cjk.ttc"), collection)?;
+                let fixture = Self { root };
+                fixture.preference("default")?;
+                Ok(fixture)
+            }
+
+            fn preference(&self, preference: &str) -> Result<()> {
+                let mut rules = String::new();
+                for (family, locale) in [
+                    ("JP", "ja"),
+                    ("KR", "ko"),
+                    ("SC", "zh-cn"),
+                    ("TC", "zh-tw"),
+                    ("HK", "zh-hk"),
+                ] {
+                    rules.push_str(&format!("<match target=\"scan\"><test name=\"family\"><string>Noto Sans CJK {family}</string></test><edit name=\"lang\" mode=\"assign\"><string>{locale}</string></edit></match>"));
+                }
+                if preference != "default" {
+                    rules.push_str(&format!("<alias><family>Epoch Latin</family><accept><family>Noto Sans CJK {}</family></accept></alias>", preference.to_uppercase()));
+                }
+                rules.push_str("<alias><family>Epoch Latin</family><default><family>Noto Sans CJK SC</family></default></alias>");
+                std::fs::write(
+                    self.root.join("fonts.conf"),
+                    format!(
+                        "<?xml version=\"1.0\"?><!DOCTYPE fontconfig SYSTEM \"urn:fontconfig:fonts.dtd\"><fontconfig><dir>{}/fonts</dir><cachedir>{}/cache</cachedir>{rules}</fontconfig>",
+                        self.root.display(),
+                        self.root.display()
+                    ),
+                )?;
+                Ok(())
+            }
+
+            fn config(&self, locale: &str) -> TextEpochConfig {
+                TextEpochConfig {
+                    locale: locale.into(),
+                    fonts: vec![gpui::font("Epoch Latin")],
+                    text: vec!["m骨".into()],
+                    fontconfig_file: Some(self.root.join("fonts.conf")),
+                }
+            }
+
+            fn prepare(
+                &self,
+                source: &gpui::TextSystem,
+                locale: &str,
+            ) -> Result<gpui::PreparedTextEpoch> {
+                wait(source.prepare_text_epoch(self.config(locale))?.prepared())
+            }
+        }
+
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let parent =
+                    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".superpowers/i50-locale");
+                if self.root.is_absolute()
+                    && self.root.parent() == Some(parent.as_path())
+                    && self.root.join(".flea-test-sandbox").is_file()
+                {
+                    let _ = std::fs::remove_dir_all(&self.root);
+                }
+            }
+        }
+
+        fn source() -> gpui::TextSystem {
+            gpui::TextSystem::new(Arc::new(CosmicTextSystem::new_without_system_fonts(
+                "Epoch Latin",
+            )))
+        }
+
+        fn shape(system: Arc<gpui::TextSystem>) -> gpui::ShapedLine {
+            let text: SharedString = "m骨".into();
+            let run = gpui::TextRun {
+                len: text.len(),
+                font: gpui::font("Epoch Latin"),
+                color: gpui::Hsla::default(),
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            };
+            gpui::WindowTextSystem::new(system).shape_line(text, gpui::px(14.), &[run], None)
+        }
+
+        fn assert_face(
+            prepared: &gpui::PreparedTextEpoch,
+            expected: &str,
+            width: f32,
+        ) -> Result<()> {
+            let line = shape(prepared.text_system().clone());
+            assert!(prepared.text_system().accepts_layout(&line));
+            assert_eq!(line.runs.len(), 2);
+            let han = &line.runs[1];
+            assert_eq!(han.glyphs.len(), 1);
+            assert_ne!(han.glyphs[0].id.0, 0);
+            let id = han.font_id;
+            assert_eq!(id.text_epoch(), prepared.token().generation());
+            assert_eq!(
+                prepared.text_system().font_family_name(id).as_deref(),
+                Some(format!("Noto Sans CJK {expected}").as_str())
+            );
+            let font = prepared.text_system().get_font_for_id(id);
+            assert!(
+                font.is_none(),
+                "fallback identities must not alias the Latin primary"
+            );
+            let advance = prepared.text_system().advance(id, gpui::px(1000.), '骨')?;
+            assert_eq!(
+                advance.width,
+                gpui::px(width),
+                "wrong collection face: {expected}"
+            );
+            Ok(())
+        }
+
+        #[test]
+        fn i50_locale_han_face_selection() -> Result<()> {
+            let fixture = Fixture::new()?;
+            let source = source();
+            let lang_before = std::env::var_os("LANG");
+            for preference in ["jp", "kr", "sc", "tc", "hk", "default"] {
+                fixture.preference(preference)?;
+                for (locale, expected, width) in [
+                    ("ja_JP.UTF-8", "JP", 1000.),
+                    ("ko_KR.UTF-8", "KR", 1100.),
+                    ("zh_CN.UTF-8", "SC", 1200.),
+                    ("zh_TW.UTF-8", "TC", 1300.),
+                    ("zh_HK.UTF-8", "HK", 1400.),
+                ] {
+                    let prepared = fixture.prepare(&source, locale)?;
+                    assert_face(&prepared, expected, width)?;
+                }
+            }
+            assert_eq!(std::env::var_os("LANG"), lang_before);
+            Ok(())
+        }
+
+        #[test]
+        fn i50_locale_preference_reload() -> Result<()> {
+            let fixture = Fixture::new()?;
+            let source = source();
+            for (preference, expected, width) in [
+                ("jp", "JP", 1000.),
+                ("kr", "KR", 1100.),
+                ("sc", "SC", 1200.),
+                ("tc", "TC", 1300.),
+                ("hk", "HK", 1400.),
+                ("default", "SC", 1200.),
+            ] {
+                fixture.preference(preference)?;
+                assert_face(&fixture.prepare(&source, "en_US.UTF-8")?, expected, width)?;
+            }
+            Ok(())
+        }
+
+        #[test]
+        fn i50_locale_same_language_font_change() -> Result<()> {
+            let fixture = Fixture::new()?;
+            fixture.preference("jp")?;
+            let first = fixture.prepare(&source(), "en_US.UTF-8")?.commit()?;
+            let old = shape(first.clone());
+            fixture.preference("tc")?;
+            let prepared = fixture.prepare(&first, "en_US.UTF-8")?;
+            assert_face(&prepared, "TC", 1300.)?;
+            assert!(!prepared.text_system().accepts_layout(&old));
+            let window = gpui::WindowTextSystem::new(first.clone());
+            let run = gpui::TextRun {
+                len: "m骨".len(),
+                font: gpui::font("Epoch Latin"),
+                color: gpui::Hsla::default(),
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            };
+            let cached_old = window.shape_line("m骨".into(), gpui::px(14.), &[run.clone()], None);
+            let wrapper = first.line_wrapper(gpui::font("Epoch Latin"), gpui::px(14.));
+            let generation = prepared.token().generation();
+            first.install_text_epoch(&prepared)?;
+            drop(wrapper);
+            std::fs::write(fixture.root.join("fonts.conf"), "invalid after preparation")?;
+            let installed = window.shape_line("m骨".into(), gpui::px(14.), &[run], None);
+            assert_eq!(first.text_epoch(), generation);
+            assert_eq!(
+                first.font_family_name(installed.runs[1].font_id).as_deref(),
+                Some("Noto Sans CJK TC")
+            );
+            assert!(!first.accepts_layout(&cached_old));
+            assert_ne!(installed.width, cached_old.width);
+            assert_eq!(cached_old.width, old.width);
+            Ok(())
+        }
+
+        #[test]
+        fn i50_locale_failure_keeps_complete_epoch() -> Result<()> {
+            let fixture = Fixture::new()?;
+            assert_busy_install_keeps_old_epoch(&fixture)?;
+            let staged = fixture.prepare(&source(), "ja_JP.UTF-8")?;
+            let weak = Arc::downgrade(staged.text_system());
+            drop(
+                staged
+                    .text_system()
+                    .line_wrapper(gpui::font("Epoch Latin"), gpui::px(14.)),
+            );
+            drop(staged);
+            assert!(
+                weak.upgrade().is_none(),
+                "staged wrapper pool retained a retired epoch"
+            );
+            let current = fixture.prepare(&source(), "ja_JP.UTF-8")?.commit()?;
+            let before = shape(current.clone());
+            for failure in 0..3 {
+                let mut config = fixture.config("ko_KR.UTF-8");
+                match failure {
+                    0 => config.locale = "".into(),
+                    1 => config.fontconfig_file = Some(fixture.root.join("absent.conf")),
+                    _ => config.fonts = vec![gpui::font("Absent primary")],
+                }
+                let error = match wait(current.prepare_text_epoch(config)?.prepared()) {
+                    std::result::Result::Ok(_) => anyhow::bail!("failure case {failure} prepared"),
+                    Err(error) => format!("{error:#}"),
+                };
+                let expected = [
+                    "invalid text locale",
+                    "fontconfig configuration could not be loaded",
+                    "requested font family contains no font matching the other parameters",
+                ][failure];
+                assert!(error.contains(expected), "case {failure}: {error}");
+                assert_eq!(shape(current.clone()).width, before.width);
+                assert!(current.accepts_layout(&before));
+            }
+            Ok(())
+        }
+
+        #[test]
+        fn i50_locale_uncovered_held_text_prepares() -> Result<()> {
+            let fixture = Fixture::new()?;
+            let mut config = fixture.config("ja_JP.UTF-8");
+            config.text.push("\u{2068}m\u{2069}".into());
+            config.text.push("\u{10ffff}".into());
+            let prepared = wait(source().prepare_text_epoch(config)?.prepared())?;
+            assert_face(&prepared, "JP", 1000.)?;
+            Ok(())
+        }
+
+        #[test]
+        fn i50_locale_stale_font_id_fails_softly() -> Result<()> {
+            let fixture = Fixture::new()?;
+            let current = fixture.prepare(&source(), "ja_JP.UTF-8")?.commit()?;
+            let stale = current.resolve_font(&gpui::font("Epoch Latin"));
+            let next = fixture.prepare(&current, "ko_KR.UTF-8")?;
+            current.install_text_epoch(&next)?;
+            assert_ne!(stale.text_epoch(), current.text_epoch());
+            assert_eq!(current.ascent(stale, gpui::px(14.)), gpui::px(0.));
+            assert_eq!(current.descent(stale, gpui::px(14.)), gpui::px(0.));
+            assert!(current.advance(stale, gpui::px(14.), 'm').is_err());
+            assert!(
+                next.text_system()
+                    .advance(
+                        current.resolve_font(&gpui::font("Epoch Latin")),
+                        gpui::px(14.),
+                        'm'
+                    )
+                    .is_ok()
+            );
+            Ok(())
+        }
+
+        #[test]
+        fn i50_locale_fonts_added_during_preparation_rejected() -> Result<()> {
+            let fixture = Fixture::new()?;
+            let current = fixture.prepare(&source(), "ja_JP.UTF-8")?.commit()?;
+            let generation = current.text_epoch();
+            let raced = fixture.prepare(&current, "ko_KR.UTF-8")?;
+            current.add_fonts(vec![font("Epoch Added", false, 0, 0).into()])?;
+            let error = match current.install_text_epoch(&raced) {
+                std::result::Result::Ok(()) => {
+                    anyhow::bail!("installed an epoch missing added fonts")
+                }
+                Err(error) => format!("{error:#}"),
+            };
+            assert!(
+                error.contains("text fonts changed during preparation"),
+                "{error}"
+            );
+            assert_eq!(current.text_epoch(), generation);
+            let error = match raced.commit() {
+                std::result::Result::Ok(_) => {
+                    anyhow::bail!("committed an epoch missing added fonts")
+                }
+                Err(error) => format!("{error:#}"),
+            };
+            assert!(
+                error.contains("text fonts changed during preparation"),
+                "{error}"
+            );
+            let next = fixture.prepare(&current, "ko_KR.UTF-8")?;
+            current.install_text_epoch(&next)?;
+            let added = current.resolve_font(&gpui::font("Epoch Added"));
+            assert_eq!(
+                current.font_family_name(added).as_deref(),
+                Some("Epoch Added")
+            );
+            Ok(())
+        }
+
+        #[test]
+        fn i50_locale_stale_missing_glyph_report() -> Result<()> {
+            let system = CosmicTextSystem::new_without_system_fonts("Epoch Latin");
+            system.add_fonts(vec![font("Epoch Latin", false, 0, 0).into()])?;
+            let current = system.font_id(&gpui::font("Epoch Latin"))?;
+            let stale = FontId::for_text_epoch(current.local_index(), current.text_epoch() + 7)?;
+            assert!(system.advance(current, GlyphId(1)).is_ok());
+            assert!(system.advance(stale, GlyphId(1)).is_err());
+            let runs = [FontRun {
+                len: "x".len(),
+                font_id: stale,
+            }];
+            let missing = system.missing_glyphs("x", &runs, [0]);
+            assert_eq!(missing.len(), 1);
+            assert_eq!(missing[0].grapheme(), "x");
+            Ok(())
+        }
+
+        #[test]
+        fn i50_locale_fonts_added_while_preparing_rejected() -> Result<()> {
+            let fixture = Fixture::new()?;
+            let entered = Arc::new(std::sync::Barrier::new(2));
+            let release = Arc::new(std::sync::Barrier::new(2));
+            let source = Arc::new(gpui::TextSystem::new(Arc::new(GatedTextSystem {
+                entered: entered.clone(),
+                release: release.clone(),
+                first: std::sync::atomic::AtomicBool::new(false),
+                block_names: std::sync::atomic::AtomicBool::new(false),
+                block_add: std::sync::atomic::AtomicBool::new(true),
+                inner: CosmicTextSystem::new_without_system_fonts("Epoch Latin"),
+            })));
+            let adder = source.clone();
+            let worker = std::thread::spawn(move || {
+                adder.add_fonts(vec![font("Epoch Added", false, 0, 0).into()])
+            });
+            entered.wait();
+            let raced = fixture.prepare(&source, "ja_JP.UTF-8");
+            release.wait();
+            worker.join().unwrap()?;
+            let error = match source.install_text_epoch(&raced?) {
+                std::result::Result::Ok(()) => {
+                    anyhow::bail!("installed an epoch missing fonts added while preparing")
+                }
+                Err(error) => format!("{error:#}"),
+            };
+            assert!(
+                error.contains("text fonts changed during preparation"),
+                "{error}"
+            );
+            Ok(())
+        }
+
+        #[test]
+        fn i50_locale_commit_during_font_add_rejected() -> Result<()> {
+            let fixture = Fixture::new()?;
+            let entered = Arc::new(std::sync::Barrier::new(2));
+            let release = Arc::new(std::sync::Barrier::new(2));
+            let source = Arc::new(gpui::TextSystem::new(Arc::new(GatedTextSystem {
+                entered: entered.clone(),
+                release: release.clone(),
+                first: std::sync::atomic::AtomicBool::new(false),
+                block_names: std::sync::atomic::AtomicBool::new(false),
+                block_add: std::sync::atomic::AtomicBool::new(true),
+                inner: CosmicTextSystem::new_without_system_fonts("Epoch Latin"),
+            })));
+            let prepared = fixture.prepare(&source, "ja_JP.UTF-8")?;
+            let adder = source.clone();
+            let worker = std::thread::spawn(move || {
+                adder.add_fonts(vec![font("Epoch Added", false, 0, 0).into()])
+            });
+            entered.wait();
+            let committed = prepared.commit();
+            release.wait();
+            worker.join().unwrap()?;
+            let error = match committed {
+                std::result::Result::Ok(_) => {
+                    anyhow::bail!("committed an epoch while fonts were being added")
+                }
+                Err(error) => format!("{error:#}"),
+            };
+            assert!(
+                error.contains("text fonts changed during preparation"),
+                "{error}"
+            );
+            Ok(())
+        }
+
+        struct GatedTextSystem {
+            entered: Arc<std::sync::Barrier>,
+            release: Arc<std::sync::Barrier>,
+            first: std::sync::atomic::AtomicBool,
+            block_names: std::sync::atomic::AtomicBool,
+            block_add: std::sync::atomic::AtomicBool,
+            inner: CosmicTextSystem,
+        }
+
+        impl PlatformTextSystem for GatedTextSystem {
+            fn prepare_text_epoch(
+                &self,
+                config: &TextEpochConfig,
+                token: &TextEpochToken,
+            ) -> Result<Arc<dyn PlatformTextSystem>> {
+                if self.first.swap(false, Ordering::AcqRel) {
+                    self.entered.wait();
+                    self.release.wait();
+                }
+                self.inner.prepare_text_epoch(config, token)
+            }
+            fn add_fonts(&self, fonts: Vec<Cow<'static, [u8]>>) -> Result<()> {
+                if self.block_add.swap(false, Ordering::AcqRel) {
+                    self.entered.wait();
+                    self.release.wait();
+                }
+                self.inner.add_fonts(fonts)
+            }
+            fn all_font_names(&self) -> Vec<String> {
+                if self.block_names.swap(false, Ordering::AcqRel) {
+                    self.entered.wait();
+                    self.release.wait();
+                }
+                self.inner.all_font_names()
+            }
+            fn font_id(&self, font: &Font) -> Result<FontId> {
+                self.inner.font_id(font)
+            }
+            fn font_metrics(&self, id: FontId) -> FontMetrics {
+                self.inner.font_metrics(id)
+            }
+            fn typographic_bounds(&self, id: FontId, glyph: GlyphId) -> Result<Bounds<f32>> {
+                self.inner.typographic_bounds(id, glyph)
+            }
+            fn advance(&self, id: FontId, glyph: GlyphId) -> Result<Size<f32>> {
+                self.inner.advance(id, glyph)
+            }
+            fn glyph_for_char(&self, id: FontId, ch: char) -> Option<GlyphId> {
+                self.inner.glyph_for_char(id, ch)
+            }
+            fn glyph_raster_bounds(
+                &self,
+                params: &RenderGlyphParams,
+            ) -> Result<Bounds<DevicePixels>> {
+                self.inner.glyph_raster_bounds(params)
+            }
+            fn rasterize_glyph(
+                &self,
+                params: &RenderGlyphParams,
+                bounds: Bounds<DevicePixels>,
+            ) -> Result<(Size<DevicePixels>, Vec<u8>)> {
+                self.inner.rasterize_glyph(params, bounds)
+            }
+            fn layout_line(&self, text: &str, size: Pixels, runs: &[FontRun]) -> LineLayout {
+                self.inner.layout_line(text, size, runs)
+            }
+            fn recommended_rendering_mode(&self, id: FontId, size: Pixels) -> TextRenderingMode {
+                self.inner.recommended_rendering_mode(id, size)
+            }
+        }
+
+        fn assert_busy_install_keeps_old_epoch(fixture: &Fixture) -> Result<()> {
+            let entered = Arc::new(std::sync::Barrier::new(2));
+            let release = Arc::new(std::sync::Barrier::new(2));
+            let platform = Arc::new(GatedTextSystem {
+                entered: entered.clone(),
+                release: release.clone(),
+                first: std::sync::atomic::AtomicBool::new(false),
+                block_names: std::sync::atomic::AtomicBool::new(false),
+                block_add: std::sync::atomic::AtomicBool::new(false),
+                inner: CosmicTextSystem::new_without_system_fonts("Epoch Latin"),
+            });
+            let source = Arc::new(gpui::TextSystem::new(platform.clone()));
+            let prepared = fixture.prepare(&source, "ja_JP.UTF-8")?;
+            platform.block_names.store(true, Ordering::Release);
+            let reader = source.clone();
+            let worker = std::thread::spawn(move || reader.all_font_names());
+            entered.wait();
+            let result = source.install_text_epoch(&prepared);
+            let unchanged = source.text_epoch() == 0;
+            release.wait();
+            worker.join().unwrap();
+            assert!(result.is_err() && unchanged);
+            source.install_text_epoch(&prepared)?;
+            assert_eq!(source.text_epoch(), prepared.token().generation());
+            assert_face(&prepared, "JP", 1000.)?;
+            Ok(())
+        }
+
+        fn assert_pending_work_cancelled(fixture: &Fixture) -> Result<()> {
+            let entered = Arc::new(std::sync::Barrier::new(2));
+            let release = Arc::new(std::sync::Barrier::new(2));
+            let source = gpui::TextSystem::new(Arc::new(GatedTextSystem {
+                entered: entered.clone(),
+                release: release.clone(),
+                first: std::sync::atomic::AtomicBool::new(true),
+                block_names: std::sync::atomic::AtomicBool::new(false),
+                block_add: std::sync::atomic::AtomicBool::new(false),
+                inner: CosmicTextSystem::new_without_system_fonts("Epoch Latin"),
+            }));
+            let running = source.prepare_text_epoch(fixture.config("ja_JP.UTF-8"))?;
+            entered.wait();
+            let pending = source.prepare_text_epoch(fixture.config("zh_CN.UTF-8"))?;
+            let newest = source.prepare_text_epoch(fixture.config("ko_KR.UTF-8"))?;
+            let running_stale = !running.token().is_current();
+            let pending_stale = !pending.token().is_current();
+            release.wait();
+            assert!(running_stale && pending_stale);
+            assert!(wait(running.prepared()).is_err());
+            assert!(wait(pending.prepared()).is_err());
+            assert_face(&wait(newest.prepared())?, "KR", 1100.)?;
+            Ok(())
+        }
+
+        #[test]
+        fn i50_locale_epoch_stale_shape_rejected() -> Result<()> {
+            use gpui::{AtlasKey, HeadlessAtlas, PlatformAtlas};
+            let fixture = Fixture::new()?;
+            assert_pending_work_cancelled(&fixture)?;
+            let source = source();
+            let old = fixture.prepare(&source, "ja_JP.UTF-8")?;
+            let old_line = shape(old.text_system().clone());
+            let next = fixture.prepare(&source, "ko_KR.UTF-8")?;
+            assert!(!old.token().is_current());
+            assert!(old.commit().is_err());
+            assert!(!next.text_system().accepts_layout(&old_line));
+            let new_line = shape(next.text_system().clone());
+            let params = |id| RenderGlyphParams {
+                font_id: id,
+                glyph_id: GlyphId(2),
+                font_size: gpui::px(14.),
+                subpixel_variant: gpui::point(0, 0),
+                scale_factor: 1.,
+                is_emoji: false,
+                subpixel_rendering: false,
+                dilation: 0,
+            };
+            let atlas = HeadlessAtlas::default();
+            let old_key = AtlasKey::Glyph(params(old_line.runs[1].font_id));
+            let new_key = AtlasKey::Glyph(params(new_line.runs[1].font_id));
+            let mut build = || {
+                Ok(Some((
+                    gpui::size(gpui::DevicePixels(1), gpui::DevicePixels(1)),
+                    Cow::Borrowed(&[255u8][..]),
+                )))
+            };
+            assert!(
+                atlas
+                    .get_or_insert_with(old_key.clone(), &mut build)?
+                    .is_some()
+            );
+            let before = atlas.generation();
+            assert!(atlas.get_or_insert_with(new_key, &mut build)?.is_some());
+            assert_ne!(atlas.generation(), before);
+            assert!(!atlas.contains(&old_key));
+            assert!(atlas.get_or_insert_with(old_key, &mut build).is_err());
+            let task = source.prepare_text_epoch(fixture.config("en_US.UTF-8"))?;
+            let cancelled = task.token();
+            drop(task);
+            assert!(!cancelled.is_current());
+            Ok(())
+        }
+
+        fn font(family: &str, han: bool, variant: u16, base: usize) -> Vec<u8> {
+            fn u16_at(bytes: &mut [u8], offset: usize, value: u16) {
+                bytes[offset..offset + 2].copy_from_slice(&value.to_be_bytes());
+            }
+            fn u32_at(bytes: &mut [u8], offset: usize, value: u32) {
+                bytes[offset..offset + 4].copy_from_slice(&value.to_be_bytes());
+            }
+            let mut tables = std::collections::BTreeMap::<[u8; 4], Vec<u8>>::new();
+            let mut head = vec![0; 54];
+            u32_at(&mut head, 0, 0x10000);
+            u32_at(&mut head, 12, 0x5f0f3cf5);
+            u16_at(&mut head, 18, 1000);
+            u16_at(&mut head, 40, 600);
+            u16_at(&mut head, 42, 800);
+            tables.insert(*b"head", head);
+            let mut hhea = vec![0; 36];
+            u32_at(&mut hhea, 0, 0x10000);
+            u16_at(&mut hhea, 4, 800);
+            u16_at(&mut hhea, 6, (-200i16) as u16);
+            u16_at(&mut hhea, 10, 1400);
+            u16_at(&mut hhea, 34, 3);
+            tables.insert(*b"hhea", hhea);
+            let mut maxp = vec![0; 6];
+            u32_at(&mut maxp, 0, 0x5000);
+            u16_at(&mut maxp, 4, 3);
+            tables.insert(*b"maxp", maxp);
+            let mut metrics = Vec::new();
+            for advance in [500, 600, 1000 + variant * 100] {
+                metrics.extend(advance.to_be_bytes());
+                metrics.extend(0u16.to_be_bytes());
+            }
+            tables.insert(*b"hmtx", metrics);
+            let groups = if han { 2 } else { 1 };
+            let mut cmap = vec![0; 12 + 16 + groups * 12];
+            u16_at(&mut cmap, 2, 1);
+            u16_at(&mut cmap, 4, 3);
+            u16_at(&mut cmap, 6, 10);
+            u32_at(&mut cmap, 8, 12);
+            u16_at(&mut cmap, 12, 12);
+            u32_at(&mut cmap, 16, (16 + groups * 12) as u32);
+            u32_at(&mut cmap, 24, groups as u32);
+            for (index, cp) in [109, 0x9aa8].iter().take(groups).enumerate() {
+                let start = 28 + index * 12;
+                u32_at(&mut cmap, start, *cp);
+                u32_at(&mut cmap, start + 4, *cp);
+                u32_at(&mut cmap, start + 8, index as u32 + 1);
+            }
+            tables.insert(*b"cmap", cmap);
+            let mut names = Vec::new();
+            let mut records = Vec::new();
+            for (id, value) in [
+                (1, family.to_owned()),
+                (2, "Regular".into()),
+                (4, family.to_owned()),
+                (6, family.replace(' ', "")),
+                (16, family.to_owned()),
+            ] {
+                let start = names.len();
+                for unit in value.encode_utf16() {
+                    names.extend(unit.to_be_bytes());
+                }
+                for value in [
+                    3u16,
+                    1,
+                    0x409,
+                    id,
+                    (names.len() - start) as u16,
+                    start as u16,
+                ] {
+                    records.extend(value.to_be_bytes());
+                }
+            }
+            let mut name = vec![0; 6];
+            u16_at(&mut name, 2, 5);
+            u16_at(&mut name, 4, 66);
+            name.extend(records);
+            name.extend(names);
+            tables.insert(*b"name", name);
+            let mut post = vec![0; 32];
+            u32_at(&mut post, 0, 0x30000);
+            tables.insert(*b"post", post);
+            let mut os2 = vec![0; 96];
+            u16_at(&mut os2, 0, 4);
+            u16_at(&mut os2, 2, 600);
+            u16_at(&mut os2, 4, 400);
+            u16_at(&mut os2, 6, 5);
+            u16_at(&mut os2, 62, 0x40);
+            u16_at(&mut os2, 64, 109);
+            u16_at(&mut os2, 66, if han { 0x9aa8 } else { 109 });
+            u16_at(&mut os2, 68, 800);
+            u16_at(&mut os2, 70, (-200i16) as u16);
+            u16_at(&mut os2, 74, 800);
+            u16_at(&mut os2, 76, 200);
+            tables.insert(*b"OS/2", os2);
+            let mut glyf = Vec::new();
+            for _ in 0..3 {
+                let mut glyph = vec![0; 36];
+                u16_at(&mut glyph, 0, 1);
+                u16_at(&mut glyph, 6, 500);
+                u16_at(&mut glyph, 8, 700);
+                u16_at(&mut glyph, 10, 3);
+                glyph[14..18].fill(1);
+                for (index, delta) in [0i16, 500, 0, -500, 0, 0, 700, 0].iter().enumerate() {
+                    u16_at(&mut glyph, 18 + index * 2, *delta as u16);
+                }
+                glyf.extend(glyph);
+            }
+            tables.insert(*b"glyf", glyf);
+            let mut loca = Vec::new();
+            for offset in [0u16, 18, 36, 54] {
+                loca.extend(offset.to_be_bytes());
+            }
+            tables.insert(*b"loca", loca);
+            let count = tables.len();
+            let mut output = vec![0; 12 + count * 16];
+            u32_at(&mut output, 0, 0x10000);
+            u16_at(&mut output, 4, count as u16);
+            u16_at(&mut output, 6, 128);
+            u16_at(&mut output, 8, 3);
+            u16_at(&mut output, 10, count as u16 * 16 - 128);
+            for (index, (tag, mut data)) in tables.into_iter().enumerate() {
+                let length = data.len();
+                while data.len() % 4 != 0 {
+                    data.push(0);
+                }
+                let checksum = data
+                    .chunks_exact(4)
+                    .map(|bytes| u32::from_be_bytes(bytes.try_into().unwrap()))
+                    .fold(0u32, u32::wrapping_add);
+                let record = 12 + index * 16;
+                output[record..record + 4].copy_from_slice(&tag);
+                u32_at(&mut output, record + 4, checksum);
+                let offset = base + output.len();
+                u32_at(&mut output, record + 8, offset as u32);
+                u32_at(&mut output, record + 12, length as u32);
+                output.extend(data);
+            }
+            output
+        }
+    }
     use super::*;
     #[cfg(feature = "test-support")]
     #[cfg(not(feature = "ci-exclude-bundled-font-tests"))]

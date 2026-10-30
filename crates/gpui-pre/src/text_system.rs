@@ -41,6 +41,146 @@ use std::{
 #[repr(C)]
 pub struct FontId(pub usize);
 
+const FONT_INDEX_BITS: u32 = usize::BITS / 2;
+const FONT_INDEX_MASK: usize = (1 << FONT_INDEX_BITS) - 1;
+static NEXT_TEXT_EPOCH: AtomicUsize = AtomicUsize::new(1);
+
+impl FontId {
+    /// Creates a font identity whose namespace is isolated from previous text epochs.
+    pub fn for_text_epoch(index: usize, generation: usize) -> Result<Self> {
+        anyhow::ensure!(
+            index <= FONT_INDEX_MASK && generation <= FONT_INDEX_MASK,
+            "text epoch font identity exhausted"
+        );
+        Ok(Self((generation << FONT_INDEX_BITS) | index))
+    }
+
+    /// Returns the generation of the text snapshot that owns this font.
+    pub fn text_epoch(self) -> usize {
+        self.0 >> FONT_INDEX_BITS
+    }
+
+    /// Returns the font's index within its owning text snapshot.
+    pub fn local_index(self) -> usize {
+        self.0 & FONT_INDEX_MASK
+    }
+}
+
+/// Inputs captured together with the application's catalog and held layout snapshot.
+#[derive(Clone, Debug)]
+pub struct TextEpochConfig {
+    /// The roster's explicit locale, for example `ja_JP.UTF-8`, independent of process LANG.
+    pub locale: String,
+    /// Every primary font needed by the held surfaces, including popovers.
+    pub fonts: Vec<Font>,
+    /// Text to resolve before publication; later text uses the frozen font database.
+    pub text: Vec<SharedString>,
+    /// Optional isolated fontconfig configuration; `None` reloads the user's normal configuration.
+    pub fontconfig_file: Option<std::path::PathBuf>,
+}
+
+/// A cancellation and publication boundary shared by all work for one requested epoch.
+#[derive(Clone)]
+pub struct TextEpochToken {
+    generation: usize,
+    latest: Arc<AtomicUsize>,
+}
+
+impl TextEpochToken {
+    /// Returns the requested epoch's globally unique generation.
+    pub fn generation(&self) -> usize {
+        self.generation
+    }
+
+    /// Old asynchronous results must be discarded when this returns false.
+    pub fn is_current(&self) -> bool {
+        self.latest.load(Ordering::Acquire) == self.generation
+    }
+
+    /// Cancels this request without cancelling any newer request.
+    pub fn cancel(&self) {
+        let _ =
+            self.latest
+                .compare_exchange(self.generation, 0, Ordering::AcqRel, Ordering::Acquire);
+    }
+}
+
+struct EpochRequest {
+    config: TextEpochConfig,
+    token: TextEpochToken,
+    fonts: usize,
+    source: Arc<dyn PlatformTextSystem>,
+    sender: async_channel::Sender<Result<PreparedTextEpoch>>,
+}
+
+#[derive(Default)]
+struct EpochQueue {
+    pending: Option<EpochRequest>,
+    running: bool,
+}
+
+/// A bounded background preparation job; dropping it cancels its publication.
+pub struct TextEpochTask {
+    token: TextEpochToken,
+    receiver: async_channel::Receiver<Result<PreparedTextEpoch>>,
+    cancel_on_drop: bool,
+}
+
+impl TextEpochTask {
+    /// Returns a token for rejecting stale layout and catalog work.
+    pub fn token(&self) -> TextEpochToken {
+        self.token.clone()
+    }
+
+    /// Waits asynchronously for the complete replacement without blocking the UI thread.
+    pub async fn prepared(mut self) -> Result<PreparedTextEpoch> {
+        let result = self
+            .receiver
+            .recv()
+            .await
+            .map_err(|_| anyhow!("text epoch worker stopped"))?;
+        self.cancel_on_drop = result.is_err();
+        result
+    }
+}
+
+impl Drop for TextEpochTask {
+    fn drop(&mut self) {
+        if self.cancel_on_drop {
+            self.token.cancel();
+        }
+    }
+}
+
+/// An isolated replacement with fresh line, metrics, raster and font caches.
+pub struct PreparedTextEpoch {
+    token: TextEpochToken,
+    fonts: usize,
+    text_system: Arc<TextSystem>,
+}
+
+impl PreparedTextEpoch {
+    /// Provides the prepared system for staging layouts before the atomic application swap.
+    pub fn text_system(&self) -> &Arc<TextSystem> {
+        &self.text_system
+    }
+
+    /// Returns the cancellation boundary for all work staged from this replacement.
+    pub fn token(&self) -> TextEpochToken {
+        self.token.clone()
+    }
+
+    /// Rejects a stale result before the caller swaps every window and catalog in one UI turn.
+    pub fn commit(self) -> Result<Arc<TextSystem>> {
+        anyhow::ensure!(self.token.is_current(), "text epoch superseded");
+        anyhow::ensure!(
+            self.text_system.epoch_fonts.load(Ordering::Acquire) == self.fonts,
+            "text fonts changed during preparation"
+        );
+        Ok(self.text_system)
+    }
+}
+
 /// An opaque identifier for a specific font family.
 #[derive(Hash, PartialEq, Eq, Clone, Copy, Debug)]
 pub struct FontFamilyId(pub usize);
@@ -226,13 +366,88 @@ impl Drop for MissingGlyphReceiver {
     }
 }
 
+struct EpochPlatformTextSystem(RwLock<Arc<dyn PlatformTextSystem>>);
+
+impl EpochPlatformTextSystem {
+    fn snapshot(&self) -> Arc<dyn PlatformTextSystem> {
+        self.0.read().clone()
+    }
+}
+
+impl PlatformTextSystem for EpochPlatformTextSystem {
+    fn text_epoch(&self) -> usize {
+        self.0.read().text_epoch()
+    }
+    fn prepare_text_epoch(
+        &self,
+        config: &TextEpochConfig,
+        token: &TextEpochToken,
+    ) -> Result<Arc<dyn PlatformTextSystem>> {
+        self.0.read().prepare_text_epoch(config, token)
+    }
+    fn add_fonts(&self, fonts: Vec<Cow<'static, [u8]>>) -> Result<()> {
+        self.0.read().add_fonts(fonts)
+    }
+    fn set_missing_glyph_sink(&self, sink: Option<Arc<dyn MissingGlyphSink>>) {
+        self.0.read().set_missing_glyph_sink(sink);
+    }
+    fn all_font_names(&self) -> Vec<String> {
+        self.0.read().all_font_names()
+    }
+    fn font_id(&self, font: &Font) -> Result<FontId> {
+        self.0.read().font_id(font)
+    }
+    fn font_family_name(&self, id: FontId) -> Option<SharedString> {
+        self.0.read().font_family_name(id)
+    }
+    fn prewarm_fonts(&self, ids: &[FontId]) {
+        self.0.read().prewarm_fonts(ids);
+    }
+    fn font_metrics(&self, id: FontId) -> FontMetrics {
+        self.0.read().font_metrics(id)
+    }
+    fn typographic_bounds(&self, id: FontId, glyph: GlyphId) -> Result<Bounds<f32>> {
+        self.0.read().typographic_bounds(id, glyph)
+    }
+    fn advance(&self, id: FontId, glyph: GlyphId) -> Result<Size<f32>> {
+        self.0.read().advance(id, glyph)
+    }
+    fn glyph_for_char(&self, id: FontId, ch: char) -> Option<GlyphId> {
+        self.0.read().glyph_for_char(id, ch)
+    }
+    fn glyph_raster_bounds(&self, params: &RenderGlyphParams) -> Result<Bounds<DevicePixels>> {
+        self.0.read().glyph_raster_bounds(params)
+    }
+    fn rasterize_glyph(
+        &self,
+        params: &RenderGlyphParams,
+        bounds: Bounds<DevicePixels>,
+    ) -> Result<(Size<DevicePixels>, Vec<u8>)> {
+        self.0.read().rasterize_glyph(params, bounds)
+    }
+    fn layout_line(&self, text: &str, size: Pixels, runs: &[FontRun]) -> LineLayout {
+        self.0.read().layout_line(text, size, runs)
+    }
+    fn recommended_rendering_mode(&self, id: FontId, size: Pixels) -> TextRenderingMode {
+        self.0.read().recommended_rendering_mode(id, size)
+    }
+    fn glyph_dilation_for_color(&self, color: Hsla) -> u8 {
+        self.0.read().glyph_dilation_for_color(color)
+    }
+}
+
 /// The GPUI text rendering sub system.
 pub struct TextSystem {
-    platform_text_system: Arc<dyn PlatformTextSystem>,
+    epoch_generation: AtomicUsize,
+    epoch_latest: Arc<AtomicUsize>,
+    epoch_queue: Arc<Mutex<EpochQueue>>,
+    epoch_fonts: Arc<AtomicUsize>,
+    platform_text_system: Arc<EpochPlatformTextSystem>,
     font_ids_by_font: RwLock<FxHashMap<Font, Result<FontId>>>,
     font_metrics: RwLock<FxHashMap<FontId, FontMetrics>>,
     raster_bounds: RwLock<FxHashMap<RenderGlyphParams, Bounds<DevicePixels>>>,
     wrapper_pool: Mutex<FxHashMap<FontIdWithSize, Vec<LineWrapper>>>,
+    wrapper_snapshot: Mutex<Option<Arc<TextSystem>>>,
     font_runs_pool: Mutex<Vec<Vec<FontRun>>>,
     fallback_font_stack: SmallVec<[Font; 2]>,
     font_generation: Arc<AtomicUsize>,
@@ -246,11 +461,18 @@ impl TextSystem {
         let (sender, receiver) = async_channel::bounded(MAX_REPORTED_MISSING_GLYPHS);
         let missing_glyph_generation = Arc::<AtomicUsize>::default();
         TextSystem {
-            platform_text_system,
+            epoch_generation: AtomicUsize::new(platform_text_system.text_epoch()),
+            epoch_latest: Arc::default(),
+            epoch_queue: Arc::default(),
+            epoch_fonts: Arc::default(),
+            platform_text_system: Arc::new(EpochPlatformTextSystem(RwLock::new(
+                platform_text_system,
+            ))),
             font_metrics: RwLock::default(),
             raster_bounds: RwLock::default(),
             font_ids_by_font: RwLock::default(),
             wrapper_pool: Mutex::default(),
+            wrapper_snapshot: Mutex::default(),
             font_runs_pool: Mutex::default(),
             fallback_font_stack: smallvec![
                 // TODO: Remove this when Linux have implemented setting fallbacks.
@@ -278,6 +500,176 @@ impl TextSystem {
         }
     }
 
+    /// Returns the snapshot generation used by caller-owned shaped-text caches.
+    pub fn text_epoch(&self) -> usize {
+        self.epoch_generation.load(Ordering::Acquire)
+    }
+
+    /// Rejects a layout produced for a different font/locale snapshot.
+    pub fn accepts_layout(&self, layout: &LineLayout) -> bool {
+        layout
+            .runs
+            .iter()
+            .all(|run| run.font_id.text_epoch() == self.text_epoch())
+    }
+
+    /// Rebuilds font fallback on one worker with at most one pending request, keeping this system intact.
+    pub fn prepare_text_epoch(&self, config: TextEpochConfig) -> Result<TextEpochTask> {
+        let mut queue = self.epoch_queue.lock();
+        let generation = NEXT_TEXT_EPOCH
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                (value <= FONT_INDEX_MASK).then_some(value + 1)
+            })
+            .map_err(|_| anyhow!("text epoch generation exhausted"))?;
+        let (sender, receiver) = async_channel::bounded(1);
+        let token = TextEpochToken {
+            generation,
+            latest: self.epoch_latest.clone(),
+        };
+        self.epoch_latest.store(generation, Ordering::Release);
+        if let Some(old) = queue.pending.replace(EpochRequest {
+            config,
+            token: token.clone(),
+            fonts: self.epoch_fonts.load(Ordering::Acquire),
+            source: self.platform_text_system.snapshot(),
+            sender,
+        }) {
+            let _ = old.sender.try_send(Err(anyhow!("text epoch superseded")));
+        }
+        if !queue.running {
+            queue.running = true;
+            let shared_queue = self.epoch_queue.clone();
+            let latest = self.epoch_latest.clone();
+            let epoch_fonts = self.epoch_fonts.clone();
+            let worker_queue = shared_queue.clone();
+            if let Err(error) =
+                std::thread::Builder::new()
+                    .name("text-epoch".into())
+                    .spawn(move || {
+                        loop {
+                            let request = {
+                                let mut queue = worker_queue.lock();
+                                match queue.pending.take() {
+                                    Some(request) => request,
+                                    None => {
+                                        queue.running = false;
+                                        break;
+                                    }
+                                }
+                            };
+                            let result =
+                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    anyhow::ensure!(
+                                        request.token.is_current(),
+                                        "text epoch superseded"
+                                    );
+                                    let platform = request
+                                        .source
+                                        .prepare_text_epoch(&request.config, &request.token)?;
+                                    anyhow::ensure!(
+                                        request.token.is_current(),
+                                        "text epoch superseded"
+                                    );
+                                    anyhow::ensure!(
+                                        platform.text_epoch() == request.token.generation,
+                                        "platform returned a mismatched text epoch"
+                                    );
+                                    let mut replacement = TextSystem::new(platform);
+                                    replacement
+                                        .epoch_generation
+                                        .store(request.token.generation, Ordering::Release);
+                                    replacement.epoch_latest = latest.clone();
+                                    replacement.epoch_queue = shared_queue.clone();
+                                    replacement.epoch_fonts = epoch_fonts.clone();
+                                    Ok(PreparedTextEpoch {
+                                        token: request.token.clone(),
+                                        fonts: request.fonts,
+                                        text_system: Arc::new(replacement),
+                                    })
+                                }))
+                                .unwrap_or_else(|_| Err(anyhow!("text epoch worker panicked")));
+                            let _ = request.sender.try_send(result);
+                        }
+                    })
+            {
+                queue.running = false;
+                queue.pending.take();
+                token.cancel();
+                return Err(error.into());
+            }
+        }
+        Ok(TextEpochTask {
+            token,
+            receiver,
+            cancel_on_drop: true,
+        })
+    }
+
+    /// Installs a staged epoch for every window sharing this system; a busy cache or stale request errors and keeps the old epoch.
+    pub fn install_text_epoch(&self, prepared: &PreparedTextEpoch) -> Result<()> {
+        anyhow::ensure!(
+            Arc::ptr_eq(&self.epoch_latest, &prepared.token.latest),
+            "text epoch belongs to another coordinator"
+        );
+        let _queue = self
+            .epoch_queue
+            .try_lock()
+            .context("text epoch coordinator is busy")?;
+        anyhow::ensure!(prepared.token.is_current(), "text epoch superseded");
+        let replacement = prepared
+            .text_system
+            .platform_text_system
+            .0
+            .try_read()
+            .context("prepared text epoch is busy")?
+            .clone();
+        let mut platform = self
+            .platform_text_system
+            .0
+            .try_write()
+            .context("text platform is busy")?;
+        anyhow::ensure!(
+            self.epoch_fonts.load(Ordering::Acquire) == prepared.fonts,
+            "text fonts changed during preparation"
+        );
+        let mut fonts = self
+            .font_ids_by_font
+            .try_write()
+            .context("text font cache is busy")?;
+        let mut metrics = self
+            .font_metrics
+            .try_write()
+            .context("text metrics cache is busy")?;
+        let mut bounds = self
+            .raster_bounds
+            .try_write()
+            .context("text raster cache is busy")?;
+        let mut wrappers = self
+            .wrapper_pool
+            .try_lock()
+            .context("text wrapper cache is busy")?;
+        let mut wrapper_snapshot = self
+            .wrapper_snapshot
+            .try_lock()
+            .context("text wrapper snapshot is busy")?;
+        let mut runs = self
+            .font_runs_pool
+            .try_lock()
+            .context("text run pool is busy")?;
+        let generation = prepared.token.generation;
+        *platform = replacement;
+        fonts.clear();
+        metrics.clear();
+        bounds.clear();
+        wrappers.clear();
+        wrapper_snapshot.take();
+        runs.clear();
+        self.missing_glyph_reporter.reset();
+        self.epoch_generation.store(generation, Ordering::Release);
+        self.font_generation.fetch_add(1, Ordering::Release);
+        Ok(())
+    }
+
     /// Get sorted, unique font family names available to the platform text system.
     ///
     /// Includes fonts registered with [`Self::add_fonts`].
@@ -293,7 +685,11 @@ impl TextSystem {
     /// Cached font resolution and line layouts are invalidated after installation.
     /// Layouts already in progress may complete against the previous font set.
     pub fn add_fonts(&self, fonts: Vec<Cow<'static, [u8]>>) -> Result<()> {
-        self.platform_text_system.add_fonts(fonts)?;
+        // Counted before and after the platform call so no preparation can record a half-added font set.
+        self.epoch_fonts.fetch_add(1, Ordering::AcqRel);
+        let added = self.platform_text_system.add_fonts(fonts);
+        self.epoch_fonts.fetch_add(1, Ordering::AcqRel);
+        added?;
         self.font_ids_by_font.write().clear();
         self.missing_glyph_reporter.reset();
         self.font_generation.fetch_add(1, Ordering::Release);
@@ -334,20 +730,29 @@ impl TextSystem {
             }
         }
 
-        let font_id = self
-            .font_ids_by_font
-            .read()
-            .get(font)
-            .map(clone_font_id_result);
-        if let Some(font_id) = font_id {
-            font_id
-        } else {
+        loop {
+            let generation = self.text_epoch();
+            let font_id = self
+                .font_ids_by_font
+                .read()
+                .get(font)
+                .map(clone_font_id_result);
+            if let Some(font_id) = font_id {
+                return font_id;
+            }
             let font_id = self.platform_text_system.font_id(font);
-            self.font_ids_by_font
-                .write()
-                .insert(font.clone(), clone_font_id_result(&font_id));
-            font_id
+            let mut cache = self.font_ids_by_font.write();
+            if generation != self.text_epoch() {
+                continue;
+            }
+            cache.insert(font.clone(), clone_font_id_result(&font_id));
+            return font_id;
         }
+    }
+
+    /// Returns the actual selected family, including script fallback faces.
+    pub fn font_family_name(&self, id: FontId) -> Option<SharedString> {
+        self.platform_text_system.font_family_name(id)
     }
 
     /// Get the Font for the Font Id.
@@ -548,9 +953,15 @@ impl TextSystem {
         let wrappers = lock
             .entry(FontIdWithSize { font_id, font_size })
             .or_default();
-        let wrapper = wrappers
-            .pop()
-            .unwrap_or_else(|| LineWrapper::new(font_id, font_size, self.clone()));
+        let wrapper = wrappers.pop().unwrap_or_else(|| {
+            let mut snapshot = self.wrapper_snapshot.lock();
+            let snapshot = snapshot
+                .get_or_insert_with(|| {
+                    Arc::new(TextSystem::new(self.platform_text_system.snapshot()))
+                })
+                .clone();
+            LineWrapper::new(font_id, font_size, snapshot)
+        });
 
         LineWrapperHandle {
             wrapper: Some(wrapper),
@@ -1097,12 +1508,15 @@ impl Drop for LineWrapperHandle {
     fn drop(&mut self) {
         let mut state = self.text_system.wrapper_pool.lock();
         let wrapper = self.wrapper.take().unwrap();
+        if wrapper.font_id.text_epoch() != self.text_system.text_epoch() {
+            return;
+        }
         state
-            .get_mut(&FontIdWithSize {
+            .entry(FontIdWithSize {
                 font_id: wrapper.font_id,
                 font_size: wrapper.font_size,
             })
-            .unwrap()
+            .or_default()
             .push(wrapper);
     }
 }
