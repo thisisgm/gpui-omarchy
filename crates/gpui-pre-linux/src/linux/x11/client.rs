@@ -49,14 +49,15 @@ use super::{
 };
 
 use crate::linux::{
-    DEFAULT_CURSOR_ICON_NAME, capslock_from_xkb, cursor_style_to_icon_names, get_xkb_compose_state,
-    is_within_click_distance, keystroke_from_xkb, keystroke_underlying_dead_key,
-    log_cursor_icon_warning, modifiers_from_xkb, new_xkb_context, open_uri_internal,
+    DEFAULT_CURSOR_ICON_NAME, XkbKeyboardLayout, capslock_from_xkb, composes,
+    cursor_style_to_icon_names, get_xkb_compose_state, is_within_click_distance,
+    keystroke_from_xkb, keystroke_underlying_dead_key, log_cursor_icon_warning, modifiers_from_xkb,
+    new_xkb_context, open_uri_internal,
     platform::{DOUBLE_CLICK_INTERVAL, SCROLL_LINES},
-    reveal_path_internal,
+    prefers_character_input, reveal_path_internal,
     xdg_desktop_portal::{Event as XDPEvent, XDPEventSource},
 };
-use crate::linux::{LinuxCommon, LinuxKeyboardLayout, X11Window, modifiers_from_xinput_info};
+use crate::linux::{LinuxCommon, X11Window, modifiers_from_xinput_info};
 
 use gpui::{
     AnyWindowHandle, Bounds, CursorStyle, FileDropEvent, FrameRequestSource, Keystroke, Modifiers,
@@ -210,7 +211,7 @@ pub struct X11ClientState {
     pub(crate) mouse_focused_window: Option<xproto::Window>,
     pub(crate) keyboard_focused_window: Option<xproto::Window>,
     pub(crate) xkb: xkbc::State,
-    keyboard_layout: LinuxKeyboardLayout,
+    keyboard_layout: XkbKeyboardLayout,
     pub(crate) ximc: Option<X11rbClient<Arc<XCBConnection>>>,
     pub(crate) xim_handler: Option<XimHandler>,
     pub modifiers: Modifiers,
@@ -336,6 +337,7 @@ impl Drop for X11Connection {
     fn drop(&mut self) {
         let mut state = self.0.0.borrow_mut();
         state.common.borrow_mut().after_runnable = None;
+        state.common.borrow_mut().keyboard_mapper = None;
         if let Some(token) = state.clipboard_timer.take() {
             state.loop_handle.remove(token);
         }
@@ -472,12 +474,10 @@ impl X11Connection {
             xkbc::x11::state_new_from_device(&xkb_keymap, &xcb_connection, xkb_device_id)
         };
         let compose_state = get_xkb_compose_state(&xkb_context);
-        let layout_idx = xkb_state.serialize_layout(STATE_LAYOUT_EFFECTIVE);
-        let layout_name = xkb_state
-            .get_keymap()
-            .layout_get_name(layout_idx)
-            .to_string();
-        let keyboard_layout = LinuxKeyboardLayout::new(layout_name.into());
+        let keyboard_layout = XkbKeyboardLayout::unknown()
+            .follow(Some(&xkb_state))
+            .unwrap_or_else(XkbKeyboardLayout::unknown);
+        common.borrow_mut().keyboard_mapper = Some(keyboard_layout.mapper());
 
         let resource_database = x11rb::resource_manager::new_from_default(&xcb_connection)
             .context("Failed to create resource database")?;
@@ -1186,6 +1186,7 @@ impl X11Client {
                 state.pre_key_char_down.take();
                 let key_event_state = xkb_state_for_key_event(&state.xkb, event.state);
 
+                let mut prefer_character_input = prefers_character_input(&key_event_state);
                 let keystroke = {
                     let code = event.detail.into();
                     let mut keystroke = keystroke_from_xkb(&key_event_state, modifiers, code);
@@ -1195,10 +1196,13 @@ impl X11Client {
                         return Some(());
                     }
 
-                    if let Some(mut compose_state) = state.compose_state.take() {
+                    if composes(modifiers)
+                        && let Some(mut compose_state) = state.compose_state.take()
+                    {
                         compose_state.feed(keysym);
                         match compose_state.status() {
                             xkbc::Status::Composed => {
+                                prefer_character_input = true;
                                 state.pre_edit_text.take();
                                 keystroke.key_char = compose_state.utf8();
                                 if let Some(keysym) = compose_state.keysym() {
@@ -1206,6 +1210,7 @@ impl X11Client {
                                 }
                             }
                             xkbc::Status::Composing => {
+                                prefer_character_input = true;
                                 keystroke.key_char = None;
                                 state.pre_edit_text = compose_state
                                     .utf8()
@@ -1231,6 +1236,14 @@ impl X11Client {
                             _ => {}
                         }
                         state.compose_state = Some(compose_state);
+                    } else if let Some(pre_edit) = state.pre_edit_text.take() {
+                        // A shortcut ends a pending composition the way an unmatched key does: its text is committed.
+                        if let Some(compose_state) = state.compose_state.as_mut() {
+                            compose_state.reset();
+                        }
+                        drop(state);
+                        window.handle_ime_commit(pre_edit);
+                        state = self.0.borrow_mut();
                     }
                     keystroke
                 };
@@ -1238,7 +1251,7 @@ impl X11Client {
                 window.handle_input(PlatformInput::KeyDown(gpui::KeyDownEvent {
                     keystroke,
                     is_held: false,
-                    prefer_character_input: false,
+                    prefer_character_input,
                 }));
             }
             Event::KeyRelease(event) => {
@@ -1641,11 +1654,9 @@ impl X11Client {
 
     fn handle_keyboard_layout_change(&self) {
         let mut state = self.0.borrow_mut();
-        let layout_idx = state.xkb.serialize_layout(STATE_LAYOUT_EFFECTIVE);
-        let keymap = state.xkb.get_keymap();
-        let layout_name = keymap.layout_get_name(layout_idx);
-        if layout_name != state.keyboard_layout.name() {
-            state.keyboard_layout = LinuxKeyboardLayout::new(layout_name.to_string().into());
+        if let Some(layout) = state.keyboard_layout.follow(Some(&state.xkb)) {
+            state.common.borrow_mut().keyboard_mapper = Some(layout.mapper());
+            state.keyboard_layout = layout;
             let callback = state
                 .common
                 .borrow_mut()

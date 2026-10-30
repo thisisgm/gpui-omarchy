@@ -43,11 +43,14 @@ pub struct KeybindingKeystroke {
     /// The GPUI representation of the keystroke.
     inner: Keystroke,
     /// The modifiers to display.
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "linux", target_os = "freebsd"))]
     display_modifiers: Modifiers,
     /// The key to display.
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "linux", target_os = "freebsd"))]
     display_key: String,
+    /// The keystroke as written before a keyboard mapper resolved it, which `unparse` emits.
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    source: Option<Keystroke>,
 }
 
 /// Error type for `Keystroke::parse`. This is used instead of `anyhow::Error` so that Zed can use
@@ -270,13 +273,31 @@ impl Keystroke {
 }
 
 impl KeybindingKeystroke {
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "linux", target_os = "freebsd"))]
     #[expect(missing_docs)]
     pub fn new(inner: Keystroke, display_modifiers: Modifiers, display_key: String) -> Self {
         KeybindingKeystroke {
             inner,
             display_modifiers,
             display_key,
+            #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+            source: None,
+        }
+    }
+
+    /// A keystroke a keyboard mapper resolved from `source`, which `unparse` gives back so reparsing maps it the same way.
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    pub fn new_mapped(
+        inner: Keystroke,
+        display_modifiers: Modifiers,
+        display_key: String,
+        source: Keystroke,
+    ) -> Self {
+        KeybindingKeystroke {
+            inner,
+            display_modifiers,
+            display_key,
+            source: Some(source),
         }
     }
 
@@ -291,7 +312,7 @@ impl KeybindingKeystroke {
 
     /// Create a new keybinding keystroke from the given keystroke, without any platform-specific mapping.
     pub fn from_keystroke(keystroke: Keystroke) -> Self {
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "windows", target_os = "linux", target_os = "freebsd"))]
         {
             let key = keystroke.key.clone();
             let modifiers = keystroke.modifiers;
@@ -299,9 +320,11 @@ impl KeybindingKeystroke {
                 inner: keystroke,
                 display_modifiers: modifiers,
                 display_key: key,
+                #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+                source: None,
             }
         }
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "freebsd")))]
         {
             KeybindingKeystroke { inner: keystroke }
         }
@@ -315,15 +338,16 @@ impl KeybindingKeystroke {
     /// Returns the modifiers.
     ///
     /// Platform-specific behavior:
-    /// - On macOS and Linux, this modifiers is the same as `inner.modifiers`, which is the GPUI representation of the keystroke.
+    /// - On macOS, this modifiers is the same as `inner.modifiers`, which is the GPUI representation of the keystroke.
     /// - On Windows, this modifiers is the display modifiers, for example, a `ctrl-@` keystroke will have `inner.modifiers` as
     /// `Modifiers::control()` and `display_modifiers` as `Modifiers::control_shift()`.
+    /// - On Linux, this is the display modifiers the keyboard mapper chose; without a mapper it equals `inner.modifiers`.
     pub fn modifiers(&self) -> &Modifiers {
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "windows", target_os = "linux", target_os = "freebsd"))]
         {
             &self.display_modifiers
         }
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "freebsd")))]
         {
             &self.inner.modifiers
         }
@@ -332,44 +356,64 @@ impl KeybindingKeystroke {
     /// Returns the key.
     ///
     /// Platform-specific behavior:
-    /// - On macOS and Linux, this key is the same as `inner.key`, which is the GPUI representation of the keystroke.
+    /// - On macOS, this key is the same as `inner.key`, which is the GPUI representation of the keystroke.
     /// - On Windows, this key is the display key, for example, a `ctrl-@` keystroke will have `inner.key` as `@` and `display_key` as `2`.
+    /// - On Linux, this is the keycap the keyboard mapper resolved on the active group, for example `ü` for `[` on German; else `inner.key`.
     pub fn key(&self) -> &str {
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "windows", target_os = "linux", target_os = "freebsd"))]
         {
             &self.display_key
         }
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "freebsd")))]
         {
             &self.inner.key
         }
     }
 
-    /// Sets the modifiers. On Windows this modifies both `inner.modifiers` and `display_modifiers`.
+    /// Sets the modifiers. On Windows and Linux this modifies both `inner.modifiers` and `display_modifiers`; on Linux a mapped keystroke first returns to what was written.
     pub fn set_modifiers(&mut self, modifiers: Modifiers) {
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+        self.unmap();
         self.inner.modifiers = modifiers;
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "windows", target_os = "linux", target_os = "freebsd"))]
         {
             self.display_modifiers = modifiers;
         }
     }
 
-    /// Sets the key. On Windows this modifies both `inner.key` and `display_key`.
+    /// Sets the key. On Windows and Linux this modifies both `inner.key` and `display_key`; on Linux a mapped keystroke first returns to what was written.
     pub fn set_key(&mut self, key: String) {
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+        self.unmap();
+        #[cfg(any(target_os = "windows", target_os = "linux", target_os = "freebsd"))]
         {
             self.display_key = key.clone();
         }
         self.inner.key = key;
     }
 
-    /// Produces a representation of this key that Parse can understand.
+    /// Turns a mapped keystroke back into the unmapped keystroke it was written as; an edit is mapped again by its caller.
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    fn unmap(&mut self) {
+        if let Some(source) = self.source.take() {
+            self.display_modifiers = source.modifiers;
+            self.display_key = source.key.clone();
+            self.inner = source;
+        }
+    }
+
+    /// Produces a representation of this key that Parse can understand; on Linux a mapped keystroke gives back what was written.
     pub fn unparse(&self) -> String {
         #[cfg(target_os = "windows")]
         {
             unparse(&self.display_modifiers, &self.display_key)
         }
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+        {
+            let written = self.source.as_ref().unwrap_or(&self.inner);
+            unparse(&written.modifiers, &written.key)
+        }
+        #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "freebsd")))]
         {
             unparse(&self.inner.modifiers, &self.inner.key)
         }
@@ -672,6 +716,48 @@ pub struct Capslock {
     /// The capslock key is on
     #[serde(default)]
     pub on: bool,
+}
+
+/// The active keyboard group, read from the keyboard state and never the UI language; on Linux `PlatformKeyboardLayout::id` is its [`Self::to_id`].
+#[derive(Clone, Debug, Default, Eq, PartialEq, Hash)]
+pub struct KeyboardLayoutIdentity {
+    /// The XKB group name, such as `Russian` or `French (Switzerland)`, naming layout and variant; `unknown` without a keymap.
+    pub name: String,
+    /// The zero-based index of the active group within its keymap.
+    pub group: u32,
+    /// Increases on every keymap or group change, with one layout change notification each; never reused in a process.
+    pub generation: u64,
+}
+
+impl KeyboardLayoutIdentity {
+    const PREFIX: &'static str = "xkb";
+
+    /// Formats the identity as the layout id `xkb:<generation>:<group>:<name>`.
+    pub fn to_id(&self) -> String {
+        format!(
+            "{}:{}:{}:{}",
+            Self::PREFIX,
+            self.generation,
+            self.group,
+            self.name
+        )
+    }
+
+    /// Reads an identity back from a layout id such as `xkb:3:1:Russian`, or `None` when [`Self::to_id`] did not make it.
+    pub fn parse(id: &str) -> Option<Self> {
+        let mut parts = id.splitn(4, ':');
+        if parts.next()? != Self::PREFIX {
+            return None;
+        }
+        let generation = parts.next()?.parse().ok()?;
+        let group = parts.next()?.parse().ok()?;
+        let name = parts.next()?.to_owned();
+        Some(Self {
+            name,
+            group,
+            generation,
+        })
+    }
 }
 
 impl AsKeystroke for Keystroke {
