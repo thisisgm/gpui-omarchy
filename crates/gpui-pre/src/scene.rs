@@ -50,6 +50,7 @@ pub struct Scene {
     pub subpixel_sprites: Vec<SubpixelSprite>,
     pub polychrome_sprites: Vec<PolychromeSprite>,
     pub surfaces: Vec<PaintSurface>,
+    pub backdrop_blurs: Vec<BackdropBlur>,
 }
 
 #[expect(missing_docs)]
@@ -66,6 +67,7 @@ impl Scene {
         self.subpixel_sprites.clear();
         self.polychrome_sprites.clear();
         self.surfaces.clear();
+        self.backdrop_blurs.clear();
     }
 
     pub fn len(&self) -> usize {
@@ -94,11 +96,17 @@ impl Scene {
             return;
         }
 
-        let order = self
-            .layer_stack
-            .last()
-            .copied()
-            .unwrap_or_else(|| self.primitive_bounds.insert(clipped_bounds));
+        let order = match &primitive {
+            // A backdrop blur reads what is already drawn as far out as its
+            // gaussian reaches, so it orders after everything under that
+            // reach, layer or not.
+            Primitive::BackdropBlur(blur) => self.primitive_bounds.insert(blur.sampled_bounds()),
+            _ => self
+                .layer_stack
+                .last()
+                .copied()
+                .unwrap_or_else(|| self.primitive_bounds.insert(clipped_bounds)),
+        };
         match &mut primitive {
             Primitive::Shadow(shadow) => {
                 shadow.order = order;
@@ -133,6 +141,10 @@ impl Scene {
                 surface.order = order;
                 self.surfaces.push(surface.clone());
             }
+            Primitive::BackdropBlur(blur) => {
+                blur.order = order;
+                self.backdrop_blurs.push(*blur);
+            }
         }
         self.paint_operations
             .push(PaintOperation::Primitive(primitive));
@@ -160,6 +172,7 @@ impl Scene {
         self.polychrome_sprites
             .sort_by_key(|sprite| (sprite.order, sprite.tile.tile_id));
         self.surfaces.sort_by_key(|surface| surface.order);
+        self.backdrop_blurs.sort_by_key(|blur| blur.order);
     }
 
     #[cfg_attr(
@@ -187,6 +200,8 @@ impl Scene {
             polychrome_sprites_iter: self.polychrome_sprites.iter().peekable(),
             surfaces_start: 0,
             surfaces_iter: self.surfaces.iter().peekable(),
+            backdrop_blurs_start: 0,
+            backdrop_blurs_iter: self.backdrop_blurs.iter().peekable(),
         }
     }
 }
@@ -209,6 +224,7 @@ pub(crate) enum PrimitiveKind {
     SubpixelSprite,
     PolychromeSprite,
     Surface,
+    BackdropBlur,
 }
 
 pub(crate) enum PaintOperation {
@@ -228,6 +244,7 @@ pub enum Primitive {
     SubpixelSprite(SubpixelSprite),
     PolychromeSprite(PolychromeSprite),
     Surface(PaintSurface),
+    BackdropBlur(BackdropBlur),
 }
 
 #[expect(missing_docs)]
@@ -242,6 +259,7 @@ impl Primitive {
             Primitive::SubpixelSprite(sprite) => &sprite.bounds,
             Primitive::PolychromeSprite(sprite) => &sprite.bounds,
             Primitive::Surface(surface) => &surface.bounds,
+            Primitive::BackdropBlur(blur) => &blur.bounds,
         }
     }
 
@@ -255,6 +273,7 @@ impl Primitive {
             Primitive::SubpixelSprite(sprite) => &sprite.content_mask,
             Primitive::PolychromeSprite(sprite) => &sprite.content_mask,
             Primitive::Surface(surface) => &surface.content_mask,
+            Primitive::BackdropBlur(blur) => &blur.content_mask,
         }
     }
 }
@@ -283,6 +302,8 @@ struct BatchIterator<'a> {
     polychrome_sprites_iter: Peekable<slice::Iter<'a, PolychromeSprite>>,
     surfaces_start: usize,
     surfaces_iter: Peekable<slice::Iter<'a, PaintSurface>>,
+    backdrop_blurs_start: usize,
+    backdrop_blurs_iter: Peekable<slice::Iter<'a, BackdropBlur>>,
 }
 
 impl<'a> Iterator for BatchIterator<'a> {
@@ -315,6 +336,10 @@ impl<'a> Iterator for BatchIterator<'a> {
             (
                 self.surfaces_iter.peek().map(|s| s.order),
                 PrimitiveKind::Surface,
+            ),
+            (
+                self.backdrop_blurs_iter.peek().map(|b| b.order),
+                PrimitiveKind::BackdropBlur,
             ),
         ];
         orders_and_kinds.sort_by_key(|(order, kind)| (order.unwrap_or(u32::MAX), *kind));
@@ -461,6 +486,14 @@ impl<'a> Iterator for BatchIterator<'a> {
                 self.surfaces_start = surfaces_end;
                 Some(PrimitiveBatch::Surfaces(surfaces_start..surfaces_end))
             }
+            // Each blur reads the frame as drawn up to it, so blurs never
+            // batch together.
+            PrimitiveKind::BackdropBlur => {
+                let index = self.backdrop_blurs_start;
+                self.backdrop_blurs_iter.next();
+                self.backdrop_blurs_start += 1;
+                Some(PrimitiveBatch::BackdropBlur(index))
+            }
         }
     }
 }
@@ -493,6 +526,7 @@ pub enum PrimitiveBatch {
         range: Range<usize>,
     },
     Surfaces(Range<usize>),
+    BackdropBlur(usize),
 }
 
 impl PrimitiveBatch {
@@ -525,6 +559,7 @@ impl PrimitiveBatch {
                 )
             }
             Self::Surfaces(range) => format!("surfaces ({})", range.len()),
+            Self::BackdropBlur(index) => format!("backdrop blur {index}"),
         }
     }
 }
@@ -588,6 +623,37 @@ pub struct Shadow {
 impl From<Shadow> for Primitive {
     fn from(shadow: Shadow) -> Self {
         Primitive::Shadow(shadow)
+    }
+}
+
+/// A gaussian blur of whatever the window drew under a rounded rect before it,
+/// like CSS `backdrop-filter: blur()`. What the window leaves see-through stays
+/// see-through, so the compositor's own blur behind the window shows as before.
+#[derive(Debug, Copy, Clone)]
+#[repr(C)]
+pub struct BackdropBlur {
+    /// Draw order, set when inserted into a scene.
+    pub order: DrawOrder,
+    /// The gaussian's standard deviation, as in CSS `blur()`.
+    pub radius: ScaledPixels,
+    /// The blurred region.
+    pub bounds: Bounds<ScaledPixels>,
+    /// The region's corner radii.
+    pub corner_radii: Corners<ScaledPixels>,
+    /// Clips the blurred region.
+    pub content_mask: ContentMask<ScaledPixels>,
+}
+
+impl BackdropBlur {
+    /// How far the gaussian reads: three standard deviations around the bounds.
+    pub fn sampled_bounds(&self) -> Bounds<ScaledPixels> {
+        self.bounds.dilate(self.radius * 3.)
+    }
+}
+
+impl From<BackdropBlur> for Primitive {
+    fn from(blur: BackdropBlur) -> Self {
+        Primitive::BackdropBlur(blur)
     }
 }
 
@@ -945,5 +1011,72 @@ impl PathVertex<Pixels> {
             st_position: self.st_position,
             content_mask: self.content_mask.scale(factor),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{point, size};
+
+    fn bounds(x: f32, y: f32, width: f32, height: f32) -> Bounds<ScaledPixels> {
+        Bounds {
+            origin: point(ScaledPixels(x), ScaledPixels(y)),
+            size: size(ScaledPixels(width), ScaledPixels(height)),
+        }
+    }
+
+    fn quad(bounds: Bounds<ScaledPixels>) -> Quad {
+        Quad {
+            bounds,
+            content_mask: ContentMask { bounds },
+            ..Default::default()
+        }
+    }
+
+    fn blur(bounds: Bounds<ScaledPixels>) -> BackdropBlur {
+        BackdropBlur {
+            order: 0,
+            radius: ScaledPixels(4.),
+            bounds,
+            corner_radii: Corners::default(),
+            content_mask: ContentMask { bounds },
+        }
+    }
+
+    fn kinds(scene: &Scene) -> Vec<String> {
+        scene.batches().map(|batch| batch.label()).collect()
+    }
+
+    #[test]
+    fn a_backdrop_blur_draws_between_what_is_under_it_and_what_is_over_it() {
+        let mut scene = Scene::default();
+        scene.insert_primitive(quad(bounds(0., 0., 100., 100.)));
+        scene.insert_primitive(blur(bounds(20., 20., 40., 40.)));
+        scene.insert_primitive(quad(bounds(20., 20., 40., 40.)));
+        scene.insert_primitive(blur(bounds(30., 30., 10., 10.)));
+        scene.finish();
+        assert_eq!(
+            kinds(&scene),
+            [
+                "quads (1)",
+                "backdrop blur 0",
+                "quads (1)",
+                "backdrop blur 1"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_backdrop_blur_reads_past_its_bounds_and_out_of_layers() {
+        let mut scene = Scene::default();
+        // Beside the blur but inside its gaussian's reach.
+        scene.insert_primitive(quad(bounds(0., 0., 18., 18.)));
+        scene.push_layer(bounds(0., 0., 100., 100.));
+        scene.insert_primitive(quad(bounds(50., 50., 10., 10.)));
+        scene.insert_primitive(blur(bounds(20., 20., 40., 40.)));
+        scene.pop_layer();
+        scene.finish();
+        assert_eq!(kinds(&scene), ["quads (2)", "backdrop blur 0"]);
     }
 }

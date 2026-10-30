@@ -1360,3 +1360,105 @@ fn fs_surface(input: SurfaceVarying) -> @location(0) vec4<f32> {
 
     return ycbcr_to_RGB * y_cb_cr;
 }
+
+// --- backdrop blur --- //
+
+// Every backdrop pass draws one rect into its target from one source texture,
+// in pixels: the frame copied, then shrunk, then blurred along x and along y,
+// then drawn back into the frame under the element's rounded rect. Members
+// are vec4s so the uniform needs no struct padding.
+struct BackdropParams {
+    // The rect drawn: origin in xy, size in zw, in target pixels.
+    target_rect: vec4<f32>,
+    // Source samples are clamped into this rect, min in xy and max in zw, in
+    // source pixels, so they never read past what the pass filled.
+    source_clamp: vec4<f32>,
+    // Where the blurred region starts in the frame (xy), and one blur step
+    // along the pass's axis (zw), in source pixels.
+    region: vec4<f32>,
+    bounds: vec4<f32>,
+    // Top left, top right, bottom right, bottom left.
+    corner_radii: vec4<f32>,
+    content_mask: vec4<f32>,
+    target_size: vec2<f32>,
+    // How many frame pixels each shrunk pixel covers.
+    scale: f32,
+    // The gaussian's standard deviation, in source pixels.
+    sigma: f32,
+}
+
+@group(1) @binding(0) var<uniform> backdrop: BackdropParams;
+@group(1) @binding(1) var t_backdrop: texture_2d<f32>;
+@group(1) @binding(2) var t_backdrop_sharp: texture_2d<f32>;
+@group(1) @binding(3) var s_backdrop: sampler;
+
+struct BackdropVarying {
+    @builtin(position) position: vec4<f32>,
+}
+
+@vertex
+fn vs_backdrop(@builtin(vertex_index) vertex_id: u32) -> BackdropVarying {
+    let unit_vertex = vec2<f32>(f32(vertex_id & 1u), 0.5 * f32(vertex_id & 2u));
+    let position = backdrop.target_rect.xy + unit_vertex * backdrop.target_rect.zw;
+    var out = BackdropVarying();
+    out.position = vec4<f32>(position / backdrop.target_size * vec2<f32>(2.0, -2.0) + vec2<f32>(-1.0, 1.0), 0.0, 1.0);
+    return out;
+}
+
+fn backdrop_sample(position: vec2<f32>) -> vec4<f32> {
+    let clamped = clamp(position, backdrop.source_clamp.xy, backdrop.source_clamp.zw);
+    let size = vec2<f32>(textureDimensions(t_backdrop, 0));
+    return textureSampleLevel(t_backdrop, s_backdrop, clamped / size, 0.0);
+}
+
+// Averages the frame pixels a shrunk pixel covers. Linear filtering averages
+// the 2x2 pixels around each pixel corner sampled.
+@fragment
+fn fs_backdrop_downsample(input: BackdropVarying) -> @location(0) vec4<f32> {
+    let start = backdrop.region.xy + floor(input.position.xy) * backdrop.scale;
+    if (backdrop.scale < 1.5) {
+        return backdrop_sample(start + vec2<f32>(0.5));
+    }
+    let corners = i32(backdrop.scale / 2.0);
+    var sum = vec4<f32>(0.0);
+    for (var y = 0; y < corners; y += 1) {
+        for (var x = 0; x < corners; x += 1) {
+            sum += backdrop_sample(start + vec2<f32>(f32(2 * x + 1), f32(2 * y + 1)));
+        }
+    }
+    return sum / f32(corners * corners);
+}
+
+// One axis of a separable gaussian.
+@fragment
+fn fs_backdrop_blur(input: BackdropVarying) -> @location(0) vec4<f32> {
+    let center = input.position.xy;
+    let step = backdrop.region.zw;
+    let taps = i32(ceil(3.0 * backdrop.sigma));
+    var total = gaussian(0.0, backdrop.sigma);
+    var sum = backdrop_sample(center) * total;
+    for (var i = 1; i <= taps; i += 1) {
+        let weight = gaussian(f32(i), backdrop.sigma);
+        let offset = step * f32(i);
+        sum += (backdrop_sample(center + offset) + backdrop_sample(center - offset)) * weight;
+        total += 2.0 * weight;
+    }
+    return sum / total;
+}
+
+// The blurred pixels inside the element's rounded rect and content mask, and
+// the frame as it was outside them, antialiased between.
+@fragment
+fn fs_backdrop_composite(input: BackdropVarying) -> @location(0) vec4<f32> {
+    let position = input.position.xy;
+    let sharp = textureLoad(t_backdrop_sharp, vec2<i32>(position), 0);
+    let blurred = backdrop_sample((position - backdrop.region.xy) / backdrop.scale);
+    let bounds = Bounds(backdrop.bounds.xy, backdrop.bounds.zw);
+    let radii = Corners(backdrop.corner_radii.x, backdrop.corner_radii.y, backdrop.corner_radii.z, backdrop.corner_radii.w);
+    var coverage = saturate(0.5 - quad_sdf(position, bounds, radii));
+    let mask = distance_from_clip_rect_impl(position, Bounds(backdrop.content_mask.xy, backdrop.content_mask.zw));
+    if (any(mask < vec4<f32>(0.0))) {
+        coverage = 0.0;
+    }
+    return mix(sharp, blurred, coverage);
+}
