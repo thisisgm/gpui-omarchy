@@ -265,7 +265,7 @@ pub struct WgpuRenderer {
     /// The device's shared fence watcher, taken on first use and again after device recovery.
     #[cfg(not(target_family = "wasm"))]
     gpu_fence: Option<(Arc<crate::gpu_fence::GpuFence>, Arc<wgpu::Device>)>,
-    /// This window's GPU completions, which outlive any one device's watcher.
+    /// This window's GPU completions, which outlive any one device's watcher and survive [`Self::recover`].
     #[cfg(not(target_family = "wasm"))]
     gpu_completions: Arc<crate::GpuCompletionSink>,
 }
@@ -2268,7 +2268,8 @@ impl WgpuRenderer {
         let queue = Arc::clone(&core.resources().queue);
         if !matches!(&self.gpu_fence, Some((_, watched)) if Arc::ptr_eq(watched, &device)) {
             // Frames an old watcher still holds resolve, go stale or are reported unobserved when it drops.
-            self.gpu_fence = match crate::gpu_fence::fence_for(&device, clock) {
+            let started = crate::gpu_fence::fence_for(&device, &self.device_errors, clock);
+            self.gpu_fence = match started {
                 Ok(fence) => Some((fence, device)),
                 Err(error) => {
                     warn!("GPU completion watcher could not start: {error}");
@@ -2322,6 +2323,7 @@ impl WgpuRenderer {
 
             // Drop old resources to release Arc<Device>/Arc<Queue> and GPU resources
             self.state = RendererState::Released;
+            self.gpu_fence = None;
             *gpu_context.borrow_mut() = None;
 
             // Wait briefly for the GPU driver to stabilize, then try to
@@ -2358,6 +2360,7 @@ impl WgpuRenderer {
         self.atlas.handle_device_lost(context);
 
         let is_bgr = self.is_bgr;
+        let gpu_completions = Arc::clone(&self.gpu_completions);
         *self = Self::new_internal(
             Some(gpu_context.clone()),
             context,
@@ -2367,6 +2370,7 @@ impl WgpuRenderer {
             self.atlas.clone(),
         )?;
         self.set_subpixel_layout(is_bgr);
+        self.gpu_completions = gpu_completions;
 
         log::info!("GPU recovery complete");
         Ok(())

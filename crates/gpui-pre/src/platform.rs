@@ -1382,7 +1382,11 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     }
     /// Registers terminal feedback, outside platform state borrows. Submitted receipts are returned by [`Self::draw_with_feedback`] before terminal callbacks can run.
     fn on_frame_terminal(&self, _callback: Box<dyn FnMut(FrameTerminal)>) {}
-    /// Starts (`Some`) or stops (`None`) per-frame GPU completion; backends without a fence watcher never call it.
+    /// Whether [`Self::on_gpu_completion`] reports committed frames here; a backend without a fence watcher keeps `false`.
+    fn gpu_completion_supported(&self) -> bool {
+        false
+    }
+    /// Starts (`Some`) or stops (`None`) per-frame GPU completion where [`Self::gpu_completion_supported`] holds.
     fn on_gpu_completion(&self, _callback: Option<Box<dyn FnMut(GpuCompletion)>>) {}
     fn schedule_frame(&self) {}
     /// Presentation feedback, or `None` where the platform or compositor reports none.

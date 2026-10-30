@@ -1,6 +1,6 @@
 use crate::{
     AnyWindowHandle, Bounds, DevicePixels, DispatchEventResult, DisplayId, FrameOutcome,
-    FrameTerminal, GpuSpecs, HeadlessAtlas, Pixels, PlatformAtlas, PlatformDisplay,
+    FrameTerminal, GpuCompletion, GpuSpecs, HeadlessAtlas, Pixels, PlatformAtlas, PlatformDisplay,
     PlatformHeadlessRenderer, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
     PresentedFrames, PromptButton, RequestFrameOptions, Scene, Size, TestDisplay, TestPlatform,
     TextInputConfiguration, TextInputStateChange, WindowAppearance, WindowBackgroundAppearance,
@@ -12,7 +12,7 @@ use image::RgbaImage;
 use parking_lot::Mutex;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use std::{
-    cell::Cell,
+    cell::{Cell, RefCell},
     path::PathBuf,
     rc::{Rc, Weak},
     sync::{self, Arc},
@@ -53,6 +53,8 @@ pub(crate) struct TestWindowState {
     feedback_frames: Option<PresentedFrames>,
     frame_terminal_callback: Option<Box<dyn FnMut(FrameTerminal)>>,
     frame_presented_callback: Option<Box<dyn FnMut()>>,
+    gpu_completion_callback: Option<Rc<RefCell<Box<dyn FnMut(GpuCompletion)>>>>,
+    gpu_completion_enabled: bool,
     feedback_pending: Vec<u64>,
     skip_next_present: bool,
     input_handler: Option<PlatformInputHandler>,
@@ -138,6 +140,8 @@ impl TestWindow {
             feedback_frames: None,
             frame_terminal_callback: None,
             frame_presented_callback: None,
+            gpu_completion_callback: None,
+            gpu_completion_enabled: false,
             feedback_pending: Vec::new(),
             skip_next_present: false,
             input_handler: None,
@@ -211,6 +215,23 @@ impl TestWindow {
                 }
             }
         }
+    }
+
+    /// Delivers one GPU completion as a fence watcher would, outside the state lock.
+    pub fn simulate_gpu_completion(&self, completion: GpuCompletion) {
+        let callback = self.0.lock().gpu_completion_callback.clone();
+        if let Some(callback) = callback {
+            callback.borrow_mut()(completion);
+        }
+    }
+
+    /// Reports GPU completion alongside frame feedback, as a backend with a fence watcher does.
+    pub fn enable_gpu_completion(&self) {
+        self.0.lock().gpu_completion_enabled = true;
+    }
+
+    pub fn gpu_completion_hooked(&self) -> bool {
+        self.0.lock().gpu_completion_callback.is_some()
     }
 
     pub fn simulate_scheduled_frame(&self) -> bool {
@@ -674,6 +695,16 @@ impl PlatformWindow for TestWindow {
 
     fn on_frame_terminal(&self, callback: Box<dyn FnMut(FrameTerminal)>) {
         self.0.lock().frame_terminal_callback = Some(callback);
+    }
+
+    fn gpu_completion_supported(&self) -> bool {
+        let state = self.0.lock();
+        state.feedback_frames.is_some() && state.gpu_completion_enabled
+    }
+
+    fn on_gpu_completion(&self, callback: Option<Box<dyn FnMut(GpuCompletion)>>) {
+        self.0.lock().gpu_completion_callback =
+            callback.map(|callback| Rc::new(RefCell::new(callback)));
     }
 
     fn presented_frames(&self) -> Option<PresentedFrames> {

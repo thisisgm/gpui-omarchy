@@ -3115,13 +3115,13 @@ impl Window {
         Some(subscription)
     }
 
-    /// Observes per-frame GPU completion. Returns `None` where the backend has no frame feedback; the fence watcher runs only while observed.
+    /// Observes per-frame GPU completion. Returns `None` where the backend reports none; the fence watcher runs only while observed.
     pub fn observe_gpu_completion(
         &mut self,
         cx: &App,
         mut callback: impl FnMut(GpuCompletion, &mut Window, &mut App) + 'static,
     ) -> Option<Subscription> {
-        if self.removed || !self.platform_window.frame_feedback_supported() {
+        if self.removed || !self.platform_window.gpu_completion_supported() {
             return None;
         }
         if !self.gpu_completion_hooked {
@@ -9346,6 +9346,67 @@ mod tests {
             replacement_count,
             "closed window must not deliver terminal feedback to replacement"
         );
+    }
+
+    #[gpui::test]
+    fn gpu_completion_observers_hook_unhook_and_rehook_the_platform(cx: &mut TestAppContext) {
+        use crate::GpuCompletion;
+        let window = cx.add_window(|_, _| EmptyView);
+        let native = cx.test_window(window.into());
+        assert!(
+            window
+                .update(cx, |_, window, cx| window
+                    .observe_gpu_completion(cx, |_, _, _| {}))
+                .unwrap()
+                .is_none()
+        );
+        native.enable_frame_feedback();
+        assert!(
+            window
+                .update(cx, |_, window, cx| window
+                    .observe_gpu_completion(cx, |_, _, _| {}))
+                .unwrap()
+                .is_none(),
+            "frame feedback without a fence watcher reports no GPU completion"
+        );
+        native.enable_gpu_completion();
+        let completion = GpuCompletion {
+            frame_id: 1,
+            submitted_at: std::time::Duration::from_millis(1),
+            not_before: None,
+            completed_at: Some(std::time::Duration::from_millis(2)),
+            clock_id: 1,
+        };
+        let seen = Rc::new(Cell::new(0));
+        let first = window
+            .update(cx, {
+                let seen = seen.clone();
+                move |_, window, cx| {
+                    window.observe_gpu_completion(cx, move |_, _, _| seen.set(seen.get() + 1))
+                }
+            })
+            .unwrap();
+        assert!(first.is_some() && native.gpu_completion_hooked());
+        native.simulate_gpu_completion(completion);
+        assert_eq!(seen.get(), 1);
+        drop(first);
+        native.simulate_gpu_completion(completion);
+        assert_eq!(seen.get(), 1, "a dropped observer hears nothing");
+        assert!(
+            !native.gpu_completion_hooked(),
+            "the last observer leaving stops the platform tracking frames"
+        );
+        let again = window
+            .update(cx, {
+                let seen = seen.clone();
+                move |_, window, cx| {
+                    window.observe_gpu_completion(cx, move |_, _, _| seen.set(seen.get() + 10))
+                }
+            })
+            .unwrap();
+        assert!(again.is_some() && native.gpu_completion_hooked());
+        native.simulate_gpu_completion(completion);
+        assert_eq!(seen.get(), 11);
     }
 
     #[gpui::test]

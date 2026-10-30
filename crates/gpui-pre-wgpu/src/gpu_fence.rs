@@ -244,10 +244,25 @@ impl Drop for GpuFence {
     }
 }
 
+/// Runs one poll unless the device is lost or an earlier poll panicked, as wgpu does when poll itself finds the loss.
+fn poll_unless_lost(lost: bool, gave_up: &AtomicBool, poll: impl FnOnce()) {
+    if lost || gave_up.load(Ordering::Acquire) {
+        return;
+    }
+    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(poll)).is_err() {
+        gave_up.store(true, Ordering::Release);
+        log::warn!("GPU fence watcher stopped polling a lost device; its frames go stale");
+    }
+}
+
 static FENCES: Mutex<Vec<(Weak<wgpu::Device>, Weak<GpuFence>)>> = Mutex::new(Vec::new());
 
-/// The one watcher for `device`, started on first use.
-pub fn fence_for(device: &Arc<wgpu::Device>, clock: FenceClock) -> std::io::Result<Arc<GpuFence>> {
+/// The one watcher for `device`, started on first use; `errors` is that device's shared error state.
+pub fn fence_for(
+    device: &Arc<wgpu::Device>,
+    errors: &Arc<crate::DeviceErrorState>,
+    clock: FenceClock,
+) -> std::io::Result<Arc<GpuFence>> {
     let mut fences = FENCES.lock();
     fences.retain(|(device, fence)| device.strong_count() > 0 && fence.strong_count() > 0);
     if let Some(fence) = fences
@@ -262,13 +277,18 @@ pub fn fence_for(device: &Arc<wgpu::Device>, clock: FenceClock) -> std::io::Resu
         return Ok(fence);
     }
     let polled = Arc::downgrade(device);
+    let errors = Arc::clone(errors);
+    let gave_up = AtomicBool::new(false);
     let fence = Arc::new(GpuFence::spawn(
         move || {
-            if let Some(device) = polled.upgrade()
-                && let Err(error) = device.poll(wgpu::PollType::Poll)
-            {
-                log::warn!("GPU fence poll failed: {error:?}");
-            }
+            let Some(device) = polled.upgrade() else {
+                return;
+            };
+            poll_unless_lost(errors.device_lost(), &gave_up, || {
+                if let Err(error) = device.poll(wgpu::PollType::Poll) {
+                    log::warn!("GPU fence poll failed: {error:?}");
+                }
+            });
         },
         clock,
     )?);
@@ -296,6 +316,48 @@ mod tests {
         Arc::new(|| {})
     }
 
+    // A wait that outlives this fails its test instead of hanging the run.
+    const WAIT: Duration = Duration::from_secs(10);
+
+    fn wait_for<T>(what: &str, mut ready: impl FnMut() -> Option<T>) -> T {
+        let deadline = std::time::Instant::now() + WAIT;
+        loop {
+            if let Some(value) = ready() {
+                return value;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out after {WAIT:?} waiting for {what}"
+            );
+            thread::sleep(POLL_INTERVAL);
+        }
+    }
+
+    #[test]
+    fn a_device_poll_that_panics_is_never_repeated() {
+        let gave_up = AtomicBool::new(false);
+        let polls = AtomicUsize::new(0);
+        let count = || {
+            polls.fetch_add(1, Ordering::AcqRel);
+        };
+        poll_unless_lost(true, &gave_up, count);
+        assert_eq!(
+            polls.load(Ordering::Acquire),
+            0,
+            "a lost device is never polled"
+        );
+        poll_unless_lost(false, &gave_up, || {
+            count();
+            panic!("Error in Device::poll: Parent device is lost");
+        });
+        poll_unless_lost(false, &gave_up, count);
+        assert_eq!(
+            polls.load(Ordering::Acquire),
+            1,
+            "the watcher outlives the panic and stops polling"
+        );
+    }
+
     #[test]
     fn retention_is_bounded_and_counts_what_it_drops() {
         let sink = GpuCompletionSink::default();
@@ -313,7 +375,7 @@ mod tests {
     }
 
     #[test]
-    fn a_fence_seen_by_the_watcher_is_bracketed_and_reported_once() {
+    fn a_fence_seen_by_the_watcher_is_bracketed_by_the_last_poll_that_missed_it() {
         let _turn = SERIAL.lock();
         let (queue, callbacks) = mpsc::channel::<Box<dyn FnOnce() + Send>>();
         let gate = Arc::new(Mutex::new(()));
@@ -321,7 +383,7 @@ mod tests {
         let polled = gate.clone();
         let aged: Vec<(u32, Box<dyn FnOnce() + Send>)> = Vec::new();
         let callbacks = Mutex::new((callbacks, aged));
-        // The fence signals only after two polls have looked at the attached callback and missed it.
+        // The fence signals on the third poll, and each poll moves the clock on 1 ms so every poll start differs.
         let fence = GpuFence::spawn(
             move || {
                 let _gate = polled.lock();
@@ -337,6 +399,7 @@ mod tests {
                 for (_, done) in due {
                     done();
                 }
+                NOW_NS.fetch_add(1_000_000, Ordering::AcqRel);
             },
             clock(),
         )
@@ -349,23 +412,13 @@ mod tests {
         queue.send(Box::new(registered.done)).unwrap();
         fence.arm(&registered.armed);
         drop(held);
-        let completion = loop {
-            if let Some(completion) = sink.drain().0.pop() {
-                break completion;
-            }
-            thread::sleep(POLL_INTERVAL);
-        };
+        let completion = wait_for("the frame's completion", || sink.drain().0.pop());
         assert_eq!(completion.frame_id, 7);
-        assert_eq!(completion.completed_at, Some(Duration::from_millis(5)));
+        assert_eq!(completion.completed_at, Some(Duration::from_millis(7)));
         assert_eq!(
             completion.not_before,
-            Some(Duration::from_millis(5)),
-            "a poll after arming missed it"
-        );
-        thread::sleep(POLL_INTERVAL * 8);
-        assert!(
-            sink.drain().0.is_empty(),
-            "the stale sweep never repeats a resolved frame"
+            Some(Duration::from_millis(6)),
+            "poll 2 started at 6 ms and missed it"
         );
     }
 
@@ -403,9 +456,9 @@ mod tests {
         let registered = fence
             .register(9, Duration::from_millis(4), &sink, quiet())
             .unwrap();
-        while fence.watched.polls.load(Ordering::Acquire) == 0 {
-            thread::sleep(POLL_INTERVAL);
-        }
+        wait_for("the watcher's first poll", || {
+            (fence.watched.polls.load(Ordering::Acquire) > 0).then_some(())
+        });
         queue.send(Box::new(registered.done)).unwrap();
         fence.arm(&registered.armed);
         assert_eq!(
@@ -414,12 +467,7 @@ mod tests {
             "poll 1 is still inside poll()"
         );
         drop(held);
-        let completion = loop {
-            if let Some(completion) = sink.drain().0.pop() {
-                break completion;
-            }
-            thread::sleep(POLL_INTERVAL);
-        };
+        let completion = wait_for("the frame's completion", || sink.drain().0.pop());
         assert_eq!(
             completion.not_before, None,
             "poll 1 started before the callback was attached"
@@ -445,14 +493,12 @@ mod tests {
         let registered = fence
             .register(8, Duration::from_millis(4), &sink, quiet())
             .unwrap();
-        // Never armed: a callback that fires before track arms it has nothing that bounds it.
+        // Never armed, after two polls: only the unarmed sentinel keeps poll 2 from bounding it.
+        wait_for("two watcher polls", || {
+            (fence.watched.polls.load(Ordering::Acquire) >= 2).then_some(())
+        });
         queue.send(Box::new(registered.done)).unwrap();
-        let completion = loop {
-            if let Some(completion) = sink.drain().0.pop() {
-                break completion;
-            }
-            thread::sleep(POLL_INTERVAL);
-        };
+        let completion = wait_for("the frame's completion", || sink.drain().0.pop());
         assert_eq!(
             (completion.not_before, completion.completed_at),
             (None, Some(Duration::from_millis(5)))
@@ -469,12 +515,49 @@ mod tests {
             .register(3, Duration::from_millis(8), &sink, quiet())
             .unwrap();
         fence.arm(&registered.armed);
+        // Two watcher polls start after arming, so only the thread check leaves this unbounded.
+        wait_for("two watcher polls after arming", || {
+            let previous = fence.watched.previous_poll.0.load(Ordering::Acquire);
+            (previous > registered.armed.load(Ordering::Acquire)).then_some(())
+        });
         (registered.done)();
         let (done, _) = sink.drain();
         assert_eq!(
             (done[0].not_before, done[0].completed_at),
             (None, Some(Duration::from_millis(9)))
         );
+    }
+
+    #[test]
+    fn a_frame_the_callback_resolved_is_never_reported_again_by_the_sweep() {
+        let _turn = SERIAL.lock();
+        let gate = Arc::new(Mutex::new(()));
+        let polled = gate.clone();
+        let fence = GpuFence::spawn(move || drop(polled.lock()), clock()).unwrap();
+        let sink = Arc::new(GpuCompletionSink::default());
+        NOW_NS.store(0, Ordering::Release);
+        let held = gate.lock();
+        let early = fence.register(1, Duration::ZERO, &sink, quiet()).unwrap();
+        let _late = fence.register(2, Duration::ZERO, &sink, quiet()).unwrap();
+        // The watcher waits in its first poll, so no sweep can forget frame 1 before the stale one sees it.
+        wait_for("the watcher's first poll", || {
+            (fence.watched.polls.load(Ordering::Acquire) > 0).then_some(())
+        });
+        (early.done)();
+        NOW_NS.store(STALE.as_nanos() as u64, Ordering::Release);
+        drop(held);
+        let mut reported = Vec::new();
+        wait_for("the stale sweep to report frame 2", || {
+            reported.extend(sink.drain().0);
+            reported.iter().any(|c| c.frame_id == 2).then_some(())
+        });
+        let ids: Vec<u64> = reported.iter().map(|c| c.frame_id).collect();
+        assert_eq!(
+            ids,
+            [1, 2],
+            "the sweep skips the frame its callback already reported"
+        );
+        assert!(reported[0].completed_at.is_some() && reported[1].completed_at.is_none());
     }
 
     #[test]
@@ -488,9 +571,9 @@ mod tests {
             .unwrap()
             .done;
         NOW_NS.store(STALE.as_nanos() as u64, Ordering::Release);
-        while sink.drain().0.iter().all(|c| c.frame_id != 1) {
-            thread::sleep(POLL_INTERVAL);
-        }
+        wait_for("the stale sweep to report frame 1", || {
+            sink.drain().0.iter().any(|c| c.frame_id == 1).then_some(())
+        });
         late();
         assert!(
             sink.drain().0.is_empty(),

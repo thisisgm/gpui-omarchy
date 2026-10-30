@@ -81,12 +81,9 @@ fn monotonic() -> Duration {
         tv_sec: 0,
         tv_nsec: 0,
     };
-    // SAFETY: clock_gettime fills the struct it is given.
+    // SAFETY: clock_gettime fills the struct it is given; CLOCK_MONOTONIC always exists on Linux.
     unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut time) };
-    Duration::new(
-        time.tv_sec.max(0) as u64,
-        time.tv_nsec.clamp(0, 999_999_999) as u32,
-    )
+    Duration::new(time.tv_sec as u64, time.tv_nsec as u32)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2212,6 +2209,10 @@ impl PlatformWindow for WaylandWindow {
 
     fn on_frame_terminal(&self, callback: Box<dyn FnMut(FrameTerminal)>) {
         self.0.callbacks.borrow_mut().frame_terminal = Some(Rc::new(RefCell::new(callback)));
+    }
+
+    fn gpu_completion_supported(&self) -> bool {
+        self.frame_feedback_supported()
     }
 
     fn on_gpu_completion(&self, callback: Option<Box<dyn FnMut(GpuCompletion)>>) {
