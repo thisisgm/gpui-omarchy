@@ -1141,9 +1141,13 @@ impl CosmicTextSystemState {
                 continue;
             }
 
+            // cosmic-text keeps shaper offsets apart from the pen, in ems; ShapedGlyph adds them.
             let shaped_glyph = ShapedGlyph {
                 id: GlyphId(glyph.glyph_id as u32),
-                position: point(glyph.x.into(), glyph.y.into()),
+                position: point(
+                    (glyph.x + glyph.x_offset * glyph.font_size).into(),
+                    (glyph.y - glyph.y_offset * glyph.font_size).into(),
+                ),
                 index: glyph.start,
                 is_emoji,
             };
@@ -2924,3 +2928,6 @@ mod tests {
         assert!(spans.is_empty());
     }
 }
+
+#[cfg(test)]
+mod mark_offset_tests;
