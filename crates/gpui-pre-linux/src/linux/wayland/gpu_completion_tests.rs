@@ -18,9 +18,11 @@ struct Probe(usize);
 impl Render for Probe {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         self.0 += 1;
-        div()
-            .size_full()
-            .bg(rgb(if self.0.is_multiple_of(2) { 0x234567 } else { 0x345678 }))
+        div().size_full().bg(rgb(if self.0.is_multiple_of(2) {
+            0x234567
+        } else {
+            0x345678
+        }))
     }
 }
 

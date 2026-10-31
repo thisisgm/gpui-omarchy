@@ -645,8 +645,7 @@ impl WaylandClientStatePtr {
         self.start_drag_session(surface, payload, DragOrigin::Keyboard)
     }
 
-    /// FileDropEvent::Ended goes out from the event loop: the caller runs inside an App update, where the window's
-    /// input callback cannot.
+    /// Sends FileDropEvent::Ended from the event loop, because the caller runs inside an App update.
     pub fn cancel_external_drag(&self, surface: &wl_surface::WlSurface) -> bool {
         let client = self.get_client();
         let mut state = client.borrow_mut();

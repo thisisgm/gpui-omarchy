@@ -399,7 +399,7 @@ mod tests {
                 for (_, done) in due {
                     done();
                 }
-                NOW_NS.fetch_add(1_000_000, Ordering::AcqRel);
+                NOW_NS.fetch_add(Duration::from_millis(1).as_nanos() as u64, Ordering::AcqRel);
             },
             clock(),
         )
