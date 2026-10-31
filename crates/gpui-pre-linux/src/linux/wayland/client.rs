@@ -2388,6 +2388,34 @@ impl Dispatch<wl_seat::WlSeat, ()> for WaylandClientStatePtr {
     }
 }
 
+// wlroots sends modifiers and keys before any keymap once a virtual keyboard exits; None drops them.
+fn keyboard_modifiers(
+    keymap_state: Option<&mut xkb::State>,
+    mods_depressed: u32,
+    mods_latched: u32,
+    mods_locked: u32,
+    group: u32,
+) -> Option<(xkb::LayoutIndex, Modifiers, Capslock)> {
+    let keymap_state = keymap_state?;
+    let old_layout = keymap_state.serialize_layout(xkb::STATE_LAYOUT_EFFECTIVE);
+    keymap_state.update_mask(mods_depressed, mods_latched, mods_locked, 0, 0, group);
+    Some((
+        old_layout,
+        modifiers_from_xkb(keymap_state),
+        capslock_from_xkb(keymap_state),
+    ))
+}
+
+// A wl_keyboard key read through the keymap, or None before the seat has sent one.
+fn keyboard_key(
+    keymap_state: Option<&xkb::State>,
+    key: u32,
+) -> Option<(&xkb::State, Keycode, xkb::Keysym)> {
+    let keymap_state = keymap_state?;
+    let keycode = Keycode::from(key + MIN_KEYCODE);
+    Some((keymap_state, keycode, keymap_state.key_get_one_sym(keycode)))
+}
+
 impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandClientStatePtr {
     fn event(
         this: &mut Self,
@@ -2472,13 +2500,17 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandClientStatePtr {
             } => {
                 let focused_window = state.keyboard_focused_window.clone();
 
-                let keymap_state = state.keymap_state.as_mut().unwrap();
-                let old_layout =
-                    keymap_state.serialize_layout(xkbcommon::xkb::STATE_LAYOUT_EFFECTIVE);
-                keymap_state.update_mask(mods_depressed, mods_latched, mods_locked, 0, 0, group);
-                state.modifiers = modifiers_from_xkb(keymap_state);
-                let keymap_state = state.keymap_state.as_mut().unwrap();
-                state.capslock = capslock_from_xkb(keymap_state);
+                let Some((old_layout, modifiers, capslock)) = keyboard_modifiers(
+                    state.keymap_state.as_mut(),
+                    mods_depressed,
+                    mods_latched,
+                    mods_locked,
+                    group,
+                ) else {
+                    return;
+                };
+                state.modifiers = modifiers;
+                state.capslock = capslock;
 
                 let input = PlatformInput::ModifiersChanged(ModifiersChangedEvent {
                     modifiers: state.modifiers,
@@ -2509,9 +2541,11 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandClientStatePtr {
                     return;
                 };
 
-                let keymap_state = state.keymap_state.as_ref().unwrap();
-                let keycode = Keycode::from(key + MIN_KEYCODE);
-                let keysym = keymap_state.key_get_one_sym(keycode);
+                let Some((keymap_state, keycode, keysym)) =
+                    keyboard_key(state.keymap_state.as_ref(), key)
+                else {
+                    return;
+                };
 
                 match key_state {
                     wl_keyboard::KeyState::Pressed if !keysym.is_modifier_key() => {
@@ -3572,9 +3606,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn keypad_keys_carry_keypad_identity_without_changing_key() {
-        // A compositor sends a compiled keymap, so compile one and reload its text as the client does.
+    // A compositor sends a compiled keymap, so compile one and reload its text as the client does.
+    fn us_keymap() -> xkb::Keymap {
         let names_context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
         let compiled = xkb::Keymap::new_from_names(
             &names_context,
@@ -3587,13 +3620,42 @@ mod tests {
         )
         .expect("test keymap should compile");
         let context = new_xkb_context().expect("xkb context");
-        let keymap = xkb::Keymap::new_from_string(
+        xkb::Keymap::new_from_string(
             &context,
             compiled.get_as_string(XKB_KEYMAP_FORMAT_TEXT_V1),
             XKB_KEYMAP_FORMAT_TEXT_V1,
             KEYMAP_COMPILE_NO_FLAGS,
         )
-        .expect("compositor keymap text should load");
+        .expect("compositor keymap text should load")
+    }
+
+    #[test]
+    fn keyboard_input_before_a_keymap_is_dropped_until_one_arrives() {
+        // Linux evdev code of A, as wl_keyboard.key sends it.
+        let key_a = 30;
+        let keymap = us_keymap();
+        let control = 1 << keymap.mod_get_index(xkb::MOD_NAME_CTRL);
+        let caps_lock = 1 << keymap.mod_get_index(xkb::MOD_NAME_CAPS);
+
+        assert!(keyboard_modifiers(None, control, 0, caps_lock, 0).is_none());
+        assert!(keyboard_key(None, key_a).is_none());
+
+        let mut keymap_state = xkb::State::new(&keymap);
+        let (_, keycode, keysym) =
+            keyboard_key(Some(&keymap_state), key_a).expect("key read after the keymap");
+        assert_eq!(keycode, Keycode::from(key_a + MIN_KEYCODE));
+        assert_eq!(keysym, xkb::Keysym::a);
+        let (old_layout, modifiers, capslock) =
+            keyboard_modifiers(Some(&mut keymap_state), control, 0, caps_lock, 0)
+                .expect("modifiers read after the keymap");
+        assert_eq!(old_layout, 0);
+        assert!(modifiers.control && !modifiers.shift && !modifiers.alt);
+        assert!(capslock.on);
+    }
+
+    #[test]
+    fn keypad_keys_carry_keypad_identity_without_changing_key() {
+        let keymap = us_keymap();
         let num_lock = 1 << keymap.mod_get_index(xkb::MOD_NAME_NUM);
         // Linux evdev codes, as wl_keyboard.key sends them.
         let (key_kp1, key_1, key_kpenter) = (79, 2, 96);
