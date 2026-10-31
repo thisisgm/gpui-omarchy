@@ -44,8 +44,7 @@ const SUBPIXEL_SHADERS: &str = concat!(
     include_str!("shaders_subpixel.wgsl"),
 );
 
-/// Reopens the main pass over the frame drawn so far, after work that had to
-/// leave it (paths, backdrop blurs).
+/// Reopens the main pass over the frame drawn so far, after paths or a backdrop blur left it.
 fn begin_continued_pass<'a>(
     encoder: &'a mut wgpu::CommandEncoder,
     frame_view: &wgpu::TextureView,
@@ -141,8 +140,7 @@ struct PixelRect {
 }
 
 impl PixelRect {
-    /// The pixels `bounds` touches, within a texture of `size`; `None` when
-    /// it touches none.
+    /// The pixels `bounds` touches within a texture of `size`, or `None` when it touches none.
     fn covering(bounds: Bounds<ScaledPixels>, size: (u32, u32)) -> Option<Self> {
         let left = bounds.origin.x.0.floor().max(0.) as u32;
         let top = bounds.origin.y.0.floor().max(0.) as u32;
@@ -180,12 +178,13 @@ impl PixelRect {
     }
 }
 
-/// How many frame pixels each pixel of the shrunk copy a blur works on covers:
-/// a power of two that keeps the gaussian under four shrunk pixels wide, so a
-/// wide blur costs no more taps than a narrow one.
+/// Widest gaussian a pass samples, in shrunk pixels, so a wide blur costs no more taps.
+const BACKDROP_MAX_SHRUNK_SIGMA: f32 = 4.;
+
+/// Frame pixels per shrunk pixel for a blur of `sigma`, a power of two.
 fn backdrop_downscale(sigma: f32) -> u32 {
     let mut scale = 1;
-    while sigma >= 4. * scale as f32 {
+    while sigma >= BACKDROP_MAX_SHRUNK_SIGMA * scale as f32 {
         scale *= 2;
     }
     scale
@@ -306,11 +305,7 @@ struct WgpuResources {
     backdrop_textures: Option<BackdropTextures>,
 }
 
-/// Frame-sized textures a backdrop blur works in: `copy` holds the frame as
-/// drawn so far, and the shrunk copy is blurred from `first` into `second`
-/// and back. Each blur's passes read their parameters from their own slots
-/// of `params`, one bind group per pass picking the slot by dynamic offset.
-/// Views keep their textures alive.
+/// Frame-sized textures and per-blur parameter slots; views keep their textures alive.
 struct BackdropTextures {
     copy: wgpu::Texture,
     first_view: wgpu::TextureView,
@@ -618,8 +613,7 @@ impl WgpuRenderer {
             );
         }
 
-        // A backdrop blur copies the frame drawn so far; without the copy it
-        // draws no blur.
+        // A backdrop blur copies the frame drawn so far, so without COPY_SRC it draws no blur.
         if !surface_caps.usages.contains(wgpu::TextureUsages::COPY_SRC) {
             warn!("The surface cannot be copied from, so backdrop blurs are not drawn");
         }
@@ -1147,8 +1141,7 @@ impl WgpuRendererCore {
             &shader_module,
         );
 
-        // Backdrop passes replace what they draw over: the composite pass
-        // blends the blurred and sharp frame itself.
+        // Backdrop passes replace what they draw over; the composite blends sharp and blurred itself.
         let backdrop_pipeline = |name: &str, fs_entry: &str| {
             create_pipeline(
                 name,
@@ -2089,8 +2082,7 @@ impl WgpuRendererCore {
         Ok(())
     }
 
-    /// Makes the textures for a frame of `size` and parameter slots for
-    /// `blurs` blurs, keeping what already fits.
+    /// Makes textures for a `size` frame and parameter slots for `blurs` blurs, keeping what fits.
     fn ensure_backdrop_textures(&mut self, size: Size<DevicePixels>, blurs: usize) {
         let (width, height) = (size.width.0 as u32, size.height.0 as u32);
         let slots = (blurs * BACKDROP_PASSES) as u64;
@@ -2185,9 +2177,7 @@ impl WgpuRendererCore {
         });
     }
 
-    /// Blurs the frame drawn so far under `blur`, the scene's `index`th:
-    /// copies the pixels its gaussian reads, shrinks them, blurs them along x
-    /// then y, and draws them back inside its rounded rect.
+    /// Copies, shrinks, blurs and draws back the frame under `blur`, the scene's `index`th.
     fn draw_backdrop_blur(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
@@ -3235,8 +3225,7 @@ mod tests {
         }
     }
 
-    /// Red on the left half and blue on the right, a blur over the middle, and
-    /// a green quad painted after it in one corner.
+    /// Red left half, blue right half, `blur` over them, and a green quad painted after it.
     #[cfg(target_os = "linux")]
     fn render_blurred_edge(blur: BackdropBlur) -> anyhow::Result<image::RgbaImage> {
         let mut renderer = WgpuHeadlessRenderer::new()?;
@@ -3269,6 +3258,9 @@ mod tests {
             assert_pixel(&image, 12, 50, RED);
             assert_pixel(&image, 116, 50, BLUE);
             assert_pixel(&image, 2, 2, RED);
+            // Just above the blur, where its gaussian reads, the edge stays sharp.
+            assert_pixel(&image, 63, 4, RED);
+            assert_pixel(&image, 64, 4, BLUE);
             // What is painted after the blur stays sharp over it.
             assert_pixel(&image, 17, 17, [0, 128, 0, 255]);
         }
@@ -3278,7 +3270,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn backdrop_blur_stays_inside_its_corners_and_content_mask() -> anyhow::Result<()> {
-        let mut blur = backdrop_blur(32.0, 0.0, 64.0, 64.0, 8.0);
+        // The blur's left side sits on the red and blue edge, so a corner it leaks into mixes.
+        let mut blur = backdrop_blur(64.0, 0.0, 32.0, 64.0, 8.0);
         blur.corner_radii = Corners {
             top_left: 16.0.into(),
             top_right: 16.0.into(),
@@ -3288,15 +3281,14 @@ mod tests {
         blur.content_mask.bounds.size.height = 32.0.into();
         let image = render_blurred_edge(blur)?;
         // Inside: the edge is soft.
-        let [red, _, blue, _] = image.get_pixel(63, 24).0;
+        let [red, _, blue, _] = image.get_pixel(64, 24).0;
         assert!(
             red > 20 && blue > 20,
             "inside the blur the edge mixes, {red} red, {blue} blue"
         );
-        // Below the content mask, and in a rounded corner, it stays sharp.
-        assert_pixel(&image, 63, 48, RED);
+        // In the rounded corner, and below the content mask, it stays sharp.
+        assert_pixel(&image, 64, 0, BLUE);
         assert_pixel(&image, 64, 48, BLUE);
-        assert_pixel(&image, 33, 1, RED);
         Ok(())
     }
 

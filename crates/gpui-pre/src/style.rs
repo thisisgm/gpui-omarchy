@@ -291,8 +291,7 @@ pub struct Style {
     /// Box shadow of the element
     pub box_shadow: Vec<BoxShadow>,
 
-    /// Blurs what is drawn behind the element, by a gaussian with this
-    /// standard deviation, like CSS `backdrop-filter: blur()`
+    /// Standard deviation of the blur behind the element, like CSS `backdrop-filter: blur()`
     pub backdrop_blur: Option<Pixels>,
 
     /// The text style of this element

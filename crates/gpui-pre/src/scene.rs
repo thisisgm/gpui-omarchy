@@ -41,7 +41,7 @@ impl From<bool> for PaddedBool32 {
 pub struct Scene {
     pub(crate) paint_operations: Vec<PaintOperation>,
     primitive_bounds: BoundsTree<ScaledPixels>,
-    layer_stack: Vec<DrawOrder>,
+    layer_stack: Vec<(DrawOrder, Bounds<ScaledPixels>)>,
     pub shadows: Vec<Shadow>,
     pub quads: Vec<Quad>,
     pub paths: Vec<Path<ScaledPixels>>,
@@ -76,7 +76,7 @@ impl Scene {
 
     pub fn push_layer(&mut self, bounds: Bounds<ScaledPixels>) {
         let order = self.primitive_bounds.insert(bounds);
-        self.layer_stack.push(order);
+        self.layer_stack.push((order, bounds));
         self.paint_operations
             .push(PaintOperation::StartLayer(bounds));
     }
@@ -97,14 +97,26 @@ impl Scene {
         }
 
         let order = match &primitive {
-            // A backdrop blur reads what is already drawn as far out as its
-            // gaussian reaches, so it orders after everything under that
-            // reach, layer or not.
-            Primitive::BackdropBlur(blur) => self.primitive_bounds.insert(blur.sampled_bounds()),
+            // A blur orders after everything its gaussian reads and all its open layers hold.
+            Primitive::BackdropBlur(blur) => {
+                let sampled_bounds = blur.sampled_bounds();
+                let drawn_before = self
+                    .layer_stack
+                    .iter()
+                    .fold(sampled_bounds, |bounds, (_, layer_bounds)| {
+                        bounds.union(layer_bounds)
+                    });
+                let order = self.primitive_bounds.insert(drawn_before);
+                // What open layers paint next draws over the blur; outermost first keeps inner over outer.
+                for (layer_order, layer_bounds) in &mut self.layer_stack {
+                    *layer_order = self.primitive_bounds.insert(*layer_bounds);
+                }
+                order
+            }
             _ => self
                 .layer_stack
                 .last()
-                .copied()
+                .map(|(order, _)| *order)
                 .unwrap_or_else(|| self.primitive_bounds.insert(clipped_bounds)),
         };
         match &mut primitive {
@@ -486,8 +498,7 @@ impl<'a> Iterator for BatchIterator<'a> {
                 self.surfaces_start = surfaces_end;
                 Some(PrimitiveBatch::Surfaces(surfaces_start..surfaces_end))
             }
-            // Each blur reads the frame as drawn up to it, so blurs never
-            // batch together.
+            // Each blur reads the frame as drawn up to it, so blurs never batch together.
             PrimitiveKind::BackdropBlur => {
                 let index = self.backdrop_blurs_start;
                 self.backdrop_blurs_iter.next();
@@ -626,9 +637,7 @@ impl From<Shadow> for Primitive {
     }
 }
 
-/// A gaussian blur of whatever the window drew under a rounded rect before it,
-/// like CSS `backdrop-filter: blur()`. What the window leaves see-through stays
-/// see-through, so the compositor's own blur behind the window shows as before.
+/// A gaussian blur of what the window drew under a rounded rect, like CSS `backdrop-filter`.
 #[derive(Debug, Copy, Clone)]
 #[repr(C)]
 pub struct BackdropBlur {
@@ -646,10 +655,13 @@ pub struct BackdropBlur {
     pub opacity: f32,
 }
 
+/// Standard deviations a blur's gaussian reads; shaders.wgsl `BACKDROP_REACH` matches it.
+const BACKDROP_BLUR_REACH: f32 = 3.;
+
 impl BackdropBlur {
-    /// How far the gaussian reads: three standard deviations around the bounds.
+    /// How far the gaussian reads around the bounds.
     pub fn sampled_bounds(&self) -> Bounds<ScaledPixels> {
-        self.bounds.dilate(self.radius * 3.)
+        self.bounds.dilate(self.radius * BACKDROP_BLUR_REACH)
     }
 }
 
@@ -1073,13 +1085,69 @@ mod tests {
     #[test]
     fn a_backdrop_blur_reads_past_its_bounds_and_out_of_layers() {
         let mut scene = Scene::default();
-        // Beside the blur but inside its gaussian's reach.
-        scene.insert_primitive(quad(bounds(0., 0., 18., 18.)));
-        scene.push_layer(bounds(0., 0., 100., 100.));
-        scene.insert_primitive(quad(bounds(50., 50., 10., 10.)));
+        // Stacked beside the blur, inside its gaussian's reach and outside its layer.
+        for _ in 0..3 {
+            scene.insert_primitive(quad(bounds(0., 0., 18., 18.)));
+        }
+        scene.push_layer(bounds(20., 20., 40., 40.));
         scene.insert_primitive(blur(bounds(20., 20., 40., 40.)));
         scene.pop_layer();
         scene.finish();
-        assert_eq!(kinds(&scene), ["quads (2)", "backdrop blur 0"]);
+        assert_eq!(kinds(&scene), ["quads (3)", "backdrop blur 0"]);
+    }
+
+    #[test]
+    fn what_a_layer_paints_after_a_backdrop_blur_draws_over_it() {
+        let mut scene = Scene::default();
+        scene.push_layer(bounds(0., 0., 100., 100.));
+        scene.push_layer(bounds(10., 10., 80., 80.));
+        scene.insert_primitive(quad(bounds(10., 10., 80., 80.)));
+        scene.insert_primitive(blur(bounds(20., 20., 40., 40.)));
+        scene.insert_primitive(quad(bounds(20., 20., 40., 40.)));
+        scene.pop_layer();
+        scene.insert_primitive(quad(bounds(30., 30., 10., 10.)));
+        scene.pop_layer();
+        scene.finish();
+        assert_eq!(kinds(&scene), ["quads (1)", "backdrop blur 0", "quads (2)"]);
+        let order_of = |at: Bounds<ScaledPixels>| {
+            scene
+                .quads
+                .iter()
+                .find(|quad| quad.bounds == at)
+                .unwrap()
+                .order
+        };
+        // The inner layer still draws over the outer one, as it did before the blur.
+        assert!(order_of(bounds(20., 20., 40., 40.)) > order_of(bounds(30., 30., 10., 10.)));
+    }
+
+    #[test]
+    fn what_a_layer_paints_past_its_bounds_after_a_backdrop_blur_draws_over_it() {
+        let mut scene = Scene::default();
+        // Stacked under the blur, away from the layer it is painted in.
+        for _ in 0..2 {
+            scene.insert_primitive(quad(bounds(100., 100., 20., 20.)));
+        }
+        scene.push_layer(bounds(0., 0., 10., 10.));
+        scene.insert_primitive(blur(bounds(100., 100., 20., 20.)));
+        scene.insert_primitive(quad(bounds(100., 100., 20., 20.)));
+        scene.pop_layer();
+        scene.finish();
+        assert_eq!(kinds(&scene), ["quads (2)", "backdrop blur 0", "quads (1)"]);
+    }
+
+    #[test]
+    fn a_backdrop_blur_orders_after_what_its_layer_painted_past_its_bounds() {
+        let mut scene = Scene::default();
+        for _ in 0..2 {
+            scene.insert_primitive(quad(bounds(0., 0., 10., 10.)));
+        }
+        scene.push_layer(bounds(0., 0., 10., 10.));
+        // Painted in the layer but outside its bounds, under the blur.
+        scene.insert_primitive(quad(bounds(100., 100., 20., 20.)));
+        scene.insert_primitive(blur(bounds(100., 100., 20., 20.)));
+        scene.pop_layer();
+        scene.finish();
+        assert_eq!(kinds(&scene), ["quads (3)", "backdrop blur 0"]);
     }
 }

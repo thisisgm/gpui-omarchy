@@ -4822,12 +4822,7 @@ impl Window {
         }
     }
 
-    /// Blur what has been painted under `bounds` so far, by a gaussian with
-    /// `radius` as its standard deviation, like CSS `backdrop-filter: blur()`.
-    /// Paint the element's own background after it, see-through, to tint the
-    /// blur. What the window leaves see-through stays see-through.
-    ///
-    /// This method should only be called as part of the paint phase of element drawing.
+    /// Blurs what was painted under `bounds`, like CSS `backdrop-filter: blur()`; paint phase only.
     pub fn paint_backdrop_blur(
         &mut self,
         bounds: Bounds<Pixels>,

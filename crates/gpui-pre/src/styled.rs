@@ -742,9 +742,7 @@ pub trait Styled: Sized {
         self
     }
 
-    /// Blurs what is drawn behind this element, by a gaussian with `radius` as
-    /// its standard deviation, like CSS `backdrop-filter: blur()`. Give the
-    /// element a see-through background to tint the blur.
+    /// Blurs what is drawn behind this element, like CSS `backdrop-filter: blur(radius)`.
     fn backdrop_blur(mut self, radius: impl Into<Pixels>) -> Self {
         self.style().backdrop_blur = Some(radius.into());
         self

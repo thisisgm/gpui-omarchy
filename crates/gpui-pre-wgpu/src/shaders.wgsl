@@ -1363,18 +1363,16 @@ fn fs_surface(input: SurfaceVarying) -> @location(0) vec4<f32> {
 
 // --- backdrop blur --- //
 
-// Every backdrop pass draws one rect into its target from one source texture,
-// in pixels: the frame copied, then shrunk, then blurred along x and along y,
-// then drawn back into the frame under the element's rounded rect. Members
-// are vec4s so the uniform needs no struct padding.
+// Standard deviations the blur reads; matches BACKDROP_BLUR_REACH in gpui's scene.rs.
+const BACKDROP_REACH: f32 = 3.0;
+
+// One backdrop pass, drawing one rect from one source texture; vec4 members need no padding.
 struct BackdropParams {
     // The rect drawn: origin in xy, size in zw, in target pixels.
     target_rect: vec4<f32>,
-    // Source samples are clamped into this rect, min in xy and max in zw, in
-    // source pixels, so they never read past what the pass filled.
+    // Samples clamp into this rect (min xy, max zw, source pixels), never reading unfilled texels.
     source_clamp: vec4<f32>,
-    // Where the blurred region starts in the frame (xy), and one blur step
-    // along the pass's axis (zw), in source pixels.
+    // Blurred region origin in the frame (xy) and one blur step along the pass's axis (zw).
     region: vec4<f32>,
     bounds: vec4<f32>,
     // Top left, top right, bottom right, bottom left.
@@ -1413,8 +1411,7 @@ fn backdrop_sample(position: vec2<f32>) -> vec4<f32> {
     return textureSampleLevel(t_backdrop, s_backdrop, clamped / size, 0.0);
 }
 
-// Averages the frame pixels a shrunk pixel covers. Linear filtering averages
-// the 2x2 pixels around each pixel corner sampled.
+// Averages the frame pixels a shrunk pixel covers; linear filtering averages 2x2 per sample.
 @fragment
 fn fs_backdrop_downsample(input: BackdropVarying) -> @location(0) vec4<f32> {
     let start = backdrop.region.xy + floor(input.position.xy) * backdrop.scale;
@@ -1436,7 +1433,7 @@ fn fs_backdrop_downsample(input: BackdropVarying) -> @location(0) vec4<f32> {
 fn fs_backdrop_blur(input: BackdropVarying) -> @location(0) vec4<f32> {
     let center = input.position.xy;
     let step = backdrop.region.zw;
-    let taps = i32(ceil(3.0 * backdrop.sigma));
+    let taps = i32(ceil(BACKDROP_REACH * backdrop.sigma));
     var total = gaussian(0.0, backdrop.sigma);
     var sum = backdrop_sample(center) * total;
     for (var i = 1; i <= taps; i += 1) {
@@ -1448,8 +1445,7 @@ fn fs_backdrop_blur(input: BackdropVarying) -> @location(0) vec4<f32> {
     return sum / total;
 }
 
-// The blurred pixels inside the element's rounded rect and content mask, and
-// the frame as it was outside them, antialiased between.
+// Blurred inside the rounded rect and content mask, sharp outside, antialiased between.
 @fragment
 fn fs_backdrop_composite(input: BackdropVarying) -> @location(0) vec4<f32> {
     let position = input.position.xy;
