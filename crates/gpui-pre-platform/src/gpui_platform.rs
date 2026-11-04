@@ -31,6 +31,13 @@ pub fn linux(allowed_modes: gpui::WindowingModes) -> gpui::Application {
     gpui::Application::with_platform(gpui_linux::linux_platform(allowed_modes))
 }
 
+/// Starts creating the GPU instance in the background so the first window opens sooner.
+///
+/// Call it at the top of `main`, before other startup work, to overlap the two.
+pub fn prewarm_gpu() {
+    gpui_linux::prewarm_gpu();
+}
+
 /// Returns the default [`Platform`] for the current OS.
 pub fn current_platform(headless: bool) -> Rc<dyn Platform> {
     gpui_linux::current_platform(headless)

@@ -1684,6 +1684,7 @@ impl Window {
             .and_then(|titlebar| titlebar.title.clone());
 
         let window_bounds = window_bounds.unwrap_or_else(|| default_bounds(display_id, cx));
+        let window_decorations = window_decorations.unwrap_or(WindowDecorations::Server);
         let mut platform_window = cx.platform.open_window(
             handle,
             WindowParams {
@@ -1700,6 +1701,8 @@ impl Window {
                 window_min_size,
                 app_id: app_id.clone(),
                 icon,
+                window_background,
+                window_decorations,
                 #[cfg(target_os = "macos")]
                 tabbing_identifier,
             },
@@ -1731,8 +1734,7 @@ impl Window {
         let input_rate_tracker = Rc::new(RefCell::new(InputRateTracker::default()));
         let last_frame_time = Rc::new(Cell::new(None));
 
-        platform_window
-            .request_decorations(window_decorations.unwrap_or(WindowDecorations::Server));
+        platform_window.request_decorations(window_decorations);
         platform_window.set_background_appearance(window_background);
 
         match window_bounds {

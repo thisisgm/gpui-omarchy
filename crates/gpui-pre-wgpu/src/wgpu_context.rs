@@ -7,6 +7,16 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use wgpu::TextureFormat;
 
+#[cfg(not(target_family = "wasm"))]
+/// A Vulkan instance being created ahead of the first window.
+enum Prewarmed {
+    Pending(std::thread::JoinHandle<wgpu::Instance>),
+    Taken,
+}
+
+#[cfg(not(target_family = "wasm"))]
+static PREWARMED_VULKAN_INSTANCE: Mutex<Option<Prewarmed>> = Mutex::new(None);
+
 #[derive(Clone)]
 pub struct WgpuContext {
     pub instance: wgpu::Instance,
@@ -471,6 +481,31 @@ impl WgpuContext {
     #[cfg(not(target_family = "wasm"))]
     pub fn instance(display: Option<Box<dyn wgpu::wgt::WgpuHasDisplayHandle>>) -> wgpu::Instance {
         Self::instance_with_backends(display, wgpu::Backends::VULKAN | wgpu::Backends::GL)
+    }
+
+    /// Starts creating a Vulkan instance on a background thread, so the first window's renderer
+    /// can skip that work. Call it early in `main`, before other startup work, to overlap the
+    /// two. The first renderer to need a Vulkan instance takes it, waiting if it is not ready.
+    /// Later calls do nothing; an instance nothing takes is simply never used.
+    #[cfg(not(target_family = "wasm"))]
+    pub fn prewarm_vulkan_instance() {
+        let mut slot = PREWARMED_VULKAN_INSTANCE.lock();
+        if slot.is_none() {
+            *slot = std::thread::Builder::new()
+                .name("gpu-instance-prewarm".into())
+                .spawn(|| Self::instance_with_backends(None, wgpu::Backends::VULKAN))
+                .log_err()
+                .map(Prewarmed::Pending);
+        }
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) fn take_prewarmed_vulkan_instance() -> Option<wgpu::Instance> {
+        let mut slot = PREWARMED_VULKAN_INSTANCE.lock();
+        match slot.replace(Prewarmed::Taken)? {
+            Prewarmed::Pending(thread) => thread.join().ok(),
+            Prewarmed::Taken => None,
+        }
     }
 
     /// An instance limited to `backends`; each backend in the set is brought up when the instance is created.

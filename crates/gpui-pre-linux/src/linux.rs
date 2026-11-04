@@ -52,3 +52,14 @@ pub fn current_platform(headless: bool) -> Rc<dyn gpui::Platform> {
 pub fn linux_platform(allowed_modes: WindowingModes) -> Rc<dyn gpui::Platform> {
     Rc::new(LinuxPlatform::new(allowed_modes))
 }
+
+/// Starts creating the GPU instance in the background so the first window opens sooner.
+///
+/// Call it at the top of `main`, before other startup work, to overlap the two. Without a
+/// windowing feature, or when the process ends up headless or on GL, it costs one idle thread.
+pub fn prewarm_gpu() {
+    #[cfg(any(feature = "wayland", feature = "x11"))]
+    if std::env::var_os("ZED_HEADLESS").is_none() {
+        gpui_wgpu::WgpuContext::prewarm_vulkan_instance();
+    }
+}

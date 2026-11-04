@@ -592,6 +592,15 @@ impl WaylandWindowState {
         options: WindowParams,
         parent: Option<WaylandWindowStatePtr>,
     ) -> anyhow::Result<Self> {
+        // The window applies its requested decorations and background right after opening; start
+        // the renderer in the alpha mode they produce so neither step rebuilds every pipeline.
+        let initial_decorations = if surface_state.decoration().is_some() {
+            options.window_decorations
+        } else {
+            WindowDecorations::Client
+        };
+        let initially_transparent = initial_decorations == WindowDecorations::Client
+            || options.window_background != WindowBackgroundAppearance::Opaque;
         let renderer = {
             let raw_window = RawWindow {
                 window: surface.id().as_ptr().cast::<c_void>(),
@@ -607,7 +616,7 @@ impl WaylandWindowState {
                     width: DevicePixels(f32::from(options.bounds.size.width) as i32),
                     height: DevicePixels(f32::from(options.bounds.size.height) as i32),
                 },
-                transparent: true,
+                transparent: initially_transparent,
                 // Prefer Mailbox to avoid blocking. Falls back to FIFO if Mailbox is unsupported.
                 preferred_present_mode: Some(wgpu::PresentMode::Mailbox),
             };
@@ -648,7 +657,7 @@ impl WaylandWindowState {
             scale: 1.0,
             input_handler: None,
             decorations: WindowDecorations::Client,
-            background_appearance: WindowBackgroundAppearance::Opaque,
+            background_appearance: options.window_background,
             fullscreen: false,
             maximized: false,
             visibility: WindowVisibility::Visible,

@@ -309,6 +309,11 @@ impl WgpuRenderer {
             .map_err(|e| anyhow::anyhow!("Failed to get window handle: {e}"))?;
 
         let raw_window_handle = window_handle.as_raw();
+        // Named on every surface: a prewarmed instance was created without a display.
+        let raw_display_handle = window
+            .display_handle()
+            .map_err(|e| anyhow::anyhow!("Failed to get display handle: {e}"))?
+            .as_raw();
 
         // Use the existing context's instance if available, otherwise create a new one.
         // The surface must be created with the same instance that will be used for
@@ -321,7 +326,7 @@ impl WgpuRenderer {
         let mut ctx_ref = gpu_context.borrow_mut();
         let surface = match existing_instance {
             Some(instance) => {
-                let surface = Self::create_raw_surface(&instance, raw_window_handle)?;
+                let surface = create_surface(&instance, raw_display_handle, raw_window_handle)?;
                 ctx_ref
                     .as_ref()
                     .context("GPU context vanished while its instance was in use")?
@@ -330,7 +335,12 @@ impl WgpuRenderer {
             }
             None => {
                 let (context, surface) =
-                    Self::new_context_vulkan_first(window, raw_window_handle, compositor_gpu)?;
+                    Self::new_context_vulkan_first(
+                        window,
+                        raw_display_handle,
+                        raw_window_handle,
+                        compositor_gpu,
+                    )?;
                 *ctx_ref = Some(context);
                 surface
             }
@@ -351,27 +361,11 @@ impl WgpuRenderer {
         )
     }
 
-    #[cfg(not(target_family = "wasm"))]
-    fn create_raw_surface(
-        instance: &wgpu::Instance,
-        raw_window_handle: raw_window_handle::RawWindowHandle,
-    ) -> anyhow::Result<wgpu::Surface<'static>> {
-        let target = wgpu::SurfaceTargetUnsafe::RawHandle {
-            // Fall back to the display handle already provided via InstanceDescriptor::display.
-            raw_display_handle: None,
-            raw_window_handle,
-        };
-        // Safety: The caller guarantees that the window handle is valid for the
-        // lifetime of this renderer. In practice, the RawWindow struct is created
-        // from the native window handles and the surface is dropped before the window.
-        unsafe { instance.create_surface_unsafe(target) }
-            .map_err(|e| anyhow::anyhow!("Failed to create surface: {e}"))
-    }
-
     /// Tries Vulkan alone before GL: an instance listing both brings up EGL on every launch even when Vulkan wins.
     #[cfg(not(target_family = "wasm"))]
     fn new_context_vulkan_first<W>(
         window: &W,
+        raw_display_handle: raw_window_handle::RawDisplayHandle,
         raw_window_handle: raw_window_handle::RawWindowHandle,
         compositor_gpu: Option<CompositorGpuHint>,
     ) -> anyhow::Result<(WgpuContext, wgpu::Surface<'static>)>
@@ -380,10 +374,16 @@ impl WgpuRenderer {
     {
         let mut last_error = None;
         for backends in [wgpu::Backends::VULKAN, wgpu::Backends::GL] {
-            let instance =
-                WgpuContext::instance_with_backends(Some(Box::new(window.clone())), backends);
-            let attempt =
-                Self::create_raw_surface(&instance, raw_window_handle).and_then(|surface| {
+            let instance = if backends == wgpu::Backends::VULKAN {
+                WgpuContext::take_prewarmed_vulkan_instance()
+            } else {
+                None
+            }
+            .unwrap_or_else(|| {
+                WgpuContext::instance_with_backends(Some(Box::new(window.clone())), backends)
+            });
+            let attempt = create_surface(&instance, raw_display_handle, raw_window_handle)
+                .and_then(|surface| {
                     WgpuContext::new(instance, &surface, compositor_gpu)
                         .map(|context| (context, surface))
                 });
@@ -826,49 +826,6 @@ impl WgpuRendererCore {
             })
         };
 
-        let quads = create_pipeline(
-            "quads",
-            "vs_quad",
-            "fs_quad",
-            &layouts.globals,
-            &layouts.instances,
-            None,
-            wgpu::PrimitiveTopology::TriangleStrip,
-            &[Some(color_target.clone())],
-            1,
-            &shader_module,
-        );
-
-        let shadows = create_pipeline(
-            "shadows",
-            "vs_shadow",
-            "fs_shadow",
-            &layouts.globals,
-            &layouts.instances,
-            None,
-            wgpu::PrimitiveTopology::TriangleStrip,
-            &[Some(color_target.clone())],
-            1,
-            &shader_module,
-        );
-
-        let path_rasterization = create_pipeline(
-            "path_rasterization",
-            "vs_path_rasterization",
-            "fs_path_rasterization",
-            &layouts.globals,
-            &layouts.instances,
-            None,
-            wgpu::PrimitiveTopology::TriangleList,
-            &[Some(wgpu::ColorTargetState {
-                format: surface_format,
-                blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
-                write_mask: wgpu::ColorWrites::ALL,
-            })],
-            path_sample_count,
-            &shader_module,
-        );
-
         let paths_blend = wgpu::BlendState {
             color: wgpu::BlendComponent {
                 src_factor: wgpu::BlendFactor::One,
@@ -881,109 +838,180 @@ impl WgpuRendererCore {
                 operation: wgpu::BlendOperation::Add,
             },
         };
-
-        let paths = create_pipeline(
-            "paths",
-            "vs_path",
-            "fs_path",
-            &layouts.globals,
-            &layouts.instances,
-            Some(&layouts.texture),
-            wgpu::PrimitiveTopology::TriangleStrip,
-            &[Some(wgpu::ColorTargetState {
-                format: surface_format,
-                blend: Some(paths_blend),
-                write_mask: wgpu::ColorWrites::ALL,
-            })],
-            1,
-            &shader_module,
-        );
-
-        let underlines = create_pipeline(
-            "underlines",
-            "vs_underline",
-            "fs_underline",
-            &layouts.globals,
-            &layouts.instances,
-            None,
-            wgpu::PrimitiveTopology::TriangleStrip,
-            &[Some(color_target.clone())],
-            1,
-            &shader_module,
-        );
-
-        let mono_sprites = create_pipeline(
-            "mono_sprites",
-            "vs_mono_sprite",
-            "fs_mono_sprite",
-            &layouts.globals,
-            &layouts.instances,
-            Some(&layouts.texture),
-            wgpu::PrimitiveTopology::TriangleStrip,
-            &[Some(color_target.clone())],
-            1,
-            &shader_module,
-        );
-
-        let subpixel_sprites = if let Some(subpixel_module) = &subpixel_shader_module {
-            let subpixel_blend = wgpu::BlendState {
-                color: wgpu::BlendComponent {
-                    src_factor: wgpu::BlendFactor::Src1,
-                    dst_factor: wgpu::BlendFactor::OneMinusSrc1,
-                    operation: wgpu::BlendOperation::Add,
-                },
-                alpha: wgpu::BlendComponent {
-                    src_factor: wgpu::BlendFactor::One,
-                    dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
-                    operation: wgpu::BlendOperation::Add,
-                },
-            };
-
-            Some(create_pipeline(
-                "subpixel_sprites",
-                "vs_subpixel_sprite",
-                "fs_subpixel_sprite",
-                &layouts.globals,
-                &layouts.instances,
-                Some(&layouts.texture),
-                wgpu::PrimitiveTopology::TriangleStrip,
-                &[Some(wgpu::ColorTargetState {
-                    format: surface_format,
-                    blend: Some(subpixel_blend),
-                    write_mask: wgpu::ColorWrites::COLOR,
-                })],
-                1,
-                subpixel_module,
-            ))
-        } else {
-            None
+        let subpixel_blend = wgpu::BlendState {
+            color: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::Src1,
+                dst_factor: wgpu::BlendFactor::OneMinusSrc1,
+                operation: wgpu::BlendOperation::Add,
+            },
+            alpha: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::One,
+                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                operation: wgpu::BlendOperation::Add,
+            },
         };
 
-        let poly_sprites = create_pipeline(
-            "poly_sprites",
-            "vs_poly_sprite",
-            "fs_poly_sprite",
-            &layouts.globals,
-            &layouts.instances,
-            Some(&layouts.texture),
-            wgpu::PrimitiveTopology::TriangleStrip,
-            &[Some(color_target.clone())],
-            1,
-            &shader_module,
-        );
-
-        let surfaces = create_pipeline(
-            "surfaces",
-            "vs_surface",
-            "fs_surface",
-            &layouts.globals,
-            &layouts.surfaces,
-            None,
-            wgpu::PrimitiveTopology::TriangleStrip,
-            &[Some(color_target)],
-            1,
-            &shader_module,
-        );
+        // Each pipeline is compiled independently, and a driver with a cold shader cache
+        // (NVIDIA after a driver update, for example) spends tens of milliseconds on each
+        // one, so they are built side by side rather than in sequence.
+        let create_pipeline = &create_pipeline;
+        let shader_module = &shader_module;
+        let color_target = &color_target;
+        let paths_blend = &paths_blend;
+        let subpixel_blend = &subpixel_blend;
+        let mut jobs: Vec<Box<dyn FnOnce() -> wgpu::RenderPipeline + Send + '_>> = vec![
+            Box::new(move || {
+                create_pipeline(
+                    "quads",
+                    "vs_quad",
+                    "fs_quad",
+                    &layouts.globals,
+                    &layouts.instances,
+                    None,
+                    wgpu::PrimitiveTopology::TriangleStrip,
+                    &[Some(color_target.clone())],
+                    1,
+                    shader_module,
+                )
+            }),
+            Box::new(move || {
+                create_pipeline(
+                    "shadows",
+                    "vs_shadow",
+                    "fs_shadow",
+                    &layouts.globals,
+                    &layouts.instances,
+                    None,
+                    wgpu::PrimitiveTopology::TriangleStrip,
+                    &[Some(color_target.clone())],
+                    1,
+                    shader_module,
+                )
+            }),
+            Box::new(move || {
+                create_pipeline(
+                    "path_rasterization",
+                    "vs_path_rasterization",
+                    "fs_path_rasterization",
+                    &layouts.globals,
+                    &layouts.instances,
+                    None,
+                    wgpu::PrimitiveTopology::TriangleList,
+                    &[Some(wgpu::ColorTargetState {
+                        format: surface_format,
+                        blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    path_sample_count,
+                    shader_module,
+                )
+            }),
+            Box::new(move || {
+                create_pipeline(
+                    "paths",
+                    "vs_path",
+                    "fs_path",
+                    &layouts.globals,
+                    &layouts.instances,
+                    Some(&layouts.texture),
+                    wgpu::PrimitiveTopology::TriangleStrip,
+                    &[Some(wgpu::ColorTargetState {
+                        format: surface_format,
+                        blend: Some(*paths_blend),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    1,
+                    shader_module,
+                )
+            }),
+            Box::new(move || {
+                create_pipeline(
+                    "underlines",
+                    "vs_underline",
+                    "fs_underline",
+                    &layouts.globals,
+                    &layouts.instances,
+                    None,
+                    wgpu::PrimitiveTopology::TriangleStrip,
+                    &[Some(color_target.clone())],
+                    1,
+                    shader_module,
+                )
+            }),
+            Box::new(move || {
+                create_pipeline(
+                    "mono_sprites",
+                    "vs_mono_sprite",
+                    "fs_mono_sprite",
+                    &layouts.globals,
+                    &layouts.instances,
+                    Some(&layouts.texture),
+                    wgpu::PrimitiveTopology::TriangleStrip,
+                    &[Some(color_target.clone())],
+                    1,
+                    shader_module,
+                )
+            }),
+            Box::new(move || {
+                create_pipeline(
+                    "poly_sprites",
+                    "vs_poly_sprite",
+                    "fs_poly_sprite",
+                    &layouts.globals,
+                    &layouts.instances,
+                    Some(&layouts.texture),
+                    wgpu::PrimitiveTopology::TriangleStrip,
+                    &[Some(color_target.clone())],
+                    1,
+                    shader_module,
+                )
+            }),
+            Box::new(move || {
+                create_pipeline(
+                    "surfaces",
+                    "vs_surface",
+                    "fs_surface",
+                    &layouts.globals,
+                    &layouts.surfaces,
+                    None,
+                    wgpu::PrimitiveTopology::TriangleStrip,
+                    &[Some(color_target.clone())],
+                    1,
+                    shader_module,
+                )
+            }),
+        ];
+        if let Some(subpixel_module) = &subpixel_shader_module {
+            jobs.push(Box::new(move || {
+                create_pipeline(
+                    "subpixel_sprites",
+                    "vs_subpixel_sprite",
+                    "fs_subpixel_sprite",
+                    &layouts.globals,
+                    &layouts.instances,
+                    Some(&layouts.texture),
+                    wgpu::PrimitiveTopology::TriangleStrip,
+                    &[Some(wgpu::ColorTargetState {
+                        format: surface_format,
+                        blend: Some(*subpixel_blend),
+                        write_mask: wgpu::ColorWrites::COLOR,
+                    })],
+                    1,
+                    subpixel_module,
+                )
+            }));
+        }
+        let mut pipelines = build_in_parallel(jobs).into_iter();
+        let mut next = || pipelines.next().expect("one pipeline per job");
+        let quads = next();
+        let shadows = next();
+        let path_rasterization = next();
+        let paths = next();
+        let underlines = next();
+        let mono_sprites = next();
+        let poly_sprites = next();
+        let surfaces = next();
+        let subpixel_sprites = subpixel_shader_module.as_ref().map(|_| next());
 
         WgpuPipelines {
             quads,
@@ -1048,6 +1076,68 @@ impl WgpuRendererCore {
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         Some((texture, view))
+    }
+}
+
+/// Runs independent jobs on a few scoped threads and returns their results in order. Wasm has
+/// no threads, so there the jobs run one after another.
+fn build_in_parallel<'a, T: Send>(jobs: Vec<Box<dyn FnOnce() -> T + Send + 'a>>) -> Vec<T> {
+    #[cfg(not(target_family = "wasm"))]
+    {
+        // The slowest shader bounds the wall time, so a few workers get nearly all of the gain.
+        // Each extra thread leaves a glibc malloc arena behind that keeps driver memory resident.
+        const MAX_WORKERS: usize = 4;
+        let workers = std::thread::available_parallelism()
+            .map_or(1, |n| n.get())
+            .min(MAX_WORKERS)
+            .min(jobs.len());
+        let queue = std::sync::Mutex::new(jobs.into_iter().enumerate());
+        let drain = || {
+            let mut done = Vec::new();
+            loop {
+                let next = queue.lock().unwrap_or_else(|e| e.into_inner()).next();
+                let Some((index, job)) = next else { break };
+                done.push((index, job()));
+            }
+            done
+        };
+        let mut results = std::thread::scope(|scope| {
+            // A worker that fails to spawn only means the others drain more of the queue.
+            let handles: Vec<_> = (1..workers)
+                .filter_map(|_| {
+                    std::thread::Builder::new()
+                        .name("gpu-pipeline".into())
+                        .spawn_scoped(scope, &drain)
+                        .ok()
+                })
+                .collect();
+            // The calling thread works the queue too instead of idling until the others finish.
+            let mut results = drain();
+            for handle in handles {
+                results.extend(
+                    handle
+                        .join()
+                        .unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
+                );
+            }
+            results
+        });
+        // A cold driver shader compile leaves freed memory resident in the workers' malloc
+        // arenas after the threads exit. Hand what is free back to the system.
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
+        {
+            unsafe extern "C" {
+                fn malloc_trim(pad: usize) -> std::ffi::c_int;
+            }
+            // SAFETY: malloc_trim only releases free heap pages and is safe to call at any time.
+            unsafe { malloc_trim(0) };
+        }
+        results.sort_unstable_by_key(|(index, _)| *index);
+        results.into_iter().map(|(_, result)| result).collect()
+    }
+    #[cfg(target_family = "wasm")]
+    {
+        jobs.into_iter().map(|job| job()).collect()
     }
 }
 
@@ -2203,7 +2293,7 @@ impl WgpuRenderer {
             .window_handle()
             .map_err(|e| anyhow::anyhow!("Failed to get window handle: {e}"))?;
 
-        let surface = create_surface(instance, window_handle.as_raw())?;
+        let surface = create_surface_with_instance_display(instance, window_handle.as_raw())?;
 
         let width = (config.size.width.0 as u32).max(1);
         let height = (config.size.height.0 as u32).max(1);
@@ -2317,6 +2407,10 @@ impl WgpuRenderer {
         let window_handle = window
             .window_handle()
             .map_err(|e| anyhow::anyhow!("Failed to get window handle: {e}"))?;
+        let raw_display_handle = window
+            .display_handle()
+            .map_err(|e| anyhow::anyhow!("Failed to get display handle: {e}"))?
+            .as_raw();
 
         let surface = if needs_new_context {
             log::warn!("GPU device lost, recreating context...");
@@ -2333,7 +2427,7 @@ impl WgpuRenderer {
             std::thread::sleep(std::time::Duration::from_millis(350));
 
             let instance = WgpuContext::instance(Some(Box::new(window.clone())));
-            let surface = create_surface(&instance, window_handle.as_raw())?;
+            let surface = create_surface(&instance, raw_display_handle, window_handle.as_raw())?;
             let new_context =
                 WgpuContext::new_rejecting_software(instance, &surface, self.compositor_gpu)?;
             *gpu_context.borrow_mut() = Some(new_context);
@@ -2341,7 +2435,7 @@ impl WgpuRenderer {
         } else {
             let ctx_ref = gpu_context.borrow();
             let instance = &ctx_ref.as_ref().unwrap().instance;
-            create_surface(instance, window_handle.as_raw())?
+            create_surface(instance, raw_display_handle, window_handle.as_raw())?
         };
 
         let config = WgpuSurfaceConfig {
@@ -2646,19 +2740,42 @@ fn instance_range(range: Range<usize>) -> Range<u32> {
     range.start as u32..range.end as u32
 }
 
+/// Creates a surface for a window, naming its display explicitly so it works on instances
+/// created without one, such as a prewarmed Vulkan instance.
 #[cfg(not(target_family = "wasm"))]
 fn create_surface(
     instance: &wgpu::Instance,
+    raw_display_handle: raw_window_handle::RawDisplayHandle,
     raw_window_handle: raw_window_handle::RawWindowHandle,
 ) -> anyhow::Result<wgpu::Surface<'static>> {
+    create_surface_target(instance, Some(raw_display_handle), raw_window_handle)
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn create_surface_with_instance_display(
+    instance: &wgpu::Instance,
+    raw_window_handle: raw_window_handle::RawWindowHandle,
+) -> anyhow::Result<wgpu::Surface<'static>> {
+    // Falls back to the display handle provided via InstanceDescriptor::display.
+    create_surface_target(instance, None, raw_window_handle)
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn create_surface_target(
+    instance: &wgpu::Instance,
+    raw_display_handle: Option<raw_window_handle::RawDisplayHandle>,
+    raw_window_handle: raw_window_handle::RawWindowHandle,
+) -> anyhow::Result<wgpu::Surface<'static>> {
+    // Safety: The caller guarantees that the window handle is valid for the
+    // lifetime of this renderer. In practice, the RawWindow struct is created
+    // from the native window handles and the surface is dropped before the window.
     unsafe {
         instance
             .create_surface_unsafe(wgpu::SurfaceTargetUnsafe::RawHandle {
-                // Fall back to the display handle already provided via InstanceDescriptor::display.
-                raw_display_handle: None,
+                raw_display_handle,
                 raw_window_handle,
             })
-            .map_err(|e| anyhow::anyhow!("{e}"))
+            .map_err(|e| anyhow::anyhow!("Failed to create surface: {e}"))
     }
 }
 
