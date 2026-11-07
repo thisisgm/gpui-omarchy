@@ -850,9 +850,7 @@ impl WgpuRendererCore {
             },
         };
 
-        // Each pipeline is compiled independently, and a driver with a cold shader cache
-        // (NVIDIA after a driver update, for example) spends tens of milliseconds on each
-        // one, so they are built side by side rather than in sequence.
+        // Pipelines compile independently, and a cold shader cache costs tens of milliseconds each.
         let create_pipeline = &create_pipeline;
         let shader_module = &shader_module;
         let color_target = &color_target;
@@ -1078,66 +1076,56 @@ impl WgpuRendererCore {
     }
 }
 
-/// Runs independent jobs on a few scoped threads and returns their results in order. Wasm has
-/// no threads, so there the jobs run one after another.
+/// Runs independent jobs on a few scoped threads and returns their results in job order.
 fn build_in_parallel<'a, T: Send>(jobs: Vec<Box<dyn FnOnce() -> T + Send + 'a>>) -> Vec<T> {
-    #[cfg(not(target_family = "wasm"))]
-    {
-        // The slowest shader bounds the wall time, so a few workers get nearly all of the gain.
-        // Each extra thread leaves a glibc malloc arena behind that keeps driver memory resident.
-        const MAX_WORKERS: usize = 4;
-        let workers = std::thread::available_parallelism()
-            .map_or(1, |n| n.get())
-            .min(MAX_WORKERS)
-            .min(jobs.len());
-        let queue = std::sync::Mutex::new(jobs.into_iter().enumerate());
-        let drain = || {
-            let mut done = Vec::new();
-            loop {
-                let next = queue.lock().unwrap_or_else(|e| e.into_inner()).next();
-                let Some((index, job)) = next else { break };
-                done.push((index, job()));
-            }
-            done
-        };
-        let mut results = std::thread::scope(|scope| {
-            // A worker that fails to spawn only means the others drain more of the queue.
-            let handles: Vec<_> = (1..workers)
-                .filter_map(|_| {
-                    std::thread::Builder::new()
-                        .name("gpu-pipeline".into())
-                        .spawn_scoped(scope, &drain)
-                        .ok()
-                })
-                .collect();
-            // The calling thread works the queue too instead of idling until the others finish.
-            let mut results = drain();
-            for handle in handles {
-                results.extend(
-                    handle
-                        .join()
-                        .unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
-                );
-            }
-            results
-        });
-        // A cold driver shader compile leaves freed memory resident in the workers' malloc
-        // arenas after the threads exit. Hand what is free back to the system.
-        #[cfg(all(target_os = "linux", target_env = "gnu"))]
-        {
-            unsafe extern "C" {
-                fn malloc_trim(pad: usize) -> std::ffi::c_int;
-            }
-            // SAFETY: malloc_trim only releases free heap pages and is safe to call at any time.
-            unsafe { malloc_trim(0) };
+    // The slowest shader bounds wall time; each extra thread keeps a malloc arena of driver memory.
+    const MAX_WORKERS: usize = 4;
+    let workers = std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .min(MAX_WORKERS)
+        .min(jobs.len());
+    let queue = std::sync::Mutex::new(jobs.into_iter().enumerate());
+    let drain = || {
+        let mut done = Vec::new();
+        loop {
+            let next = queue.lock().unwrap_or_else(|e| e.into_inner()).next();
+            let Some((index, job)) = next else { break };
+            done.push((index, job()));
         }
-        results.sort_unstable_by_key(|(index, _)| *index);
-        results.into_iter().map(|(_, result)| result).collect()
-    }
-    #[cfg(target_family = "wasm")]
+        done
+    };
+    let mut results = std::thread::scope(|scope| {
+        // A worker that fails to spawn only means the others drain more of the queue.
+        let handles: Vec<_> = (1..workers)
+            .filter_map(|_| {
+                std::thread::Builder::new()
+                    .name("gpu-pipeline".into())
+                    .spawn_scoped(scope, &drain)
+                    .ok()
+            })
+            .collect();
+        // The calling thread works the queue too instead of idling until the others finish.
+        let mut results = drain();
+        for handle in handles {
+            results.extend(
+                handle
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
+            );
+        }
+        results
+    });
+    // Cold shader compiles leave freed memory resident in the exited workers' malloc arenas.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
     {
-        jobs.into_iter().map(|job| job()).collect()
+        unsafe extern "C" {
+            fn malloc_trim(pad: usize) -> std::ffi::c_int;
+        }
+        // SAFETY: malloc_trim only releases free heap pages and is safe to call at any time.
+        unsafe { malloc_trim(0) };
     }
+    results.sort_unstable_by_key(|(index, _)| *index);
+    results.into_iter().map(|(_, result)| result).collect()
 }
 
 impl WgpuRenderer {
@@ -2282,7 +2270,7 @@ impl WgpuRenderer {
     /// different instance will cause a "Device does not exist" panic because
     /// the wgpu device is bound to its originating instance.
     #[cfg(not(target_family = "wasm"))]
-    pub fn replace_surface<W: HasWindowHandle>(
+    pub fn replace_surface<W: HasWindowHandle + HasDisplayHandle>(
         &mut self,
         window: &W,
         config: WgpuSurfaceConfig,
@@ -2291,8 +2279,12 @@ impl WgpuRenderer {
         let window_handle = window
             .window_handle()
             .map_err(|e| anyhow::anyhow!("Failed to get window handle: {e}"))?;
+        let raw_display_handle = window
+            .display_handle()
+            .map_err(|e| anyhow::anyhow!("Failed to get display handle: {e}"))?
+            .as_raw();
 
-        let surface = create_surface_with_instance_display(instance, window_handle.as_raw())?;
+        let surface = create_surface(instance, raw_display_handle, window_handle.as_raw())?;
 
         let width = (config.size.width.0 as u32).max(1);
         let height = (config.size.height.0 as u32).max(1);
@@ -2739,39 +2731,18 @@ fn instance_range(range: Range<usize>) -> Range<u32> {
     range.start as u32..range.end as u32
 }
 
-/// Creates a surface for a window, naming its display explicitly so it works on instances
-/// created without one, such as a prewarmed Vulkan instance.
+/// Names the window's display explicitly, since a prewarmed Vulkan instance was created without one.
 #[cfg(not(target_family = "wasm"))]
 fn create_surface(
     instance: &wgpu::Instance,
     raw_display_handle: raw_window_handle::RawDisplayHandle,
     raw_window_handle: raw_window_handle::RawWindowHandle,
 ) -> anyhow::Result<wgpu::Surface<'static>> {
-    create_surface_target(instance, Some(raw_display_handle), raw_window_handle)
-}
-
-#[cfg(not(target_family = "wasm"))]
-fn create_surface_with_instance_display(
-    instance: &wgpu::Instance,
-    raw_window_handle: raw_window_handle::RawWindowHandle,
-) -> anyhow::Result<wgpu::Surface<'static>> {
-    // Falls back to the display handle provided via InstanceDescriptor::display.
-    create_surface_target(instance, None, raw_window_handle)
-}
-
-#[cfg(not(target_family = "wasm"))]
-fn create_surface_target(
-    instance: &wgpu::Instance,
-    raw_display_handle: Option<raw_window_handle::RawDisplayHandle>,
-    raw_window_handle: raw_window_handle::RawWindowHandle,
-) -> anyhow::Result<wgpu::Surface<'static>> {
-    // Safety: The caller guarantees that the window handle is valid for the
-    // lifetime of this renderer. In practice, the RawWindow struct is created
-    // from the native window handles and the surface is dropped before the window.
+    // Safety: the caller keeps the window alive until the surface is dropped.
     unsafe {
         instance
             .create_surface_unsafe(wgpu::SurfaceTargetUnsafe::RawHandle {
-                raw_display_handle,
+                raw_display_handle: Some(raw_display_handle),
                 raw_window_handle,
             })
             .map_err(|e| anyhow::anyhow!("Failed to create surface: {e}"))
@@ -2900,13 +2871,15 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "pipeline job failed")]
-    fn build_in_parallel_propagates_a_job_panic() {
+    fn build_in_parallel_propagates_a_worker_panic() {
+        // Only worker threads panic, so the message can reach the caller only through join.
         let jobs: Vec<Box<dyn FnOnce() -> usize + Send>> = (0..6_usize)
             .map(|index| {
                 Box::new(move || {
-                    if index == 5 {
+                    if std::thread::current().name() == Some("gpu-pipeline") {
                         panic!("pipeline job failed");
                     }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
                     index
                 }) as Box<dyn FnOnce() -> usize + Send>
             })
