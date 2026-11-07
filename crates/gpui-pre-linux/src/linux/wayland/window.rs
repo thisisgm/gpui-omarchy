@@ -592,15 +592,14 @@ impl WaylandWindowState {
         options: WindowParams,
         parent: Option<WaylandWindowStatePtr>,
     ) -> anyhow::Result<Self> {
-        // The window applies its requested decorations and background right after opening; start
-        // the renderer in the alpha mode they produce so neither step rebuilds every pipeline.
-        let initial_decorations = if surface_state.decoration().is_some() {
-            options.window_decorations
-        } else {
-            WindowDecorations::Client
-        };
-        let initially_transparent = initial_decorations == WindowDecorations::Client
-            || options.window_background != WindowBackgroundAppearance::Opaque;
+        // Start in the alpha mode the decorations and background applied right after opening produce, so neither rebuilds the pipelines.
+        let initially_transparent = draws_transparent(
+            settled_decorations(
+                surface_state.decoration().is_some(),
+                options.window_decorations,
+            ),
+            options.window_background,
+        );
         let renderer = {
             let raw_window = RawWindow {
                 window: surface.id().as_ptr().cast::<c_void>(),
@@ -688,8 +687,7 @@ impl WaylandWindowState {
     }
 
     pub fn is_transparent(&self) -> bool {
-        self.decorations == WindowDecorations::Client
-            || self.background_appearance != WindowBackgroundAppearance::Opaque
+        draws_transparent(self.decorations, self.background_appearance)
     }
 
     fn update_subpixel_layout(&mut self) {
@@ -759,6 +757,55 @@ fn run_frame_terminal(callbacks: &RefCell<Callbacks>, event: FrameTerminal) {
     let callback = callbacks.borrow().frame_terminal.clone();
     if let Some(callback) = callback {
         callback.borrow_mut()(event);
+    }
+}
+
+// Server-side decorations need the xdg decoration protocol; without it the window draws its own.
+fn settled_decorations(protocol: bool, requested: WindowDecorations) -> WindowDecorations {
+    if protocol {
+        requested
+    } else {
+        WindowDecorations::Client
+    }
+}
+
+fn draws_transparent(
+    decorations: WindowDecorations,
+    background: WindowBackgroundAppearance,
+) -> bool {
+    decorations == WindowDecorations::Client || background != WindowBackgroundAppearance::Opaque
+}
+
+#[cfg(test)]
+mod initial_alpha_mode_tests {
+    use super::{draws_transparent, settled_decorations};
+    use gpui::{WindowBackgroundAppearance, WindowDecorations};
+
+    #[test]
+    fn the_renderer_starts_in_the_alpha_mode_the_window_settles_in() {
+        let opaque = WindowBackgroundAppearance::Opaque;
+        let server = WindowDecorations::Server;
+        assert!(!draws_transparent(
+            settled_decorations(true, server),
+            opaque
+        ));
+        assert!(draws_transparent(
+            settled_decorations(false, server),
+            opaque
+        ));
+        assert!(draws_transparent(
+            settled_decorations(true, WindowDecorations::Client),
+            opaque
+        ));
+        for background in [
+            WindowBackgroundAppearance::Transparent,
+            WindowBackgroundAppearance::Blurred,
+        ] {
+            assert!(draws_transparent(
+                settled_decorations(true, server),
+                background
+            ));
+        }
     }
 }
 
@@ -2447,11 +2494,10 @@ impl PlatformWindow for WaylandWindow {
 
     fn request_decorations(&self, decorations: WindowDecorations) {
         let mut state = self.borrow_mut();
-        match state.surface_state.decoration().as_ref() {
+        let protocol = match state.surface_state.decoration() {
             Some(decoration) => {
                 decoration.set_mode(decorations.to_xdg());
-                state.decorations = decorations;
-                update_window(state);
+                true
             }
             None => {
                 if matches!(decorations, WindowDecorations::Server) {
@@ -2459,10 +2505,11 @@ impl PlatformWindow for WaylandWindow {
                         "Server-side decorations requested, but the Wayland server does not support them. Falling back to client-side decorations."
                     );
                 }
-                state.decorations = WindowDecorations::Client;
-                update_window(state);
+                false
             }
-        }
+        };
+        state.decorations = settled_decorations(protocol, decorations);
+        update_window(state);
         self.0.request_redraw();
     }
 

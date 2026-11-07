@@ -483,10 +483,7 @@ impl WgpuContext {
         Self::instance_with_backends(display, wgpu::Backends::VULKAN | wgpu::Backends::GL)
     }
 
-    /// Starts creating a Vulkan instance on a background thread, so the first window's renderer
-    /// can skip that work. Call it early in `main`, before other startup work, to overlap the
-    /// two. The first renderer to need a Vulkan instance takes it, waiting if it is not ready.
-    /// Later calls do nothing; an instance nothing takes is simply never used.
+    /// The first renderer that needs a Vulkan instance takes this one, waiting for it; later calls do nothing.
     #[cfg(not(target_family = "wasm"))]
     pub fn prewarm_vulkan_instance() {
         let mut slot = PREWARMED_VULKAN_INSTANCE.lock();

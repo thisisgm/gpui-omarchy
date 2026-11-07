@@ -334,13 +334,12 @@ impl WgpuRenderer {
                 surface
             }
             None => {
-                let (context, surface) =
-                    Self::new_context_vulkan_first(
-                        window,
-                        raw_display_handle,
-                        raw_window_handle,
-                        compositor_gpu,
-                    )?;
+                let (context, surface) = Self::new_context_vulkan_first(
+                    window,
+                    raw_display_handle,
+                    raw_window_handle,
+                    compositor_gpu,
+                )?;
                 *ctx_ref = Some(context);
                 surface
             }

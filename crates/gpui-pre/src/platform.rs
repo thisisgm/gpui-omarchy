@@ -2838,8 +2838,7 @@ pub struct WindowParams {
 
     pub window_min_size: Option<Size<Pixels>>,
 
-    /// The background the window will be given right after it opens, so a renderer can start in
-    /// the matching alpha mode instead of rebuilding its pipelines when it is applied.
+    /// The background applied right after opening, so a renderer can start in its alpha mode.
     pub window_background: WindowBackgroundAppearance,
 
     /// The decorations the window will request right after it opens.
