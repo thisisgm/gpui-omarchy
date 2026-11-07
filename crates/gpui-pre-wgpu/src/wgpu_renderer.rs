@@ -2881,6 +2881,40 @@ mod tests {
         );
     }
 
+    #[test]
+    fn build_in_parallel_returns_results_in_job_order() {
+        // More jobs than workers, and jobs that finish out of order.
+        let jobs: Vec<Box<dyn FnOnce() -> usize + Send>> = (0..9_usize)
+            .map(|index| {
+                Box::new(move || {
+                    std::thread::sleep(std::time::Duration::from_millis((9 - index) as u64));
+                    index * 10
+                }) as Box<dyn FnOnce() -> usize + Send>
+            })
+            .collect();
+        assert_eq!(
+            build_in_parallel(jobs),
+            (0..9).map(|index| index * 10).collect::<Vec<_>>()
+        );
+        assert!(build_in_parallel::<usize>(Vec::new()).is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "pipeline job failed")]
+    fn build_in_parallel_propagates_a_job_panic() {
+        let jobs: Vec<Box<dyn FnOnce() -> usize + Send>> = (0..6_usize)
+            .map(|index| {
+                Box::new(move || {
+                    if index == 5 {
+                        panic!("pipeline job failed");
+                    }
+                    index
+                }) as Box<dyn FnOnce() -> usize + Send>
+            })
+            .collect();
+        build_in_parallel(jobs);
+    }
+
     #[cfg(target_os = "linux")]
     const RED: [u8; 4] = [255, 0, 0, 255];
     #[cfg(target_os = "linux")]
