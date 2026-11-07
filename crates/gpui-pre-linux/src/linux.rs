@@ -57,6 +57,8 @@ pub fn linux_platform(allowed_modes: WindowingModes) -> Rc<dyn gpui::Platform> {
 pub fn prewarm_gpu() {
     #[cfg(any(feature = "wayland", feature = "x11"))]
     if std::env::var_os("ZED_HEADLESS").is_none() {
+        // The Vulkan loader reads the environment, so the platform's startup edits must come first.
+        take_startup_environment_before_threads();
         gpui_wgpu::WgpuContext::prewarm_vulkan_instance();
     }
 }

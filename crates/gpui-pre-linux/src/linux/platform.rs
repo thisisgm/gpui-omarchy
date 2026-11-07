@@ -300,10 +300,7 @@ pub(crate) struct LinuxPlatform {
     transition_waiter: RefCell<Option<oneshot::Sender<anyhow::Result<()>>>>,
 }
 
-/// What a Wayland connection made at startup may use from this process's environment.
-///
-/// Both are taken from the environment when the platform is created, before it starts any
-/// threads, and are only meaningful for the connection made then.
+/// What the startup Wayland connection may use from the environment, taken once before any thread starts.
 #[derive(Default)]
 struct StartupEnvironment {
     #[cfg(feature = "wayland")]
@@ -314,15 +311,41 @@ struct StartupEnvironment {
     wayland_socket: Option<std::os::unix::net::UnixStream>,
 }
 
-impl LinuxPlatform {
-    /// Creates the platform, headless until `run` connects it in its initial mode.
-    pub(crate) fn new(allowed_modes: WindowingModes) -> Self {
-        let startup = StartupEnvironment {
+impl StartupEnvironment {
+    fn from_process() -> Self {
+        Self {
             #[cfg(feature = "wayland")]
             activation_token: crate::linux::take_startup_activation_token_from_environment(),
             #[cfg(feature = "wayland")]
             wayland_socket: crate::linux::take_wayland_socket_from_environment(),
-        };
+        }
+    }
+}
+
+// Filled by `prewarm_gpu` or the first platform, whichever runs first; later platforms find it empty.
+static PROCESS_STARTUP_ENVIRONMENT: std::sync::OnceLock<
+    std::sync::Mutex<Option<StartupEnvironment>>,
+> = std::sync::OnceLock::new();
+
+fn process_startup_environment() -> &'static std::sync::Mutex<Option<StartupEnvironment>> {
+    PROCESS_STARTUP_ENVIRONMENT
+        .get_or_init(|| std::sync::Mutex::new(Some(StartupEnvironment::from_process())))
+}
+
+/// Removes the startup variables from the environment now, so a thread started next never races that edit.
+#[cfg(any(feature = "wayland", feature = "x11"))]
+pub(crate) fn take_startup_environment_before_threads() {
+    process_startup_environment();
+}
+
+impl LinuxPlatform {
+    /// Creates the platform, headless until `run` connects it in its initial mode.
+    pub(crate) fn new(allowed_modes: WindowingModes) -> Self {
+        let startup = process_startup_environment()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+            .unwrap_or_default();
         let event_loop = EventLoop::try_new().expect("failed to create Linux event loop");
         let (common, main_receiver, power_receiver) = LinuxCommon::new(event_loop.get_signal());
         let common = Rc::new(RefCell::new(common));
@@ -4007,5 +4030,51 @@ xkb_symbols "(unnamed)" { key <K1> {[ Escape ]}; key <K2> {[ space ]}; };
                 }
             }
         }
+    }
+}
+
+#[cfg(all(test, feature = "wayland"))]
+mod startup_environment_tests {
+    const CHILD_ENV: &str = "GPUI_STARTUP_ENVIRONMENT_TEST_CHILD";
+    const TOKEN: &str = "token-from-the-launcher";
+
+    #[test]
+    fn prewarm_takes_the_startup_environment_before_its_thread_starts() {
+        if std::env::var_os(CHILD_ENV).is_some() {
+            crate::linux::prewarm_gpu();
+            assert_eq!(std::env::var_os("XDG_ACTIVATION_TOKEN"), None);
+            let startup = super::process_startup_environment()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take()
+                .expect("prewarm filled the startup environment");
+            assert_eq!(startup.activation_token.as_deref(), Some(TOKEN));
+            return;
+        }
+
+        // Test names don't include the crate's name.
+        let module = module_path!()
+            .split_once("::")
+            .map_or(module_path!(), |(_, module)| module);
+        let test_name =
+            format!("{module}::prewarm_takes_the_startup_environment_before_its_thread_starts");
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "the test thread has nothing else to do while the child runs"
+        )]
+        let output =
+            std::process::Command::new(std::env::current_exe().expect("current test executable"))
+                .args(["--exact", &test_name, "--nocapture"])
+                .env(CHILD_ENV, "1")
+                .env("XDG_ACTIVATION_TOKEN", TOKEN)
+                .env_remove("ZED_HEADLESS")
+                .output()
+                .expect("run the prewarm in a child process");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "child failed\nstdout:\n{stdout}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stderr),
+        );
     }
 }

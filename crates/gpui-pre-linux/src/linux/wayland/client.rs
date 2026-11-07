@@ -245,7 +245,7 @@ pub(crate) fn take_startup_activation_token_from_environment() -> Option<String>
         .ok()
         .filter(|token| !token.is_empty());
     // Per the xdg-activation spec, so that programs we launch don't inherit the token.
-    // SAFETY: `LinuxPlatform::new` calls this before it starts any threads.
+    // SAFETY: only `StartupEnvironment::from_process` calls this, once, before `prewarm_gpu` or the platform starts a thread.
     unsafe { std::env::remove_var(XDG_ACTIVATION_TOKEN_ENV_VAR) };
     token
 }
@@ -255,7 +255,7 @@ pub(crate) fn take_wayland_socket_from_environment() -> Option<UnixStream> {
     const WAYLAND_SOCKET_ENV_VAR: &str = "WAYLAND_SOCKET";
     let value = std::env::var_os(WAYLAND_SOCKET_ENV_VAR)?;
     // Removed so that programs we launch don't inherit it, as libwayland does.
-    // SAFETY: `LinuxPlatform::new` calls this before it starts any threads.
+    // SAFETY: only `StartupEnvironment::from_process` calls this, once, before `prewarm_gpu` or the platform starts a thread.
     unsafe { std::env::remove_var(WAYLAND_SOCKET_ENV_VAR) };
     let Some(fd) = value
         .to_str()
