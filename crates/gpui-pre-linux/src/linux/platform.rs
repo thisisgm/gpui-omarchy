@@ -4039,7 +4039,7 @@ mod startup_environment_tests {
     const TOKEN: &str = "token-from-the-launcher";
 
     #[test]
-    fn prewarm_takes_the_startup_environment_before_its_thread_starts() {
+    fn prewarm_takes_the_startup_environment_out_of_the_process() {
         if std::env::var_os(CHILD_ENV).is_some() {
             crate::linux::prewarm_gpu();
             assert_eq!(std::env::var_os("XDG_ACTIVATION_TOKEN"), None);
@@ -4057,7 +4057,7 @@ mod startup_environment_tests {
             .split_once("::")
             .map_or(module_path!(), |(_, module)| module);
         let test_name =
-            format!("{module}::prewarm_takes_the_startup_environment_before_its_thread_starts");
+            format!("{module}::prewarm_takes_the_startup_environment_out_of_the_process");
         #[allow(
             clippy::disallowed_methods,
             reason = "the test thread has nothing else to do while the child runs"
