@@ -130,6 +130,7 @@ struct WgpuPipelines {
     paths: wgpu::RenderPipeline,
     underlines: wgpu::RenderPipeline,
     mono_sprites: wgpu::RenderPipeline,
+    /// Built by the first frame that draws subpixel text.
     subpixel_sprites: Option<wgpu::RenderPipeline>,
     poly_sprites: wgpu::RenderPipeline,
     #[allow(dead_code)]
@@ -708,38 +709,15 @@ impl WgpuRendererCore {
         )
     }
 
+    /// Every pipeline except subpixel text, which `ensure_subpixel_pipeline` builds on first use.
     fn create_pipelines(
         device: &wgpu::Device,
         layouts: &WgpuBindGroupLayouts,
         surface_format: wgpu::TextureFormat,
         alpha_mode: wgpu::CompositeAlphaMode,
         path_sample_count: u32,
-        dual_source_blending: bool,
         uses_webgl_instance_data: bool,
     ) -> WgpuPipelines {
-        // Diagnostic guard: verify the device actually has
-        // DUAL_SOURCE_BLENDING. We have a crash report (ZED-5G1) where a
-        // feature mismatch caused a wgpu-hal abort, but we haven't
-        // identified the code path that produces the mismatch. This
-        // guard prevents the crash and logs more evidence.
-        // Remove this check once:
-        // a) We find and fix the root cause, or
-        // b) There are no reports of this warning appearing for some time.
-        let device_has_feature = device
-            .features()
-            .contains(wgpu::Features::DUAL_SOURCE_BLENDING);
-        if dual_source_blending && !device_has_feature {
-            log::error!(
-                "BUG: dual_source_blending flag is true but device does not \
-                 have DUAL_SOURCE_BLENDING enabled (device features: {:?}). \
-                 Falling back to mono text rendering. Please report this at \
-                 https://github.com/zed-industries/zed/issues",
-                device.features(),
-            );
-        }
-        let dual_source_blending =
-            dual_source_blending && device_has_feature && !uses_webgl_instance_data;
-
         let shader_source = if uses_webgl_instance_data {
             WEBGL_SHADERS
         } else {
@@ -749,15 +727,6 @@ impl WgpuRendererCore {
             label: Some("gpui_shaders"),
             source: wgpu::ShaderSource::Wgsl(shader_source.into()),
         });
-
-        let subpixel_shader_module = if dual_source_blending {
-            Some(device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("gpui_subpixel_shaders"),
-                source: wgpu::ShaderSource::Wgsl(SUBPIXEL_SHADERS.into()),
-            }))
-        } else {
-            None
-        };
 
         let blend_mode = match alpha_mode {
             wgpu::CompositeAlphaMode::PreMultiplied => {
@@ -772,59 +741,6 @@ impl WgpuRendererCore {
             write_mask: wgpu::ColorWrites::ALL,
         };
 
-        let create_pipeline = |name: &str,
-                               vs_entry: &str,
-                               fs_entry: &str,
-                               globals_layout: &wgpu::BindGroupLayout,
-                               data_layout: &wgpu::BindGroupLayout,
-                               texture_layout: Option<&wgpu::BindGroupLayout>,
-                               topology: wgpu::PrimitiveTopology,
-                               color_targets: &[Option<wgpu::ColorTargetState>],
-                               sample_count: u32,
-                               module: &wgpu::ShaderModule| {
-            let mut bind_group_layouts = vec![Some(globals_layout), Some(data_layout)];
-            bind_group_layouts.extend(texture_layout.map(Some));
-            let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some(&format!("{name}_layout")),
-                bind_group_layouts: &bind_group_layouts,
-                immediate_size: 0,
-            });
-
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some(name),
-                layout: Some(&pipeline_layout),
-                vertex: wgpu::VertexState {
-                    module,
-                    entry_point: Some(vs_entry),
-                    buffers: &[],
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module,
-                    entry_point: Some(fs_entry),
-                    targets: color_targets,
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                }),
-                primitive: wgpu::PrimitiveState {
-                    topology,
-                    strip_index_format: None,
-                    front_face: wgpu::FrontFace::Ccw,
-                    cull_mode: None,
-                    polygon_mode: wgpu::PolygonMode::Fill,
-                    unclipped_depth: false,
-                    conservative: false,
-                },
-                depth_stencil: None,
-                multisample: wgpu::MultisampleState {
-                    count: sample_count,
-                    mask: !0,
-                    alpha_to_coverage_enabled: false,
-                },
-                multiview_mask: None,
-                cache: None,
-            })
-        };
-
         let paths_blend = wgpu::BlendState {
             color: wgpu::BlendComponent {
                 src_factor: wgpu::BlendFactor::One,
@@ -837,28 +753,14 @@ impl WgpuRendererCore {
                 operation: wgpu::BlendOperation::Add,
             },
         };
-        let subpixel_blend = wgpu::BlendState {
-            color: wgpu::BlendComponent {
-                src_factor: wgpu::BlendFactor::Src1,
-                dst_factor: wgpu::BlendFactor::OneMinusSrc1,
-                operation: wgpu::BlendOperation::Add,
-            },
-            alpha: wgpu::BlendComponent {
-                src_factor: wgpu::BlendFactor::One,
-                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
-                operation: wgpu::BlendOperation::Add,
-            },
-        };
-
         // Pipelines compile independently, and a cold shader cache costs tens of milliseconds each.
-        let create_pipeline = &create_pipeline;
         let shader_module = &shader_module;
         let color_target = &color_target;
         let paths_blend = &paths_blend;
-        let subpixel_blend = &subpixel_blend;
-        let mut jobs: Vec<Box<dyn FnOnce() -> wgpu::RenderPipeline + Send + '_>> = vec![
+        let jobs: Vec<Box<dyn FnOnce() -> wgpu::RenderPipeline + Send + '_>> = vec![
             Box::new(move || {
-                create_pipeline(
+                create_render_pipeline(
+                    device,
                     "quads",
                     "vs_quad",
                     "fs_quad",
@@ -872,7 +774,8 @@ impl WgpuRendererCore {
                 )
             }),
             Box::new(move || {
-                create_pipeline(
+                create_render_pipeline(
+                    device,
                     "shadows",
                     "vs_shadow",
                     "fs_shadow",
@@ -886,7 +789,8 @@ impl WgpuRendererCore {
                 )
             }),
             Box::new(move || {
-                create_pipeline(
+                create_render_pipeline(
+                    device,
                     "path_rasterization",
                     "vs_path_rasterization",
                     "fs_path_rasterization",
@@ -904,7 +808,8 @@ impl WgpuRendererCore {
                 )
             }),
             Box::new(move || {
-                create_pipeline(
+                create_render_pipeline(
+                    device,
                     "paths",
                     "vs_path",
                     "fs_path",
@@ -922,7 +827,8 @@ impl WgpuRendererCore {
                 )
             }),
             Box::new(move || {
-                create_pipeline(
+                create_render_pipeline(
+                    device,
                     "underlines",
                     "vs_underline",
                     "fs_underline",
@@ -936,7 +842,8 @@ impl WgpuRendererCore {
                 )
             }),
             Box::new(move || {
-                create_pipeline(
+                create_render_pipeline(
+                    device,
                     "mono_sprites",
                     "vs_mono_sprite",
                     "fs_mono_sprite",
@@ -950,7 +857,8 @@ impl WgpuRendererCore {
                 )
             }),
             Box::new(move || {
-                create_pipeline(
+                create_render_pipeline(
+                    device,
                     "poly_sprites",
                     "vs_poly_sprite",
                     "fs_poly_sprite",
@@ -964,7 +872,8 @@ impl WgpuRendererCore {
                 )
             }),
             Box::new(move || {
-                create_pipeline(
+                create_render_pipeline(
+                    device,
                     "surfaces",
                     "vs_surface",
                     "fs_surface",
@@ -978,26 +887,6 @@ impl WgpuRendererCore {
                 )
             }),
         ];
-        if let Some(subpixel_module) = &subpixel_shader_module {
-            jobs.push(Box::new(move || {
-                create_pipeline(
-                    "subpixel_sprites",
-                    "vs_subpixel_sprite",
-                    "fs_subpixel_sprite",
-                    &layouts.globals,
-                    &layouts.instances,
-                    Some(&layouts.texture),
-                    wgpu::PrimitiveTopology::TriangleStrip,
-                    &[Some(wgpu::ColorTargetState {
-                        format: surface_format,
-                        blend: Some(*subpixel_blend),
-                        write_mask: wgpu::ColorWrites::COLOR,
-                    })],
-                    1,
-                    subpixel_module,
-                )
-            }));
-        }
         let mut pipelines = build_in_parallel(jobs).into_iter();
         let mut next = || pipelines.next().expect("one pipeline per job");
         let quads = next();
@@ -1008,7 +897,6 @@ impl WgpuRendererCore {
         let mono_sprites = next();
         let poly_sprites = next();
         let surfaces = next();
-        let subpixel_sprites = subpixel_shader_module.as_ref().map(|_| next());
 
         WgpuPipelines {
             quads,
@@ -1017,7 +905,7 @@ impl WgpuRendererCore {
             paths,
             underlines,
             mono_sprites,
-            subpixel_sprites,
+            subpixel_sprites: None,
             poly_sprites,
             surfaces,
         }
@@ -1074,6 +962,63 @@ impl WgpuRendererCore {
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         Some((texture, view))
     }
+}
+
+/// Builds one render pipeline with its own layout.
+fn create_render_pipeline(
+    device: &wgpu::Device,
+    name: &str,
+    vs_entry: &str,
+    fs_entry: &str,
+    globals_layout: &wgpu::BindGroupLayout,
+    data_layout: &wgpu::BindGroupLayout,
+    texture_layout: Option<&wgpu::BindGroupLayout>,
+    topology: wgpu::PrimitiveTopology,
+    color_targets: &[Option<wgpu::ColorTargetState>],
+    sample_count: u32,
+    module: &wgpu::ShaderModule,
+) -> wgpu::RenderPipeline {
+    let mut bind_group_layouts = vec![Some(globals_layout), Some(data_layout)];
+    bind_group_layouts.extend(texture_layout.map(Some));
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some(&format!("{name}_layout")),
+        bind_group_layouts: &bind_group_layouts,
+        immediate_size: 0,
+    });
+
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some(name),
+        layout: Some(&pipeline_layout),
+        vertex: wgpu::VertexState {
+            module,
+            entry_point: Some(vs_entry),
+            buffers: &[],
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module,
+            entry_point: Some(fs_entry),
+            targets: color_targets,
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology,
+            strip_index_format: None,
+            front_face: wgpu::FrontFace::Ccw,
+            cull_mode: None,
+            polygon_mode: wgpu::PolygonMode::Fill,
+            unclipped_depth: false,
+            conservative: false,
+        },
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState {
+            count: sample_count,
+            mask: !0,
+            alpha_to_coverage_enabled: false,
+        },
+        multiview_mask: None,
+        cache: None,
+    })
 }
 
 /// Runs independent jobs on a few scoped threads and returns their results in job order.
@@ -1213,15 +1158,17 @@ impl WgpuRenderer {
             return;
         };
         let resources = &mut core.resources;
+        // Subpixel text blends without the alpha mode, so a pipeline built already stays.
+        let subpixel_sprites = resources.pipelines.subpixel_sprites.take();
         resources.pipelines = WgpuRendererCore::create_pipelines(
             &resources.device,
             &resources.bind_group_layouts,
             format,
             new_alpha_mode,
             core.rendering_params.path_sample_count,
-            core.dual_source_blending,
             core.uses_webgl_instance_data,
         );
+        resources.pipelines.subpixel_sprites = subpixel_sprites;
 
         if let RendererState::Ready { surface, core } = &self.state {
             surface.configure(&core.resources.device, &self.surface_config);
@@ -1372,7 +1319,6 @@ impl WgpuRendererCore {
             target_format,
             alpha_mode,
             rendering_params.path_sample_count,
-            dual_source_blending,
             uses_webgl_instance_data,
         );
         let atlas_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -1518,6 +1464,65 @@ impl WgpuRendererCore {
         &mut self.resources
     }
 
+    /// Without dual-source blending, subpixel sprites keep drawing through the mono pipeline.
+    fn ensure_subpixel_pipeline(&mut self) {
+        if !self.dual_source_blending || self.resources.pipelines.subpixel_sprites.is_some() {
+            return;
+        }
+        let device = &self.resources.device;
+        // ZED-5G1 guard: a flag and device feature mismatch aborted wgpu-hal, root cause unknown.
+        if !device
+            .features()
+            .contains(wgpu::Features::DUAL_SOURCE_BLENDING)
+        {
+            log::error!(
+                "BUG: dual_source_blending flag is true but device does not \
+                 have DUAL_SOURCE_BLENDING enabled (device features: {:?}). \
+                 Falling back to mono text rendering. Please report this at \
+                 https://github.com/zed-industries/zed/issues",
+                device.features(),
+            );
+            // Logged once: later frames take the mono pipeline without asking again.
+            self.dual_source_blending = false;
+            return;
+        }
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("gpui_subpixel_shaders"),
+            source: wgpu::ShaderSource::Wgsl(SUBPIXEL_SHADERS.into()),
+        });
+        let subpixel_blend = wgpu::BlendState {
+            color: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::Src1,
+                dst_factor: wgpu::BlendFactor::OneMinusSrc1,
+                operation: wgpu::BlendOperation::Add,
+            },
+            alpha: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::One,
+                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                operation: wgpu::BlendOperation::Add,
+            },
+        };
+        let layouts = &self.resources.bind_group_layouts;
+        let pipeline = create_render_pipeline(
+            device,
+            "subpixel_sprites",
+            "vs_subpixel_sprite",
+            "fs_subpixel_sprite",
+            &layouts.globals,
+            &layouts.instances,
+            Some(&layouts.texture),
+            wgpu::PrimitiveTopology::TriangleStrip,
+            &[Some(wgpu::ColorTargetState {
+                format: self.target_format,
+                blend: Some(subpixel_blend),
+                write_mask: wgpu::ColorWrites::COLOR,
+            })],
+            1,
+            &module,
+        );
+        self.resources.pipelines.subpixel_sprites = Some(pipeline);
+    }
+
     /// Path rendering goes through an intermediate texture that must match the frame
     /// target's dimensions, so the textures are keyed by size and rebuilt on mismatch.
     fn ensure_intermediate_textures(&mut self, size: Size<DevicePixels>) {
@@ -1577,6 +1582,9 @@ impl WgpuRendererCore {
         // A full-window intermediate plus its MSAA copy is ~70 MB at 1440p; only frames that draw paths need it.
         if !scene.paths.is_empty() {
             self.ensure_intermediate_textures(size);
+        }
+        if !scene.subpixel_sprites.is_empty() {
+            self.ensure_subpixel_pipeline();
         }
 
         let gamma_params = GammaParams {
@@ -3005,6 +3013,75 @@ mod tests {
         // Rejection must leave the renderer usable.
         let image = renderer.render_scene_to_image(&Scene::default(), device_size(4, 4))?;
         assert_eq!(image.dimensions(), (4, 4));
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn headless_renderer_builds_the_subpixel_pipeline_on_first_use() -> anyhow::Result<()> {
+        use gpui::{AtlasKey, PlatformAtlas, RenderGlyphParams, TransformationMatrix};
+
+        let mut renderer = WgpuHeadlessRenderer::new()?;
+        let built = |renderer: &WgpuHeadlessRenderer| {
+            renderer.core.resources.pipelines.subpixel_sprites.is_some()
+        };
+        assert!(
+            !built(&renderer),
+            "a new renderer has drawn no subpixel text"
+        );
+
+        let mut scene = Scene::default();
+        scene.insert_primitive(solid_quad(0.0, 0.0, 8.0, 8.0, gpui::red()));
+        scene.finish();
+        renderer.render_scene(&scene, device_size(16, 16))?;
+        assert!(
+            !built(&renderer),
+            "a frame without subpixel text builds nothing"
+        );
+
+        let key = AtlasKey::Glyph(RenderGlyphParams {
+            font_id: gpui::FontId(1),
+            glyph_id: gpui::GlyphId(1),
+            font_size: gpui::px(14.),
+            subpixel_variant: Point::default(),
+            scale_factor: 1.,
+            is_emoji: false,
+            subpixel_rendering: true,
+            dilation: 0,
+        });
+        let tile = renderer
+            .core
+            .atlas
+            .get_or_insert_with(key, &mut || {
+                Ok(Some((
+                    device_size(4, 4),
+                    std::borrow::Cow::Owned(vec![255; 4 * 4 * 4]),
+                )))
+            })?
+            .expect("the builder always returns a tile");
+        let bounds = solid_quad(0.0, 0.0, 4.0, 4.0, gpui::red()).bounds;
+        let mut scene = Scene::default();
+        scene.insert_primitive(SubpixelSprite {
+            order: 0,
+            pad: 0,
+            bounds,
+            content_mask: ContentMask { bounds },
+            color: gpui::white(),
+            tile,
+            transformation: TransformationMatrix::unit(),
+        });
+        scene.finish();
+        assert!(
+            renderer.core.dual_source_blending,
+            "the test adapter needs dual-source blending to reach the subpixel pipeline"
+        );
+        renderer.render_scene(&scene, device_size(16, 16))?;
+        assert!(
+            built(&renderer),
+            "the first subpixel frame builds the pipeline"
+        );
+        // A pipeline the device rejected would surface here as a GPU error.
+        renderer.render_scene(&scene, device_size(16, 16))?;
         Ok(())
     }
 
