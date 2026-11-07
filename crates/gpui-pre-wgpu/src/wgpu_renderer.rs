@@ -2879,7 +2879,7 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "pipeline job failed")]
-    fn build_in_parallel_propagates_a_worker_panic() {
+    fn run_on_threads_propagates_a_worker_panic() {
         // Only the worker panics, so the message can reach the caller only through join.
         let worker_ran = std::sync::atomic::AtomicBool::new(false);
         let worker_ran = &worker_ran;

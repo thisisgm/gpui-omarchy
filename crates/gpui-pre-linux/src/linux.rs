@@ -53,7 +53,7 @@ pub fn linux_platform(allowed_modes: WindowingModes) -> Rc<dyn gpui::Platform> {
     Rc::new(LinuxPlatform::new(allowed_modes))
 }
 
-/// Creates the Vulkan instance on a background thread for the first window; unused on GL or headless, it is held until exit.
+/// With wayland or x11 and no `ZED_HEADLESS`, creates the Vulkan instance on a background thread; unused on GL, it is held until exit.
 pub fn prewarm_gpu() {
     #[cfg(any(feature = "wayland", feature = "x11"))]
     if std::env::var_os("ZED_HEADLESS").is_none() {
