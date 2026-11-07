@@ -631,6 +631,7 @@ impl Interactivity {
                 constructor(value.downcast_ref().unwrap(), offset, window, cx).into()
             }),
             external_payload: None,
+            external_at_start: false,
         });
     }
 
@@ -660,6 +661,19 @@ impl Interactivity {
         drag_listener.external_payload = Some(Box::new(move |value, window, cx| {
             resolver(value.downcast_ref::<T>()?, window, cx)
         }));
+    }
+
+    /// Offers the external payload to the platform at drag start, as GTK does; call after [`Self::external_drag_payload`].
+    pub fn external_drag_at_start(&mut self) {
+        let Some(drag_listener) = self.drag_listener.as_mut() else {
+            debug_assert!(false, "external_drag_at_start must be called after on_drag");
+            return;
+        };
+        debug_assert!(
+            drag_listener.external_payload.is_some(),
+            "external_drag_at_start must be called after external_drag_payload"
+        );
+        drag_listener.external_at_start = true;
     }
 
     /// Bind the given callback on the hover start and end events of this element. Note that the boolean
@@ -1648,6 +1662,15 @@ pub trait StatefulInteractiveElement: InteractiveElement {
         self
     }
 
+    /// The fluent API equivalent to [`Interactivity::external_drag_at_start`].
+    fn external_drag_at_start(mut self) -> Self
+    where
+        Self: Sized,
+    {
+        self.interactivity().external_drag_at_start();
+        self
+    }
+
     /// Bind the given callback on the hover start and end events of this element. Note that the boolean
     /// passed to the callback is true when the hover starts and false when it ends.
     /// Transitions caused by layout changes under a stationary mouse also invoke the callback.
@@ -1763,6 +1786,7 @@ pub(crate) struct DragListener {
     value: Arc<dyn Any>,
     render: Box<dyn Fn(&dyn Any, Point<Pixels>, &mut Window, &mut App) -> AnyView + 'static>,
     external_payload: Option<ExternalDragPayloadResolver>,
+    external_at_start: bool,
 }
 
 type ExternalDragPayloadResolver =
@@ -3004,6 +3028,8 @@ impl Interactivity {
                                 value: listener.value,
                                 cursor_offset,
                                 cursor_style: drag_cursor_style,
+                                external_at_start: listener.external_at_start
+                                    && external_payload_source.is_some(),
                                 external_payload_source,
                             });
                             pending_mouse_down.take();

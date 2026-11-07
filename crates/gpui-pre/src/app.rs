@@ -801,6 +801,8 @@ impl GpuiMode {
 struct PlatformOwnedDrag {
     source_window: WindowId,
     state: PlatformOwnedDragState,
+    // The platform draws the payload's image under the pointer, so the window does not draw the drag view too.
+    image: bool,
 }
 
 enum PlatformOwnedDragState {
@@ -2944,6 +2946,7 @@ impl App {
             cursor_offset,
             cursor_style: None,
             external_payload_source: external_payload,
+            external_at_start: false,
         });
     }
 
@@ -2951,12 +2954,7 @@ impl App {
     pub fn stop_active_drag(&mut self, window: &mut Window) -> bool {
         if self.active_drag.is_some() {
             self.active_drag = None;
-            if self.platform_owned_drag.as_ref().is_some_and(|drag| {
-                drag.source_window == window.window_handle().window_id()
-                    && matches!(&drag.state, PlatformOwnedDragState::RestoredInSourceWindow)
-            }) {
-                self.platform_owned_drag = None;
-            }
+            self.forget_restored_platform_drag(window.window_handle().window_id());
             window.refresh();
             true
         } else {
@@ -2964,15 +2962,64 @@ impl App {
         }
     }
 
-    pub(crate) fn hand_active_drag_to_platform(&mut self, source_window: WindowId) -> bool {
+    pub(crate) fn hand_active_drag_to_platform(
+        &mut self,
+        source_window: WindowId,
+        image: bool,
+    ) -> bool {
         let Some(drag) = self.active_drag.take() else {
             return false;
         };
         self.platform_owned_drag = Some(PlatformOwnedDrag {
             source_window,
             state: PlatformOwnedDragState::Suspended(drag),
+            image,
         });
         true
+    }
+
+    /// Keeps a platform drag started over its source window restored there, so its drop targets answer at once.
+    pub(crate) fn keep_active_drag_with_platform(
+        &mut self,
+        source_window: WindowId,
+        image: bool,
+    ) -> bool {
+        if self.active_drag.is_none() {
+            return false;
+        }
+        self.platform_owned_drag = Some(PlatformOwnedDrag {
+            source_window,
+            state: PlatformOwnedDragState::RestoredInSourceWindow,
+            image,
+        });
+        true
+    }
+
+    pub(crate) fn forget_restored_platform_drag(&mut self, source_window: WindowId) {
+        if self.platform_owned_drag.as_ref().is_some_and(|drag| {
+            drag.source_window == source_window
+                && matches!(&drag.state, PlatformOwnedDragState::RestoredInSourceWindow)
+        }) {
+            self.platform_owned_drag = None;
+        }
+    }
+
+    /// Whether this window's active drag is a platform drag restored in its source window.
+    pub(crate) fn platform_drag_restored_in(&self, window: WindowId) -> bool {
+        self.active_drag.is_some()
+            && self.platform_owned_drag.as_ref().is_some_and(|drag| {
+                drag.source_window == window
+                    && matches!(&drag.state, PlatformOwnedDragState::RestoredInSourceWindow)
+            })
+    }
+
+    /// Whether the platform already draws this window's active drag image.
+    pub(crate) fn platform_draws_drag_in(&self, window: WindowId) -> bool {
+        self.platform_drag_restored_in(window)
+            && self
+                .platform_owned_drag
+                .as_ref()
+                .is_some_and(|drag| drag.image)
     }
 
     pub(crate) fn restore_platform_drag(&mut self, source_window: WindowId) -> bool {
@@ -3485,9 +3532,11 @@ pub struct AnyDrag {
     /// The cursor style to use while dragging
     pub cursor_style: Option<CursorStyle>,
 
-    /// Resolves the payload to offer the platform if the drag leaves the window.
-    /// Invoked at most once per drag gesture, at promotion time.
+    /// Resolves the payload offered at promotion (viewport exit, or the first move with `external_at_start`); once per gesture.
     pub external_payload_source: Option<ExternalDragPayloadSource>,
+
+    /// Offers the payload to the platform at the first drag move, not at viewport exit; one attempt.
+    pub(crate) external_at_start: bool,
 }
 
 /// Lazily resolves the payload handed to the platform when an internal drag is
