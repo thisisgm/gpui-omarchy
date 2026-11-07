@@ -1082,8 +1082,16 @@ fn build_in_parallel<'a, T: Send>(jobs: Vec<Box<dyn FnOnce() -> T + Send + 'a>>)
     const MAX_WORKERS: usize = 4;
     let workers = std::thread::available_parallelism()
         .map_or(1, |n| n.get())
-        .min(MAX_WORKERS)
-        .min(jobs.len());
+        .min(MAX_WORKERS);
+    run_on_threads(workers, jobs)
+}
+
+/// Runs the jobs on the calling thread and up to `workers - 1` scoped threads, in job order.
+fn run_on_threads<'a, T: Send>(
+    workers: usize,
+    jobs: Vec<Box<dyn FnOnce() -> T + Send + 'a>>,
+) -> Vec<T> {
+    let workers = workers.min(jobs.len());
     let queue = std::sync::Mutex::new(jobs.into_iter().enumerate());
     let drain = || {
         let mut done = Vec::new();
@@ -2872,19 +2880,28 @@ mod tests {
     #[test]
     #[should_panic(expected = "pipeline job failed")]
     fn build_in_parallel_propagates_a_worker_panic() {
-        // Only worker threads panic, so the message can reach the caller only through join.
-        let jobs: Vec<Box<dyn FnOnce() -> usize + Send>> = (0..6_usize)
+        // Only the worker panics, so the message can reach the caller only through join.
+        let worker_ran = std::sync::atomic::AtomicBool::new(false);
+        let worker_ran = &worker_ran;
+        let jobs: Vec<Box<dyn FnOnce() -> usize + Send + '_>> = (0..2_usize)
             .map(|index| {
                 Box::new(move || {
                     if std::thread::current().name() == Some("gpu-pipeline") {
+                        worker_ran.store(true, std::sync::atomic::Ordering::SeqCst);
                         panic!("pipeline job failed");
                     }
-                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    // Leave the other job to the worker; give up if it never spawned.
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                    while !worker_ran.load(std::sync::atomic::Ordering::SeqCst)
+                        && std::time::Instant::now() < deadline
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
                     index
-                }) as Box<dyn FnOnce() -> usize + Send>
+                }) as Box<dyn FnOnce() -> usize + Send + '_>
             })
             .collect();
-        build_in_parallel(jobs);
+        run_on_threads(2, jobs);
     }
 
     #[cfg(target_os = "linux")]
