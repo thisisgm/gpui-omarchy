@@ -2282,13 +2282,19 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandClientStatePtr {
             } => {
                 let focused_window = state.keyboard_focused_window.clone();
 
-                let keymap_state = state.keymap_state.as_mut().unwrap();
+                // A seat can send modifiers and keys before any XkbV1 keymap, as
+                // wlroots does after the only keyboard with one, a short-lived
+                // virtual keyboard, goes away. Ignore them until a keymap arrives.
+                let Some(keymap_state) = state.keymap_state.as_mut() else {
+                    return;
+                };
                 let old_layout =
                     keymap_state.serialize_layout(xkbcommon::xkb::STATE_LAYOUT_EFFECTIVE);
                 keymap_state.update_mask(mods_depressed, mods_latched, mods_locked, 0, 0, group);
-                state.modifiers = modifiers_from_xkb(keymap_state);
-                let keymap_state = state.keymap_state.as_mut().unwrap();
-                state.capslock = capslock_from_xkb(keymap_state);
+                let modifiers = modifiers_from_xkb(keymap_state);
+                let capslock = capslock_from_xkb(keymap_state);
+                state.modifiers = modifiers;
+                state.capslock = capslock;
 
                 let input = PlatformInput::ModifiersChanged(ModifiersChangedEvent {
                     modifiers: state.modifiers,
@@ -2319,7 +2325,10 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandClientStatePtr {
                     return;
                 };
 
-                let keymap_state = state.keymap_state.as_ref().unwrap();
+                // As for modifiers: no keymap yet, so the key cannot be read.
+                let Some(keymap_state) = state.keymap_state.as_ref() else {
+                    return;
+                };
                 let keycode = Keycode::from(key + MIN_KEYCODE);
                 let keysym = keymap_state.key_get_one_sym(keycode);
 
