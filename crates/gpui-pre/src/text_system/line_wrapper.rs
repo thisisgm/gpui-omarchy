@@ -117,7 +117,10 @@ impl LineWrapper {
                 };
 
                 width += item_width;
-                if width > wrap_width && ix > last_wrap_ix {
+                // A space past the edge after the first word hangs on its row, so no row starts with it.
+                let hangs = matches!(candidate, WrapBoundaryCandidate::Char { character: ' ' })
+                    && first_non_whitespace_ix.is_some();
+                if width > wrap_width && ix > last_wrap_ix && !hangs {
                     let wrap_at_candidate =
                         last_candidate_ix > 0 && width - last_candidate_width <= wrap_width;
 
@@ -176,6 +179,8 @@ impl LineWrapper {
 
                     width += self.width_for_char(' ') * next_indent as f32;
 
+                    // prev_c must be the last character read on every path, or the next one opens a candidate inside a word.
+                    prev_c = new_prev_c;
                     return Some(Boundary::new(last_wrap_ix, next_indent));
                 }
 
@@ -522,6 +527,31 @@ impl LineWrapper {
         // Bengali (https://en.wikipedia.org/wiki/Bengali_(Unicode_block))
         matches!(c, '\u{0980}'..='\u{09FF}') ||
 
+        // Greek and Coptic, the first of the space-separated scripts below that only break at a space.
+        matches!(c, '\u{0370}'..='\u{03FF}') ||
+        // Cyrillic Supplement and Armenian.
+        matches!(c, '\u{0500}'..='\u{058F}') ||
+        // Hebrew, Arabic, Syriac, Thaana, NKo, Samaritan, Mandaic and the Arabic supplements.
+        matches!(c, '\u{0590}'..='\u{08FF}') ||
+        // Devanagari through Sinhala, Tamil, Telugu, Kannada and Malayalam among them.
+        matches!(c, '\u{0900}'..='\u{0DFF}') ||
+        // Georgian and Georgian Extended.
+        matches!(c, '\u{10A0}'..='\u{10FF}' | '\u{1C90}'..='\u{1CBF}') ||
+        // Ethiopic and Ethiopic Supplement.
+        matches!(c, '\u{1200}'..='\u{139F}') ||
+        // Greek Extended.
+        matches!(c, '\u{1F00}'..='\u{1FFF}') ||
+        // Latin Extended-C, -D and -E.
+        matches!(c, '\u{2C60}'..='\u{2C7F}' | '\u{A720}'..='\u{A7FF}' | '\u{AB30}'..='\u{AB6F}') ||
+        // Hebrew and Arabic presentation forms.
+        matches!(c, '\u{FB1D}'..='\u{FDFF}' | '\u{FE70}'..='\u{FEFF}') ||
+        // Combining mark blocks extend the letter before them.
+        matches!(c, '\u{1AB0}'..='\u{1AFF}' | '\u{1DC0}'..='\u{1DFF}' | '\u{20D0}'..='\u{20FF}') ||
+        // Variation selectors, combining half marks and the joiners extend it too.
+        matches!(c, '\u{FE00}'..='\u{FE0F}' | '\u{FE20}'..='\u{FE2F}' | '\u{200C}' | '\u{200D}') ||
+        // Invisible directional marks and isolates stay with the word they wrap.
+        matches!(c, '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}') ||
+
         // Some other known special characters that should be treated as word characters,
         // e.g. `a-b`, `var_name`, `I'm`/`won’t`, '@mention`, `#hashtag`, `100%`, `3.1415`,
         // `2^3`, `a~b`, `a=1`, `Self::new`, etc. Trailing punctuation like `,`, `.`, `:`, `;`
@@ -767,6 +797,88 @@ mod tests {
     }
 
     #[test]
+    fn test_wrap_line_keeps_space_separated_words_whole() {
+        let mut wrapper = build_wrapper();
+        for text in [
+            "Keyboard shortcuts settings about",
+            "விசைப்பலகை குறுக்குவழிகள் அமைப்புகள் பற்றி",
+            "Συντομεύσεις πληκτρολογίου ρυθμίσεις σχετικά",
+            "קיצורי מקלדת הגדרות אודות התוכנה",
+            "اختصارات لوحة المفاتيح الإعدادات حول",
+            "कुंजीपटल शॉर्टकट सेटिंग्स बारे में",
+        ] {
+            let mut words = Vec::new();
+            let mut word_start = 0;
+            for word in text.split(' ') {
+                let word_width = word
+                    .chars()
+                    .map(|c| f32::from(wrapper.width_for_char(c)))
+                    .sum::<f32>();
+                words.push((word_start..word_start + word.len(), word_width));
+                word_start += word.len() + ' '.len_utf8();
+            }
+            let widest = words
+                .iter()
+                .map(|(_, word_width)| *word_width)
+                .fold(0., f32::max);
+            let space = f32::from(wrapper.width_for_char(' '));
+            // Words stay whole at the widest word's width or more, and one pixel less splits a word wider than the row.
+            for width in [widest + 4., widest + space, widest - 1., space * 10.] {
+                let boundaries = wrapper
+                    .wrap_line(
+                        &[LineFragment::text(text)],
+                        px(width),
+                        IndentAdjustment::default(),
+                    )
+                    .collect::<Vec<_>>();
+                assert!(!boundaries.is_empty(), "{text} wraps at {width}px");
+                assert!(
+                    width >= widest
+                        || boundaries.iter().any(|boundary| {
+                            words.iter().any(|(span, word_width)| {
+                                *word_width > width
+                                    && span.start < boundary.ix
+                                    && boundary.ix < span.end
+                            })
+                        }),
+                    "{text} at {width}px leaves every word wider than the row whole"
+                );
+                let mut start = 0;
+                for boundary in boundaries {
+                    assert!(
+                        !text[start..boundary.ix].trim().is_empty()
+                            && !text[boundary.ix..].starts_with(' '),
+                        "{text} at {width}px wraps a row of spaces or starts one with a space at byte {}",
+                        boundary.ix
+                    );
+                    assert!(
+                        width < widest || text[..boundary.ix].ends_with(' '),
+                        "{text} at {width}px breaks inside a word at byte {}",
+                        boundary.ix
+                    );
+                    start = boundary.ix;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_wrap_line_fills_the_row_after_a_word_that_overflows_at_its_first_letter() {
+        let mut wrapper = build_wrapper();
+        // The "b" at byte 7 overflows and wraps, and the next "b" must not open a second break inside the word.
+        assert_eq!(
+            wrapper
+                .wrap_line(
+                    &[LineFragment::text("aaaaaa bbbbbbbbbbb")],
+                    px(72.),
+                    IndentAdjustment::default()
+                )
+                .collect::<Vec<_>>(),
+            &[Boundary::new(7, 0), Boundary::new(14, 0)],
+        );
+    }
+
+    #[test]
     fn test_wrap_line() {
         let mut wrapper = build_wrapper();
 
@@ -861,7 +973,7 @@ mod tests {
             ],
         );
 
-        // Test wrapping with a mix of text and element fragments
+        // Test wrapping with a mix of text and element fragments; the space after the second element hangs
         assert_eq!(
             wrapper
                 .wrap_line(
@@ -876,11 +988,7 @@ mod tests {
                     IndentAdjustment::default()
                 )
                 .collect::<Vec<_>>(),
-            &[
-                Boundary::new(5, 0),
-                Boundary::new(9, 0),
-                Boundary::new(11, 0)
-            ],
+            &[Boundary::new(5, 0), Boundary::new(11, 0)],
         );
 
         // Test with element at the beginning and text afterward
@@ -903,7 +1011,7 @@ mod tests {
             ],
         );
 
-        // Test with a large element that forces wrapping by itself
+        // Test with a large element that forces wrapping by itself; the space after it hangs on its row
         assert_eq!(
             wrapper
                 .wrap_line(
@@ -919,7 +1027,7 @@ mod tests {
             &[
                 Boundary::new(6, 0),
                 Boundary::new(11, 0),
-                Boundary::new(12, 0),
+                Boundary::new(13, 0),
                 Boundary::new(18, 0)
             ],
         );
@@ -933,7 +1041,7 @@ mod tests {
                     IndentAdjustment::default()
                 )
                 .collect::<Vec<_>>(),
-            &[Boundary::new(12, 0),], // special chars above take up 3, 2 and 3 bytes, so boundary ends up at 12
+            &[Boundary::new(13, 0),], // special chars above take up 3, 2 and 3 bytes, so the space is at 12, and it hangs, so the boundary ends up at 13
         );
     }
 
@@ -1261,8 +1369,28 @@ mod tests {
         assert_word("ছেলে");
         assert_word("হচ্ছিল");
 
+        // Space-separated scripts keep their words whole
+        assert_word("Καλημέρα");
+        assert_word("Բարեւ");
+        assert_word("שָׁלוֹם");
+        assert_word("\u{200f}مرحبا\u{200f}");
+        assert_word("گفتگو");
+        assert_word("नमस्ते");
+        assert_word("விசைப்பலகை");
+        assert_word("ಕನ್ನಡ");
+        assert_word("ආයුබෝවන්");
+        assert_word("გამარჯობა");
+        assert_word("ሰላም");
+        assert_word("Ἀθῆναι");
+        assert_word("\u{2068}Flea\u{2069}");
+        assert_word("a\u{0301}\u{1DC4}");
+        assert_not_word("Καλη μέρα");
+        assert_not_word("שלום עולם");
+        assert_not_word("விசை பலகை");
+
         // non-word characters
         assert_not_word("你好");
+        assert_not_word("สวัสดี");
         assert_not_word("안녕하세요");
         assert_not_word("こんにちは");
         assert_not_word("😀😁😂");
@@ -1695,10 +1823,10 @@ mod tests {
         // When base_indent + extra fits within wrap width (6 + 2 + 2 <= 10),
         // the extra indent is applied and not clamped.
         //
-        // Expected wrapped lines (10 columns):
+        // Expected wrapped lines (10 columns); the space after "cd" and "ef" hangs past the edge:
         //   |      ab  |  (row 0: 6 spaces + "ab ", len 9)
-        //   |        cd|  (row 1: 8 spaces + "cd", len 10)
-        //   |        ef|  (row 2: 8 spaces + "ef", len 10)
+        //   |        cd|  (row 1: 8 spaces + "cd" and a hanging space)
+        //   |        ef|  (row 2: 8 spaces + "ef" and a hanging space)
         //   |        gh|  (row 3: 8 spaces + "gh", len 10)
         assert_eq!(
             wrapper
@@ -1710,8 +1838,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             &[
                 Boundary::new(9, 8),
-                Boundary::new(11, 8),
-                Boundary::new(13, 8),
+                Boundary::new(12, 8),
                 Boundary::new(15, 8),
             ]
         );
