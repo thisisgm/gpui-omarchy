@@ -78,6 +78,14 @@ struct LoadedFont {
     user_fallback_chain: Arc<[(FontId, SharedString)]>,
 }
 
+struct LoadedFontData(Arc<CosmicTextFont>);
+
+impl AsRef<[u8]> for LoadedFontData {
+    fn as_ref(&self) -> &[u8] {
+        self.0.data()
+    }
+}
+
 struct FontMatchProperties {
     primary_family_name: SharedString,
     stretch: Stretch,
@@ -342,6 +350,15 @@ impl PlatformTextSystem for CosmicTextSystem {
             .families
             .first()
             .map(|family| family.0.clone().into())
+    }
+
+    fn font_data(&self, id: FontId) -> Option<gpui::SharedFontData> {
+        let state = self.0.read();
+        if id.text_epoch() != state.generation {
+            return None;
+        }
+        let loaded = state.loaded_fonts.get(id.local_index())?;
+        Some(Arc::new(LoadedFontData(loaded.font.clone())))
     }
 
     fn prewarm_fonts(&self, font_ids: &[FontId]) {
@@ -2372,6 +2389,36 @@ mod tests {
         let text_system = CosmicTextSystem::new_without_system_fonts("IBM Plex Sans");
         text_system.add_fonts(vec![Cow::Borrowed(IBM_PLEX)])?;
         Ok(text_system)
+    }
+
+    #[test]
+    fn font_data_shares_loaded_bytes_and_refuses_unknown_or_stale_faces() -> Result<()> {
+        let bytes = include_bytes!("../testdata/JetBrainsMono-Regular.ttf");
+        let system = CosmicTextSystem::new_without_system_fonts("JetBrains Mono");
+        system.add_fonts(vec![Cow::Borrowed(bytes)])?;
+        let id = system.font_id(&gpui::font("JetBrains Mono"))?;
+        let before = system.0.read().loaded_fonts.len();
+        let data = system.font_data(id).context("loaded face has data")?;
+        {
+            let state = system.0.read();
+            let loaded = &state.loaded_fonts[id.local_index()].font;
+            assert_eq!(data.as_ref().as_ref().as_ptr(), loaded.data().as_ptr());
+        }
+        assert!(system.font_data(FontId(usize::MAX)).is_none());
+        assert!(
+            system
+                .font_data(FontId::for_text_epoch(before, id.text_epoch())?)
+                .is_none()
+        );
+        assert!(
+            system
+                .font_data(FontId::for_text_epoch(id.local_index(), 1)?)
+                .is_none()
+        );
+        assert_eq!(system.0.read().loaded_fonts.len(), before);
+        drop(system);
+        assert_eq!(data.as_ref().as_ref(), bytes);
+        Ok(())
     }
 
     #[cfg(not(feature = "ci-exclude-bundled-font-tests"))]

@@ -368,6 +368,9 @@ impl Drop for MissingGlyphReceiver {
 
 struct EpochPlatformTextSystem(RwLock<Arc<dyn PlatformTextSystem>>);
 
+/// An already loaded font file, shared without copying or reopening it.
+pub type SharedFontData = Arc<dyn AsRef<[u8]> + Send + Sync>;
+
 impl EpochPlatformTextSystem {
     fn snapshot(&self) -> Arc<dyn PlatformTextSystem> {
         self.0.read().clone()
@@ -399,6 +402,9 @@ impl PlatformTextSystem for EpochPlatformTextSystem {
     }
     fn font_family_name(&self, id: FontId) -> Option<SharedString> {
         self.0.read().font_family_name(id)
+    }
+    fn font_data(&self, id: FontId) -> Option<SharedFontData> {
+        self.0.read().font_data(id)
     }
     fn prewarm_fonts(&self, ids: &[FontId]) {
         self.0.read().prewarm_fonts(ids);
@@ -806,6 +812,11 @@ impl TextSystem {
             }
         }
         self.platform_text_system.prewarm_fonts(&font_ids);
+    }
+
+    /// Shares the bytes of a face this text system already loaded; a stale or unknown face returns `None`.
+    pub fn font_data(&self, id: FontId) -> Option<SharedFontData> {
+        self.platform_text_system.font_data(id)
     }
 
     /// Get the bounding box for the given font and font size.

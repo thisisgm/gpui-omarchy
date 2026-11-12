@@ -130,21 +130,28 @@ pub const UNTRUSTED_IMAGE_MAX_EDGE: usize = 8192;
 pub const UNTRUSTED_IMAGE_MAX_PIXELS: usize = 16_777_216;
 
 static SYSTEM_FONT_DB: LazyLock<Arc<usvg::fontdb::Database>> = LazyLock::new(|| {
+    #[cfg(any(test, feature = "test-support"))]
+    SYSTEM_FONT_DB_LOADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut db = usvg::fontdb::Database::new();
     db.load_system_fonts();
     Arc::new(db)
 });
 
-/// The font resolver both option sets share: bundled fonts over the system database.
+#[cfg(any(test, feature = "test-support"))]
+static SYSTEM_FONT_DB_LOADS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Preview font resolver: bundled fonts over the system database, or only the given database without discovery.
 fn preview_font_resolver(
     asset_source: Arc<dyn AssetSource>,
     enriched_fontdb: Arc<OnceLock<Arc<usvg::fontdb::Database>>>,
+    discover_fonts: bool,
 ) -> usvg::FontResolver<'static> {
     let default_font_resolver = usvg::FontResolver::default_font_selector();
     let font_resolver = Box::new({
         let asset_source = asset_source.clone();
         move |font: &usvg::Font, db: &mut Arc<usvg::fontdb::Database>| {
-            if db.is_empty() {
+            if discover_fonts && db.is_empty() {
                 let fontdb = enriched_fontdb.get_or_init(|| {
                     let mut db = (**SYSTEM_FONT_DB).clone();
                     load_bundled_fonts(&*asset_source, &mut db);
@@ -294,11 +301,15 @@ impl SvgRenderer {
         let enriched_fontdb: Arc<OnceLock<Arc<usvg::fontdb::Database>>> = Arc::new(OnceLock::new());
 
         let options = usvg::Options {
-            font_resolver: preview_font_resolver(asset_source.clone(), enriched_fontdb.clone()),
+            font_resolver: preview_font_resolver(
+                asset_source.clone(),
+                enriched_fontdb.clone(),
+                true,
+            ),
             ..Default::default()
         };
         let untrusted = usvg::Options {
-            font_resolver: preview_font_resolver(asset_source.clone(), enriched_fontdb),
+            font_resolver: preview_font_resolver(asset_source.clone(), enriched_fontdb, true),
             image_href_resolver: untrusted_image_href_resolver(),
             ..Default::default()
         };
@@ -312,6 +323,35 @@ impl SvgRenderer {
     /// Parses SVG data into a [`ParsedSvg`] that can be rasterized at any scale.
     pub fn parse_svg(&self, bytes: &[u8]) -> Result<ParsedSvg, usvg::Error> {
         usvg::Tree::from_data(bytes, &self.usvg_options).map(ParsedSvg)
+    }
+
+    /// Parses generated SVG with only the supplied faces, never the system font database.
+    pub fn parse_svg_with_fonts(
+        &self,
+        bytes: &[u8],
+        fonts: impl IntoIterator<Item = crate::SharedFontData>,
+    ) -> Result<ParsedSvg, usvg::Error> {
+        let mut db = usvg::fontdb::Database::new();
+        for font in fonts {
+            db.load_font_source(usvg::fontdb::Source::Binary(font));
+        }
+        fix_generic_font_families(&mut db);
+        let options = usvg::Options {
+            fontdb: Arc::new(db),
+            font_resolver: preview_font_resolver(
+                self.asset_source.clone(),
+                Arc::new(OnceLock::new()),
+                false,
+            ),
+            ..Default::default()
+        };
+        usvg::Tree::from_data(bytes, &options).map(ParsedSvg)
+    }
+
+    /// Counts full SVG system font database loads in this process.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn system_font_database_load_count(&self) -> usize {
+        SYSTEM_FONT_DB_LOADS.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Parses SVG from an untrusted file: an `<image href>` to a file loads nothing.
@@ -503,6 +543,43 @@ mod tests {
         let image = renderer.render_parsed(&svg, SvgSize::ExactSize(requested_size))?;
 
         assert_eq!(image.size(0), requested_size);
+        Ok(())
+    }
+
+    #[test]
+    fn supplied_fonts_render_the_same_pixels_without_the_preview_font_resolver() -> Result<()> {
+        let renderer = SvgRenderer::new(Arc::new(()));
+        let data = include_bytes!("../../gpui-pre-wgpu/testdata/JetBrainsMono-Regular.ttf");
+        let bytes = br#"<svg xmlns="http://www.w3.org/2000/svg" width="160" height="40"><text x="4" y="24" font-family="JetBrains Mono" font-size="14">alpha.txt</text></svg>"#;
+        let fonts: Vec<crate::SharedFontData> = vec![Arc::new(data.to_vec())];
+        let supplied = renderer.parse_svg_with_fonts(bytes, fonts)?;
+        let mut db = usvg::fontdb::Database::new();
+        db.load_font_data(data.to_vec());
+        let expected = ParsedSvg(usvg::Tree::from_data(
+            bytes,
+            &usvg::Options {
+                fontdb: Arc::new(db),
+                ..Default::default()
+            },
+        )?);
+        let size = SvgSize::ExactSize(Size::new(DevicePixels(160), DevicePixels(40)));
+        let actual = renderer.render_parsed(&supplied, size)?;
+        let expected = renderer.render_parsed(&expected, size)?;
+        assert_eq!(actual.as_bytes(0), expected.as_bytes(0));
+        let unknown_family = br#"<svg xmlns="http://www.w3.org/2000/svg" width="160" height="40"><text x="4" y="24" font-family="'No Such Family', monospace" font-size="14">alpha.txt</text></svg>"#;
+        let fonts: Vec<crate::SharedFontData> = vec![Arc::new(data.to_vec())];
+        let fallback = renderer.parse_svg_with_fonts(unknown_family, fonts)?;
+        assert_eq!(
+            renderer.render_parsed(&fallback, size)?.as_bytes(0),
+            expected.as_bytes(0)
+        );
+        assert!(
+            actual
+                .as_bytes(0)
+                .unwrap()
+                .chunks_exact(4)
+                .any(|pixel| pixel[3] != 0)
+        );
         Ok(())
     }
 

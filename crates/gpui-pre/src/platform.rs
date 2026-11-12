@@ -1644,6 +1644,10 @@ pub trait PlatformTextSystem: Send + Sync {
     fn font_family_name(&self, _font_id: FontId) -> Option<SharedString> {
         None
     }
+    /// Shares bytes of an already loaded face, without discovering or opening fonts.
+    fn font_data(&self, _font_id: FontId) -> Option<crate::SharedFontData> {
+        None
+    }
     /// Prewarm any system font caches needed to shape text.
     fn prewarm_fonts(&self, _font_ids: &[FontId]) {}
     /// Get metrics for a font.
