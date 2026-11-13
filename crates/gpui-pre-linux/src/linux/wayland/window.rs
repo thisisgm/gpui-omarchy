@@ -2367,6 +2367,15 @@ impl WaylandWindowStatePtr {
     }
 
     pub fn set_focused(&self, focus: bool) {
+        if !focus {
+            let (client, surface) = {
+                let state = self.state.borrow();
+                (state.client.clone(), state.surface.id())
+            };
+            if client.try_get_client().is_some() {
+                client.cancel_touch_for_surface(&surface);
+            }
+        }
         self.state.borrow_mut().active = focus;
         self.retry_failed_present_now();
         let callback = self.callbacks.borrow_mut().active_status_change.take();

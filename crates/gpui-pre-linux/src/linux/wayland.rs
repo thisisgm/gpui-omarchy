@@ -1,3 +1,4 @@
+mod click;
 mod client;
 mod clipboard;
 mod cursor;
@@ -11,7 +12,10 @@ mod opaque_region;
 mod popup;
 mod presentation;
 mod scroll;
+mod seat_events;
 mod serial;
+mod touch;
+mod touch_events;
 mod window;
 
 /// Contains Types for configuring layer_shell surfaces.

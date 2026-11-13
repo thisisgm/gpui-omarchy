@@ -1,5 +1,9 @@
 #[path = "drag_icon.rs"]
 mod drag_icon;
+#[path = "input_host.rs"]
+mod input_host;
+#[path = "seat_host.rs"]
+mod seat_host;
 use drag_icon::DragIcon;
 
 use std::{
@@ -40,7 +44,7 @@ use wayland_client::{
     Connection, Dispatch, Proxy, QueueHandle, delegate_noop,
     protocol::{
         wl_buffer, wl_compositor, wl_keyboard, wl_pointer, wl_registry, wl_seat, wl_shm,
-        wl_shm_pool, wl_surface,
+        wl_shm_pool, wl_surface, wl_touch,
     },
 };
 use wayland_protocols::wp::pointer_gestures::zv1::client::{
@@ -83,20 +87,22 @@ use xkbcommon::xkb::ffi::XKB_KEYMAP_FORMAT_TEXT_V1;
 use xkbcommon::xkb::{self, KEYMAP_COMPILE_NO_FLAGS, Keycode};
 
 use super::{
+    click::ClickState,
     display::{WaylandDisplay, refresh_interval_from_millihertz},
     ime::{ImeCursorRectangle, ImeSession, TextInputRequests},
     ime_context::{Preedit, SurroundingText},
     ime_events::{self, ImeHost, ImeWindow},
     presentation::{FrameFeedback, FrameFeedbackData},
     scroll::ScrollFrame,
+    touch::TouchState,
+    touch_events,
     window::{ImeInput, WaylandWindowStatePtr},
 };
 
 use crate::linux::{
-    DOUBLE_CLICK_INTERVAL, LinuxCommon, XkbKeyboardLayout, capslock_from_xkb, composes,
-    cursor_style_to_icon_names, get_xkb_compose_state, is_within_click_distance,
-    keystroke_from_xkb, keystroke_underlying_dead_key, modifiers_from_xkb, new_xkb_context,
-    open_uri_internal, prefers_character_input, reveal_path_internal,
+    LinuxCommon, XkbKeyboardLayout, capslock_from_xkb, composes, cursor_style_to_icon_names,
+    get_xkb_compose_state, keystroke_from_xkb, keystroke_underlying_dead_key, modifiers_from_xkb,
+    new_xkb_context, open_uri_internal, prefers_character_input, reveal_path_internal,
     wayland::{
         clipboard::{Clipboard, DataOffer, DataSourceKind, ReadCompletion, SourceData},
         cursor::Cursor,
@@ -404,6 +410,9 @@ pub(crate) struct WaylandClientState {
     pub compositor_gpu: Option<CompositorGpuHint>,
     wl_seat: wl_seat::WlSeat, // TODO: Multi seat support
     wl_pointer: Option<wl_pointer::WlPointer>,
+    wl_touch: Option<wl_touch::WlTouch>,
+    touch: TouchState<ObjectId>,
+    touch_cleared_hover: bool,
     pinch_gesture: Option<zwp_pointer_gesture_pinch_v1::ZwpPointerGesturePinchV1>,
     pinch_scale: f32,
     wl_keyboard: Option<wl_keyboard::WlKeyboard>,
@@ -513,13 +522,6 @@ fn file_uri_list(paths: &gpui::FileDragPaths) -> String {
             list.push_str("\r\n");
             list
         })
-}
-
-pub struct ClickState {
-    last_mouse_button: Option<MouseButton>,
-    last_click: Instant,
-    last_location: Point<Pixels>,
-    current_count: usize,
 }
 
 pub(crate) struct KeyRepeat {
@@ -945,6 +947,7 @@ impl WaylandClientStatePtr {
     }
 
     pub fn drop_window(&self, surface_id: &ObjectId) {
+        super::touch_events::window_dropped(self, surface_id);
         ime_events::window_closed(self, surface_id);
         let client = self.get_client();
         let mut state = client.borrow_mut();
@@ -986,6 +989,14 @@ impl WaylandClientStatePtr {
         {
             state.cursor_hidden_window = Some(window);
         }
+    }
+
+    pub(super) fn cancel_touch_for_surface(&self, surface: &ObjectId) {
+        super::touch_events::focus_lost(self, surface);
+    }
+
+    fn dispatch_touch(&self, events: Vec<super::touch::Input<ObjectId>>) {
+        super::touch_events::dispatch(self, events);
     }
 }
 
@@ -1086,6 +1097,9 @@ impl Drop for WaylandConnection {
 
         if let Some(wl_pointer) = &state.wl_pointer {
             wl_pointer.release();
+        }
+        if let Some(touch) = state.wl_touch.take() {
+            touch.release();
         }
         if let Some(cursor_shape_device) = &state.cursor_shape_device {
             cursor_shape_device.destroy();
@@ -1257,6 +1271,9 @@ impl WaylandConnection {
             compositor_gpu,
             wl_seat: seat,
             wl_pointer: None,
+            wl_touch: None,
+            touch: TouchState::default(),
+            touch_cleared_hover: false,
             wl_keyboard: None,
             pinch_gesture: None,
             pinch_scale: 1.0,
@@ -1279,12 +1296,7 @@ impl WaylandConnection {
             external_drag: None,
             pending_drag_end: Rc::new(Cell::new(false)),
             retired_drag_icons: Vec::new(),
-            click: ClickState {
-                last_click: Instant::now(),
-                last_mouse_button: None,
-                last_location: Point::default(),
-                current_count: 0,
-            },
+            click: ClickState::default(),
             repeat: KeyRepeat {
                 characters_per_second: 16,
                 delay: Duration::from_millis(500),
@@ -1910,6 +1922,14 @@ impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for WaylandClientStat
                     if let Some(wl_pointer) = state.wl_pointer.take() {
                         wl_pointer.release();
                     }
+                    if let Some(touch) = state.wl_touch.take() {
+                        touch.release();
+                    }
+                    let modifiers = state.modifiers;
+                    let (_, events) = state.touch.capability(false, modifiers);
+                    drop(state);
+                    this.dispatch_touch(events);
+                    state = client.borrow_mut();
                     if let Some(wl_keyboard) = state.wl_keyboard.take() {
                         wl_keyboard.release();
                     }
@@ -2355,72 +2375,7 @@ impl Dispatch<wl_seat::WlSeat, ()> for WaylandClientStatePtr {
             capabilities: WEnum::Value(capabilities),
         } = event
         {
-            let client = this.get_client();
-            let mut state = client.borrow_mut();
-            if capabilities.contains(wl_seat::Capability::Keyboard) {
-                let keyboard = seat.get_keyboard(qh, ());
-                if let Some(text_input) = state.text_input.take() {
-                    text_input.destroy();
-                }
-
-                state.text_input = state
-                    .globals
-                    .text_input_manager
-                    .as_ref()
-                    .map(|text_input_manager| text_input_manager.get_text_input(seat, qh, ()));
-
-                if let Some(wl_keyboard) = &state.wl_keyboard {
-                    wl_keyboard.release();
-                }
-
-                state.wl_keyboard = Some(keyboard);
-                drop(state);
-                ime_events::text_input_destroyed(&*this);
-                state = client.borrow_mut();
-            } else {
-                if let Some(keyboard) = state.wl_keyboard.take() {
-                    keyboard.release();
-                }
-                if let Some(text_input) = state.text_input.take() {
-                    text_input.destroy();
-                }
-                let focused = state.keyboard_focused_window.take();
-                state.repeat.current_id += 1;
-                state.enter_token.take();
-                state.clear_keyboard_composition();
-                drop(state);
-                let surface = focused.as_ref().map(|window| window.surface().id());
-                ime_events::keyboard_removed(&*this, surface.as_ref());
-                if let Some(window) = focused {
-                    window.set_focused(false);
-                }
-                state = client.borrow_mut();
-            }
-            if capabilities.contains(wl_seat::Capability::Pointer) {
-                let pointer = seat.get_pointer(qh, ());
-
-                if let Some(cursor_shape_device) = state.cursor_shape_device.take() {
-                    cursor_shape_device.destroy();
-                }
-
-                state.cursor_shape_device = state
-                    .globals
-                    .cursor_shape_manager
-                    .as_ref()
-                    .map(|cursor_shape_manager| cursor_shape_manager.get_pointer(&pointer, qh, ()));
-
-                state.pinch_gesture = state.globals.gesture_manager.as_ref().map(
-                    |gesture_manager: &zwp_pointer_gestures_v1::ZwpPointerGesturesV1| {
-                        gesture_manager.get_pinch_gesture(&pointer, qh, ())
-                    },
-                );
-
-                if let Some(wl_pointer) = &state.wl_pointer {
-                    wl_pointer.release();
-                }
-
-                state.wl_pointer = Some(pointer);
-            }
+            super::seat_events::capabilities(this, seat, qh, capabilities);
         }
     }
 }
@@ -2815,6 +2770,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
                 state.serial_tracker.update(SerialKind::MouseEnter, serial);
                 state.mouse_location = Some(position);
                 state.button_pressed = None;
+                state.touch_cleared_hover = false;
 
                 if let Some(window) = get_window(&mut state, &surface.id()) {
                     state.mouse_focused_window = Some(window.clone());
@@ -2915,6 +2871,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
                         modifiers: state.modifiers,
                     });
                     drop(state);
+                    touch_events::pointer_motion(this, &window);
                     window.handle_input(input);
                 }
             }
@@ -2934,42 +2891,17 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
                 if state.mouse_focused_window.is_none() {
                     return;
                 }
+                if let Some(window) = state.mouse_focused_window.clone() {
+                    drop(state);
+                    touch_events::pointer_button(this, &window);
+                    state = client.borrow_mut();
+                }
                 match button_state {
                     wl_pointer::ButtonState::Pressed => {
-                        if let Some(window) = state.keyboard_focused_window.clone() {
-                            drop(state);
-                            let composed = ime_events::pointer_pressed(&*this, &window);
-                            state = client.borrow_mut();
-                            if !composed
-                                && let (Some(text), Some(compose)) =
-                                    (state.pre_edit_text.take(), state.compose_state.as_mut())
-                            {
-                                compose.reset();
-                                drop(state);
-                                window.handle_ime(ImeInput::InsertText(text));
-                                state = client.borrow_mut();
-                            }
-                        }
-                        let click_elapsed = state.click.last_click.elapsed();
-
-                        if click_elapsed < DOUBLE_CLICK_INTERVAL
-                            && state
-                                .click
-                                .last_mouse_button
-                                .is_some_and(|prev_button| prev_button == button)
-                            && is_within_click_distance(
-                                state.click.last_location,
-                                state.mouse_location.unwrap(),
-                            )
-                        {
-                            state.click.current_count += 1;
-                        } else {
-                            state.click.current_count = 1;
-                        }
-
-                        state.click.last_click = Instant::now();
-                        state.click.last_mouse_button = Some(button);
-                        state.click.last_location = state.mouse_location.unwrap();
+                        let position = state.mouse_location.unwrap();
+                        drop(state);
+                        touch_events::pointer_pressed(this, button, position, Instant::now());
+                        state = client.borrow_mut();
 
                         state.button_pressed = Some(button);
 
@@ -2978,7 +2910,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
                                 button,
                                 position: state.mouse_location.unwrap(),
                                 modifiers: state.modifiers,
-                                click_count: state.click.current_count,
+                                click_count: state.click.count(),
                                 first_mouse: state.enter_token.take().is_some(),
                             });
                             drop(state);
@@ -2993,7 +2925,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
                                 button,
                                 position: state.mouse_location.unwrap(),
                                 modifiers: state.modifiers,
-                                click_count: state.click.current_count,
+                                click_count: state.click.count(),
                             });
                             drop(state);
                             window.handle_input(input);
@@ -3020,6 +2952,57 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
                         }));
                     }
                 }
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<wl_touch::WlTouch, ()> for WaylandClientStatePtr {
+    fn event(
+        this: &mut Self,
+        touch: &wl_touch::WlTouch,
+        event: wl_touch::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        let client = this.get_client();
+        let mut state = client.borrow_mut();
+        if state.wl_touch.as_ref() != Some(touch) {
+            return;
+        }
+        match event {
+            wl_touch::Event::Down {
+                serial,
+                surface,
+                id,
+                x,
+                y,
+                ..
+            } => {
+                let surface = get_window(&mut state, &surface.id()).map(|_| surface.id());
+                drop(state);
+                touch_events::down(
+                    this,
+                    id,
+                    surface,
+                    point(px(x as f32), px(y as f32)),
+                    Instant::now(),
+                    serial,
+                );
+            }
+            wl_touch::Event::Motion { id, x, y, .. } => {
+                drop(state);
+                touch_events::motion(this, id, point(px(x as f32), px(y as f32)));
+            }
+            wl_touch::Event::Up { id, .. } => {
+                drop(state);
+                touch_events::up(this, id);
+            }
+            wl_touch::Event::Cancel => {
+                drop(state);
+                touch_events::cancel(this);
             }
             _ => {}
         }
