@@ -1290,19 +1290,44 @@ impl WgpuRenderer {
             .create_view(&wgpu::TextureViewDescriptor::default());
         let premultiplied_alpha =
             self.surface_config.alpha_mode == wgpu::CompositeAlphaMode::PreMultiplied;
-        if let Err(error) = core.render_frame(
+        let rendered = core.render_frame(
             scene,
             &frame_view,
             size,
             premultiplied_alpha,
             wgpu::Color::TRANSPARENT,
-        ) {
+        );
+        if let Err(error) = &rendered {
             log::error!("{error:#}");
-            return false;
         }
+        finish_frame(frame, rendered.is_ok(), || self.device_errors.device_lost())
+    }
+}
 
-        frame.present();
-        true
+/// A swapchain image acquired for the frame being drawn.
+trait AcquiredFrame {
+    /// A handle to the image that outlives the frame.
+    type Image;
+    fn image(&self) -> Self::Image;
+    /// Hands the frame to the surface, which takes the image unless its device is lost.
+    fn present(self);
+    /// Takes out an image a refused present left in the surface, which cannot be dropped while it owns one.
+    fn take_image(image: Self::Image);
+}
+
+impl AcquiredFrame for wgpu::SurfaceTexture {
+    type Image = wgpu::Texture;
+
+    fn image(&self) -> wgpu::Texture {
+        self.texture.clone()
+    }
+
+    fn present(self) {
+        wgpu::SurfaceTexture::present(self);
+    }
+
+    fn take_image(image: wgpu::Texture) {
+        image.destroy();
     }
 }
 
@@ -1337,6 +1362,24 @@ impl SuboptimalRebuild {
     fn swapchain_replaced(&mut self) {
         self.0 = false;
     }
+}
+
+/// Ends a frame; false when nothing reached the compositor, so no frame callback is waited for.
+fn finish_frame<F: AcquiredFrame>(
+    frame: F,
+    rendered: bool,
+    device_lost: impl Fn() -> bool,
+) -> bool {
+    if !rendered && !device_lost() {
+        // Dropping the frame discards its image, which only a working device accepts.
+        return false;
+    }
+    let image = frame.image();
+    frame.present();
+    // A device lost on any thread refuses the present and keeps the image, so it is taken out after every present.
+    F::take_image(image);
+    // A loss on another thread between wgpu's two stores reads as presented; a Wayland window then stalls until a commit.
+    !device_lost()
 }
 
 impl WgpuRendererCore {
@@ -2910,6 +2953,73 @@ mod tests {
                 .iter()
                 .all(|&(acquired, _)| acquired == Acquired::Unusable)
         );
+    }
+
+    /// Records what `finish_frame` does with the image; a present may lose the device.
+    struct FakeFrame<'a> {
+        calls: &'a std::cell::RefCell<Vec<&'static str>>,
+        lost: &'a std::cell::Cell<bool>,
+        present_loses_device: bool,
+    }
+
+    impl<'a> AcquiredFrame for FakeFrame<'a> {
+        type Image = &'a std::cell::RefCell<Vec<&'static str>>;
+
+        fn image(&self) -> Self::Image {
+            self.calls
+        }
+
+        fn present(self) {
+            self.calls.borrow_mut().push("present");
+            if self.present_loses_device {
+                self.lost.set(true);
+            }
+        }
+
+        fn take_image(image: Self::Image) {
+            image.borrow_mut().push("take_image");
+        }
+    }
+
+    /// (what happened to the image, whether the frame counts as presented)
+    fn finished(
+        lost_before: bool,
+        present_loses_device: bool,
+        rendered: bool,
+    ) -> (Vec<&'static str>, bool) {
+        let calls = std::cell::RefCell::new(Vec::new());
+        let lost = std::cell::Cell::new(lost_before);
+        let frame = FakeFrame {
+            calls: &calls,
+            lost: &lost,
+            present_loses_device,
+        };
+        let presented = finish_frame(frame, rendered, || lost.get());
+        (calls.into_inner(), presented)
+    }
+
+    #[test]
+    fn a_frame_on_a_lost_device_is_released_and_never_counts_as_presented() {
+        // The image is taken out after the present, never before: taken first, a working device presents nothing.
+        let presented_then_taken = vec!["present", "take_image"];
+        assert_eq!(
+            finished(true, false, true),
+            (presented_then_taken.clone(), false),
+            "a lost device keeps an image it was asked to present, and reports a frame no commit carried"
+        );
+        // A frame that failed to encode is not dropped on a lost device, where the discard is fatal.
+        assert_eq!(
+            finished(true, false, false),
+            (presented_then_taken.clone(), false)
+        );
+        assert_eq!(
+            finished(false, true, true),
+            (presented_then_taken.clone(), false),
+            "a present that loses the device reached no compositor"
+        );
+        assert_eq!(finished(false, false, true), (presented_then_taken, true));
+        // A frame that failed to encode on a working device is dropped, which discards its image.
+        assert_eq!(finished(false, false, false), (vec![], false));
     }
 
     #[cfg(target_os = "linux")]

@@ -47,10 +47,11 @@ impl DeviceErrorState {
         device.set_device_lost_callback({
             let errors = Arc::clone(&errors);
             move |reason, message| {
-                log::error!("wgpu device lost: reason={reason:?}, message={message}");
+                // Stored before the log line, so a frame ending on another thread reads the loss as early as it can.
                 if reason != wgpu::DeviceLostReason::Destroyed {
                     errors.lost.store(true, Ordering::Relaxed);
                 }
+                log::error!("wgpu device lost: reason={reason:?}, message={message}");
             }
         });
         device.on_uncaptured_error(Arc::new({
