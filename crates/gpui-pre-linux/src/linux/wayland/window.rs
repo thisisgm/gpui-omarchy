@@ -157,6 +157,8 @@ pub struct WaylandWindowState {
     hovered: bool,
     redraw_requested: bool,
     presentation: PresentationState,
+    present_failures: PresentFailures,
+    last_present_failure: Option<Instant>,
     pending_frame_callback: Option<wl_callback::WlCallback>,
     presented_frames: WindowFrameCounter,
     in_progress_configure: Option<InProgressConfigure>,
@@ -576,6 +578,10 @@ pub struct WaylandWindowStatePtr {
     frame_loop: Rc<Cell<FrameLoop>>,
     frame_ping: Ping,
     scheduled_frame_at: Rc<Cell<Option<Instant>>>,
+    // Names the retry wait the loop expects; a timer carrying an older token was replaced.
+    retry_token: Rc<Cell<u64>>,
+    // The armed retry's wait, counted from the failure it follows.
+    retry_wait: Rc<Cell<Duration>>,
 }
 
 impl WaylandWindowState {
@@ -671,6 +677,8 @@ impl WaylandWindowState {
             hovered: false,
             redraw_requested: false,
             presentation: PresentationState::Unpresented,
+            present_failures: PresentFailures::default(),
+            last_present_failure: None,
             pending_frame_callback: None,
             presented_frames,
             in_progress_window_controls: None,
@@ -914,6 +922,468 @@ impl PresentationState {
     }
 }
 
+/// Failed presents the compositor still paces before retries move to a timer that backs off.
+const COMPOSITOR_PACED_FAILURES: u32 = 2;
+/// The longest wait between retries: a retry can cost driver memory, so their number stays small over days.
+const PRESENT_RETRY_CAP: Duration = Duration::from_secs(24 * 60 * 60);
+/// Input, an application redraw or a sibling's recovery retries a failing present once its last attempt is this old.
+const DEMAND_RETRY_AFTER: Duration = Duration::from_secs(30);
+
+/// Presents that failed in a row; each retry redraws and may rebuild the swapchain, so none runs at frame rate.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct PresentFailures(u32);
+
+impl PresentFailures {
+    fn failed(&mut self) {
+        self.0 = self.0.saturating_add(1);
+    }
+
+    /// Clears the count; true when this present follows failures.
+    fn presented(&mut self) -> bool {
+        std::mem::take(&mut self.0) != 0
+    }
+
+    /// `None` while the loop's ordinary pacing still applies, then a wait that doubles up to the cap.
+    fn backoff(self) -> Option<Duration> {
+        let doublings = self
+            .0
+            .checked_sub(COMPOSITOR_PACED_FAILURES)?
+            .checked_sub(1)?;
+        let factor = 2u32.saturating_pow(doublings.saturating_add(1));
+        Some(
+            super::client::FRAME_RETRY_INTERVAL
+                .saturating_mul(factor)
+                .min(PRESENT_RETRY_CAP),
+        )
+    }
+}
+
+/// What can end a failing present before its retry timer does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetryWake {
+    /// The compositor changed the surface.
+    Surface,
+    /// Input, or a redraw the application asked for.
+    Demand,
+    /// Another window of this client presented again after failing.
+    Sibling,
+}
+
+/// What a wake changes for a backed-off present.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WakeRetry {
+    /// The next attempt runs now, counted from these failures.
+    Now(PresentFailures),
+    /// A frame is already on its way; it counts from these failures.
+    Recount(PresentFailures),
+    /// The retry timer moves up to this long after the last failure; the count is kept.
+    At(Duration),
+}
+
+/// What `wake` does to a present that backed off, or `None` to keep waiting; `armed` is the timer's wait.
+fn retry_on_wake(
+    wake: RetryWake,
+    frame_loop: FrameLoop,
+    failures: PresentFailures,
+    since_failure: Duration,
+    armed: Duration,
+) -> Option<WakeRetry> {
+    failures.backoff()?;
+    match (wake, frame_loop) {
+        // One failure stays counted, so the present that follows still reports the recovery.
+        (RetryWake::Surface, FrameLoop::RetryScheduled) => Some(WakeRetry::Now(PresentFailures(1))),
+        (RetryWake::Surface, FrameLoop::Scheduled) => Some(WakeRetry::Recount(PresentFailures(1))),
+        // These outrun frames, so they keep the wait's length and retry this often at most.
+        (RetryWake::Demand | RetryWake::Sibling, FrameLoop::RetryScheduled) => {
+            if since_failure >= DEMAND_RETRY_AFTER {
+                Some(WakeRetry::Now(failures))
+            } else {
+                (DEMAND_RETRY_AFTER < armed).then_some(WakeRetry::At(DEMAND_RETRY_AFTER))
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Whether a retry timer that fired is the one the loop still waits on, not one a later wait replaced.
+fn retry_timer_is_current(frame_loop: FrameLoop, armed: u64, fired: u64) -> bool {
+    frame_loop == FrameLoop::RetryScheduled && armed == fired
+}
+
+/// The wait before a redraw no present is owed for; a device that stays lost asks for one on every attempt.
+fn redraw_retry_wait(failures: PresentFailures) -> Duration {
+    failures
+        .backoff()
+        .unwrap_or(super::client::FRAME_RETRY_INTERVAL)
+}
+
+/// What retries a present that is still owed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PresentRetry {
+    /// The compositor's next frame callback, requested on a commit without a buffer.
+    Callback,
+    /// A timer, after this wait. It sends the compositor nothing.
+    Timer(Duration),
+}
+
+/// How an owed present is retried: the compositor paces the first failures after a present, a timer all others.
+fn present_retry(
+    frame_loop: FrameLoop,
+    presentation: PresentationState,
+    failures: PresentFailures,
+) -> PresentRetry {
+    match failures.backoff() {
+        Some(wait) => PresentRetry::Timer(wait),
+        None if frame_loop == FrameLoop::PresentationFailed
+            && presentation == PresentationState::RetryAfterPresent =>
+        {
+            PresentRetry::Callback
+        }
+        None => PresentRetry::Timer(super::client::FRAME_RETRY_INTERVAL),
+    }
+}
+
+#[cfg(test)]
+mod present_retry_tests {
+    use super::super::client::FRAME_RETRY_INTERVAL;
+    use super::{
+        COMPOSITOR_PACED_FAILURES, DEMAND_RETRY_AFTER, FrameLoop, PRESENT_RETRY_CAP,
+        PresentFailures, PresentRetry, PresentationState, RetryWake, WakeRetry, present_retry,
+        redraw_retry_wait, retry_on_wake, retry_timer_is_current,
+    };
+    use std::time::Duration;
+
+    // A visible window is handed a frame callback every refresh; 144 Hz is a common output.
+    const REFRESH: Duration = Duration::from_micros(6_944);
+    const UNATTENDED: Duration = Duration::from_secs(23 * 60 * 60);
+    // A wait that doubles from two frames passes 23 hours on its 22nd step.
+    const DOUBLINGS: u64 = 22;
+
+    /// Retries of a present that never succeeds, over `span` of simulated time: (callback retries, timer retries).
+    fn retries_while_failing(span: Duration, presentation: PresentationState) -> (u64, u64) {
+        let mut failures = PresentFailures::default();
+        let (mut elapsed, mut callbacks, mut timers) = (Duration::ZERO, 0u64, 0u64);
+        while elapsed < span {
+            failures.failed();
+            match present_retry(FrameLoop::PresentationFailed, presentation, failures) {
+                PresentRetry::Callback => {
+                    callbacks += 1;
+                    elapsed += REFRESH;
+                }
+                PresentRetry::Timer(wait) => {
+                    timers += 1;
+                    elapsed += wait;
+                }
+            }
+        }
+        (callbacks, timers)
+    }
+
+    #[test]
+    fn a_present_that_keeps_failing_is_retried_a_bounded_number_of_times() {
+        let (callbacks, timers) =
+            retries_while_failing(UNATTENDED, PresentationState::RetryAfterPresent);
+        // Each callback retry costs the compositor a commit and a feedback object; only the first failures may.
+        assert_eq!(callbacks, u64::from(COMPOSITOR_PACED_FAILURES));
+        // Each timer retry redraws and may rebuild the swapchain or the device, which can cost driver memory.
+        assert_eq!(timers, DOUBLINGS, "timer retries in 23 hours");
+    }
+
+    #[test]
+    fn a_surface_that_never_presented_backs_off_too() {
+        let (callbacks, timers) =
+            retries_while_failing(UNATTENDED, PresentationState::RetryBeforeFirstPresent);
+        assert_eq!(callbacks, 0);
+        // Its first failures retry after one frame each, where a presented surface waits for the compositor.
+        assert_eq!(timers, u64::from(COMPOSITOR_PACED_FAILURES) + DOUBLINGS);
+    }
+
+    const LONG_AGO: Duration = Duration::from_secs(60 * 60);
+
+    const DEMANDS: [RetryWake; 2] = [RetryWake::Demand, RetryWake::Sibling];
+
+    /// What `wake` does to a window that waits on the timer its `count` failures armed.
+    fn on_timer(wake: RetryWake, count: u32, since_failure: Duration) -> Option<WakeRetry> {
+        let failures = PresentFailures(count);
+        let armed = failures.backoff().unwrap_or_default();
+        retry_on_wake(
+            wake,
+            FrameLoop::RetryScheduled,
+            failures,
+            since_failure,
+            armed,
+        )
+    }
+
+    #[test]
+    fn a_surface_change_restarts_a_backed_off_present_and_keeps_it_failing() {
+        // Two failures are still paced by the compositor: nothing has backed off yet.
+        for count in 0..=2 {
+            assert_eq!(on_timer(RetryWake::Surface, count, LONG_AGO), None);
+        }
+        for count in [3, 13, 40] {
+            assert_eq!(
+                on_timer(RetryWake::Surface, count, Duration::ZERO),
+                Some(WakeRetry::Now(PresentFailures(1)))
+            );
+        }
+        // From one failure the compositor paces the retry again, and its present tells the other windows.
+        let mut restarted = PresentFailures(1);
+        assert_eq!(restarted.backoff(), None);
+        assert!(restarted.presented());
+    }
+
+    #[test]
+    fn a_demand_retries_an_old_failure_now_and_keeps_the_wait() {
+        for wake in DEMANDS {
+            for count in 0..=2 {
+                assert_eq!(on_timer(wake, count, LONG_AGO), None);
+            }
+            for count in [3, 13, 40] {
+                assert_eq!(
+                    on_timer(wake, count, DEMAND_RETRY_AFTER),
+                    Some(WakeRetry::Now(PresentFailures(count)))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_demand_inside_thirty_seconds_moves_the_retry_to_the_thirty_second_mark() {
+        let moved = Some(WakeRetry::At(DEMAND_RETRY_AFTER));
+        for wake in DEMANDS {
+            // 13 failures wait 34.1 s and 40 wait a day; the count is kept, so the next wait is no shorter.
+            for count in [13, 40] {
+                assert_eq!(on_timer(wake, count, Duration::from_secs(10)), moved);
+                assert_eq!(on_timer(wake, count, Duration::from_millis(29_999)), moved);
+                // Later asks leave the moved timer alone.
+                assert_eq!(
+                    retry_on_wake(
+                        wake,
+                        FrameLoop::RetryScheduled,
+                        PresentFailures(count),
+                        Duration::from_secs(11),
+                        DEMAND_RETRY_AFTER,
+                    ),
+                    None
+                );
+            }
+            // 12 failures wait 17.1 s, which ends before the mark.
+            assert_eq!(on_timer(wake, 12, Duration::from_secs(10)), None);
+        }
+    }
+
+    #[test]
+    fn a_surface_change_resets_the_count_of_a_demand_frame_still_pending() {
+        // Pointer motion restarts a present that failed 15 times and keeps the count; its frame is on its way.
+        assert_eq!(
+            on_timer(RetryWake::Demand, 15, LONG_AGO),
+            Some(WakeRetry::Now(PresentFailures(15)))
+        );
+        let woken = |wake, frame_loop| {
+            retry_on_wake(
+                wake,
+                frame_loop,
+                PresentFailures(15),
+                LONG_AGO,
+                PRESENT_RETRY_CAP,
+            )
+        };
+        // A configure before that frame still restarts the count, and schedules nothing more.
+        assert_eq!(
+            woken(RetryWake::Surface, FrameLoop::Scheduled),
+            Some(WakeRetry::Recount(PresentFailures(1)))
+        );
+        for wake in DEMANDS {
+            assert_eq!(woken(wake, FrameLoop::Scheduled), None);
+        }
+        for frame_loop in [
+            FrameLoop::Parked,
+            FrameLoop::Ticking,
+            FrameLoop::RescheduleRequested,
+            FrameLoop::PresentationFailed,
+            FrameLoop::AwaitingCallback,
+        ] {
+            assert_eq!(woken(RetryWake::Surface, frame_loop), None);
+        }
+    }
+
+    /// Attempts in `span` at a present that never succeeds while `wake` arrives at each of `wakes`.
+    fn attempts_while_woken(
+        span: Duration,
+        wake: RetryWake,
+        wakes: impl Iterator<Item = Duration>,
+    ) -> u64 {
+        let mut wakes = wakes.peekable();
+        let mut failures = PresentFailures::default();
+        let (mut now, mut attempts) = (Duration::ZERO, 0u64);
+        while now < span {
+            failures.failed();
+            attempts += 1;
+            let failed_at = now;
+            let retry = present_retry(
+                FrameLoop::PresentationFailed,
+                PresentationState::RetryAfterPresent,
+                failures,
+            );
+            let mut armed = match retry {
+                PresentRetry::Callback => REFRESH,
+                PresentRetry::Timer(wait) => wait,
+            };
+            now = failed_at + armed;
+            loop {
+                let due = now;
+                let Some(woken_at) = wakes.next_if(|&at| at < due) else {
+                    break;
+                };
+                let since_failure = woken_at.saturating_sub(failed_at);
+                let frame_loop = FrameLoop::RetryScheduled;
+                match retry_on_wake(wake, frame_loop, failures, since_failure, armed) {
+                    Some(WakeRetry::Now(restarted)) => {
+                        failures = restarted;
+                        now = woken_at;
+                        break;
+                    }
+                    Some(WakeRetry::At(after_failure)) => {
+                        armed = after_failure;
+                        now = failed_at + after_failure;
+                    }
+                    Some(WakeRetry::Recount(_)) | None => {}
+                }
+            }
+        }
+        attempts
+    }
+
+    fn every(period: Duration) -> impl Iterator<Item = Duration> {
+        (1u32..).map(move |nth| period * nth)
+    }
+
+    const DAY: Duration = Duration::from_secs(24 * 60 * 60);
+
+    #[test]
+    fn a_window_asked_to_redraw_all_day_retries_once_per_thirty_seconds() {
+        // 13 attempts until the wait passes 30 s (at 34.1 s), then one every 30 s from 64.1 s on.
+        for ask in [Duration::from_secs(1), FRAME_RETRY_INTERVAL] {
+            assert_eq!(
+                attempts_while_woken(DAY, RetryWake::Demand, every(ask)),
+                2_891
+            );
+        }
+    }
+
+    #[test]
+    fn one_ask_after_the_thirteenth_failure_is_answered_at_thirty_seconds() {
+        // The 13th attempt fails at 34.1 s and arms a 34.1 s wait; the one ask comes 10.9 s later.
+        let attempts_by = |seconds, asks: usize| {
+            let wakes = every(Duration::from_secs(45)).take(asks);
+            attempts_while_woken(Duration::from_secs(seconds), RetryWake::Demand, wakes)
+        };
+        assert_eq!(attempts_by(64, 1), 13);
+        assert_eq!(attempts_by(65, 1), 14);
+        assert_eq!(attempts_by(65, 0), 13);
+    }
+
+    /// When a window that fails every other present recovers; each recovery wakes the client's other windows.
+    fn recoveries_of_a_flapping_window() -> impl Iterator<Item = Duration> {
+        let mut failures = PresentFailures::default();
+        let mut now = Duration::ZERO;
+        std::iter::from_fn(move || {
+            failures.failed();
+            // The compositor paces the one retry, and it presents.
+            now += 2 * REFRESH;
+            failures.presented().then_some(now)
+        })
+    }
+
+    #[test]
+    fn a_sibling_that_flaps_all_day_costs_a_dead_window_one_attempt_per_thirty_seconds() {
+        let flaps = recoveries_of_a_flapping_window();
+        assert_eq!(attempts_while_woken(DAY, RetryWake::Sibling, flaps), 2_891);
+    }
+
+    #[test]
+    fn only_the_retry_timer_the_loop_waits_on_runs_a_frame() {
+        assert!(retry_timer_is_current(FrameLoop::RetryScheduled, 7, 7));
+        // A wake replaced that wait: its timer still fires, and must not run a second frame.
+        assert!(!retry_timer_is_current(FrameLoop::RetryScheduled, 8, 7));
+        for frame_loop in [
+            FrameLoop::Parked,
+            FrameLoop::Scheduled,
+            FrameLoop::AwaitingCallback,
+        ] {
+            assert!(!retry_timer_is_current(frame_loop, 7, 7));
+        }
+    }
+
+    #[test]
+    fn a_redraw_with_no_present_owed_backs_off_with_the_failures() {
+        assert_eq!(redraw_retry_wait(PresentFailures(0)), FRAME_RETRY_INTERVAL);
+        assert_eq!(redraw_retry_wait(PresentFailures(2)), FRAME_RETRY_INTERVAL);
+        assert_eq!(
+            redraw_retry_wait(PresentFailures(3)),
+            Duration::from_micros(33_334)
+        );
+        assert_eq!(
+            redraw_retry_wait(PresentFailures(13)),
+            Duration::from_micros(34_134_016)
+        );
+        assert_eq!(redraw_retry_wait(PresentFailures(60)), PRESENT_RETRY_CAP);
+    }
+
+    #[test]
+    fn only_a_present_after_failures_reports_a_recovery() {
+        let mut failures = PresentFailures(4);
+        assert!(failures.presented());
+        assert_eq!(failures, PresentFailures(0));
+        assert!(!failures.presented());
+    }
+
+    #[test]
+    fn the_wait_doubles_from_two_frames_to_the_cap_and_a_present_clears_it() {
+        let mut failures = PresentFailures::default();
+        for _ in 0..COMPOSITOR_PACED_FAILURES {
+            failures.failed();
+            assert_eq!(failures.backoff(), None);
+        }
+        let mut last = FRAME_RETRY_INTERVAL;
+        let mut reached_cap = false;
+        for _ in 0..40 {
+            failures.failed();
+            let wait = failures.backoff().unwrap();
+            assert!(
+                wait == PRESENT_RETRY_CAP || wait == last * 2,
+                "{wait:?} after {last:?}"
+            );
+            reached_cap |= wait == PRESENT_RETRY_CAP;
+            last = wait;
+        }
+        assert!(reached_cap);
+        failures.presented();
+        assert_eq!(failures.backoff(), None);
+        assert_eq!(
+            present_retry(
+                FrameLoop::PresentationFailed,
+                PresentationState::RetryAfterPresent,
+                failures
+            ),
+            PresentRetry::Callback
+        );
+    }
+
+    #[test]
+    fn a_throttled_tick_still_retries_on_the_timer() {
+        assert_eq!(
+            present_retry(
+                FrameLoop::Ticking,
+                PresentationState::RetryAfterPresent,
+                PresentFailures::default()
+            ),
+            PresentRetry::Timer(FRAME_RETRY_INTERVAL)
+        );
+    }
+}
+
 #[cfg(test)]
 mod presentation_state_tests {
     use super::PresentationState;
@@ -1080,6 +1550,8 @@ impl WaylandWindow {
             frame_loop: Rc::new(Cell::new(FrameLoop::Unconfigured)),
             frame_ping,
             scheduled_frame_at: Rc::new(Cell::new(None)),
+            retry_token: Rc::new(Cell::new(0)),
+            retry_wait: Rc::new(Cell::new(Duration::ZERO)),
         });
 
         // Kick things off
@@ -1173,39 +1645,83 @@ impl WaylandWindowStatePtr {
         }
 
         if state.presentation.requires_presentation() {
-            // Before the first present, or when throttling skipped draw, a
-            // callback may never arrive. Otherwise let the compositor pace
-            // retries so an occluded window does not keep polling.
-            if frame_loop == FrameLoop::PresentationFailed
-                && state.presentation == PresentationState::RetryAfterPresent
-            {
-                if state.pending_frame_callback.is_none() {
-                    let callback = state.surface.frame(&state.globals.qh, state.surface.id());
-                    state.pending_frame_callback = Some(callback);
+            match present_retry(frame_loop, state.presentation, state.present_failures) {
+                PresentRetry::Callback => {
+                    if state.pending_frame_callback.is_none() {
+                        let callback = state.surface.frame(&state.globals.qh, state.surface.id());
+                        state.pending_frame_callback = Some(callback);
+                    }
+                    state.commit_surface();
+                    self.frame_loop.set(FrameLoop::AwaitingCallback);
                 }
-                state.commit_surface();
-                self.frame_loop.set(FrameLoop::AwaitingCallback);
-                return;
+                PresentRetry::Timer(wait) => self.schedule_retry(state, wait),
             }
-
-            self.frame_loop.set(FrameLoop::RetryScheduled);
-            let surface_id = state.surface.id();
-            let client = state.client.clone();
-            drop(state);
-            client.schedule_frame_retry(&surface_id);
             return;
         }
 
         if frame_loop == FrameLoop::RescheduleRequested || state.redraw_requested {
-            self.frame_loop.set(FrameLoop::RetryScheduled);
-            let surface_id = state.surface.id();
-            let client = state.client.clone();
-            drop(state);
-            client.schedule_frame_retry(&surface_id);
+            let wait = redraw_retry_wait(state.present_failures);
+            self.schedule_retry(state, wait);
             return;
         }
 
         self.frame_loop.set(FrameLoop::Parked);
+    }
+
+    /// Arms the one retry timer the loop waits on; an earlier one still pending no longer counts.
+    fn schedule_retry(&self, state: RefMut<'_, WaylandWindowState>, wait: Duration) {
+        self.frame_loop.set(FrameLoop::RetryScheduled);
+        self.retry_wait.set(wait);
+        let token = self.retry_token.get().wrapping_add(1);
+        self.retry_token.set(token);
+        let surface_id = state.surface.id();
+        let client = state.client.clone();
+        drop(state);
+        client.schedule_frame_retry(&surface_id, wait, token);
+    }
+
+    /// The surface changed in a way that can end a failing present, so the next attempt runs now.
+    pub fn retry_failed_present_now(&self) {
+        self.restart_failed_present(RetryWake::Surface);
+    }
+
+    /// Another window of this client presented again after failing, which shows the device works.
+    pub fn retry_failed_present_after_sibling(&self) {
+        self.restart_failed_present(RetryWake::Sibling);
+    }
+
+    fn restart_failed_present(&self, wake: RetryWake) {
+        let frame_loop = self.frame_loop.get();
+        // Only these two states can hold a count that backed off, and no frame holds the state in either.
+        if !matches!(frame_loop, FrameLoop::RetryScheduled | FrameLoop::Scheduled) {
+            return;
+        }
+        let mut state = self.state.borrow_mut();
+        let since_failure = state
+            .last_present_failure
+            .map_or(Duration::MAX, |at| at.elapsed());
+        let armed = self.retry_wait.get();
+        match retry_on_wake(
+            wake,
+            frame_loop,
+            state.present_failures,
+            since_failure,
+            armed,
+        ) {
+            Some(WakeRetry::Now(failures)) => {
+                state.present_failures = failures;
+                drop(state);
+                self.retry_token.set(self.retry_token.get().wrapping_add(1));
+                self.frame_loop.set(FrameLoop::Parked);
+                self.schedule_frame();
+            }
+            Some(WakeRetry::Recount(failures)) => state.present_failures = failures,
+            Some(WakeRetry::At(after_failure)) => {
+                self.schedule_retry(state, after_failure.saturating_sub(since_failure));
+                self.retry_wait.set(after_failure);
+            }
+            None => {}
+        }
     }
 
     pub fn frame_callback_fired(&self, signal_at: Option<Instant>) {
@@ -1269,8 +1785,8 @@ impl WaylandWindowStatePtr {
         }
     }
 
-    pub fn retry_timer_fired(&self, signal_at: Instant) {
-        if self.frame_loop.get() == FrameLoop::RetryScheduled {
+    pub fn retry_timer_fired(&self, signal_at: Instant, token: u64) {
+        if retry_timer_is_current(self.frame_loop.get(), self.retry_token.get(), token) {
             self.frame(
                 PlatformFrameSignal::capture(|| signal_at),
                 FrameRequestSource::LocalSchedule,
@@ -1411,6 +1927,7 @@ impl WaylandWindowStatePtr {
             if initial_configure {
                 self.frame(None, FrameRequestSource::NativeCallback);
             } else {
+                self.retry_failed_present_now();
                 self.request_redraw();
             }
         }
@@ -1674,6 +2191,7 @@ impl WaylandWindowStatePtr {
                 if display_changed {
                     self.report_display_changed();
                 }
+                self.retry_failed_present_now();
                 self.request_redraw();
             }
             wl_surface::Event::Leave { output } => {
@@ -1696,6 +2214,7 @@ impl WaylandWindowStatePtr {
                 if display_changed {
                     self.report_display_changed();
                 }
+                self.retry_failed_present_now();
                 self.request_redraw();
             }
             wl_surface::Event::PreferredBufferScale { factor } => {
@@ -1771,6 +2290,7 @@ impl WaylandWindowStatePtr {
             }
             (state.bounds.size, state.scale)
         };
+        self.retry_failed_present_now();
 
         let callback = self.callbacks.borrow_mut().resize.take();
         if let Some(mut fun) = callback {
@@ -1821,6 +2341,7 @@ impl WaylandWindowStatePtr {
     }
 
     pub fn handle_input(&self, input: PlatformInput) {
+        self.restart_failed_present(RetryWake::Demand);
         if self.is_blocked() {
             return;
         }
@@ -1847,6 +2368,7 @@ impl WaylandWindowStatePtr {
 
     pub fn set_focused(&self, focus: bool) {
         self.state.borrow_mut().active = focus;
+        self.retry_failed_present_now();
         let callback = self.callbacks.borrow_mut().active_status_change.take();
         if let Some(mut fun) = callback {
             fun(focus);
@@ -2279,8 +2801,8 @@ impl PlatformWindow for WaylandWindow {
     }
 
     fn draw_with_feedback(&self, scene: &Scene) -> Option<u64> {
-        let mut state = self.borrow_mut();
-        let state = &mut *state;
+        let mut guard = self.borrow_mut();
+        let state = &mut *guard;
         let Some(renderer) = &mut state.renderer else {
             return None;
         };
@@ -2303,6 +2825,9 @@ impl PlatformWindow for WaylandWindow {
                 }
             }
 
+            // The recovered device is only known good once it presents.
+            state.present_failures.failed();
+            state.last_present_failure = Some(Instant::now());
             state.redraw_requested = true;
             return None;
         }
@@ -2341,21 +2866,33 @@ impl PlatformWindow for WaylandWindow {
                 Arc::new(move || ping.ping()),
             );
         }
+        let mut recovered = None;
         if presented {
             state.presentation = PresentationState::Presented;
+            if state.present_failures.presented() {
+                recovered = Some((state.client.clone(), state.surface.id()));
+            }
+            state.last_present_failure = None;
             self.0.frame_loop.set(FrameLoop::AwaitingCallback);
         } else {
             state.presentation = state.presentation.failed();
+            state.present_failures.failed();
+            state.last_present_failure = Some(Instant::now());
             self.0.frame_loop.set(FrameLoop::PresentationFailed);
         }
 
         if renderer.needs_redraw() {
             state.redraw_requested = true;
         }
+        drop(guard);
+        if let Some((client, surface_id)) = recovered {
+            client.retry_failed_presents_except(&surface_id);
+        }
         receipt
     }
 
     fn schedule_frame(&self) {
+        self.0.restart_failed_present(RetryWake::Demand);
         self.0.schedule_frame();
     }
 

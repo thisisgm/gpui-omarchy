@@ -238,7 +238,7 @@ impl ImeWindow for WaylandWindowStatePtr {
 
 /// Pacing for retry ticks: a fixed 60Hz interval. Retries only occur for throttled or
 /// failed-present frames, so matching the output's actual refresh rate wouldn't be observable.
-const FRAME_RETRY_INTERVAL: Duration = Duration::from_micros(16_667);
+pub(super) const FRAME_RETRY_INTERVAL: Duration = Duration::from_micros(16_667);
 
 pub(crate) fn take_startup_activation_token_from_environment() -> Option<String> {
     let token = std::env::var(XDG_ACTIVATION_TOKEN_ENV_VAR)
@@ -619,23 +619,36 @@ impl WaylandClientStatePtr {
         }
     }
 
-    /// Queue a retry tick for `surface_id` one refresh interval from now. An immediate
-    /// retry would spin against the frame-rate throttle that deferred the draw in the
-    /// first place.
-    pub fn schedule_frame_retry(&self, surface_id: &ObjectId) {
+    /// A present that succeeds after failures shows the device works, so the client's other windows retry sooner.
+    pub fn retry_failed_presents_except(&self, presented: &ObjectId) {
+        let client = self.get_client();
+        let windows = client
+            .borrow()
+            .windows
+            .iter()
+            .filter(|(surface_id, _)| *surface_id != presented)
+            .map(|(_, window)| window.clone())
+            .collect::<Vec<WaylandWindowStatePtr>>();
+        for window in windows {
+            window.retry_failed_present_after_sibling();
+        }
+    }
+
+    /// Queues a retry tick for `surface_id` after `delay`, at least one refresh interval; `token` names this wait.
+    pub fn schedule_frame_retry(&self, surface_id: &ObjectId, delay: Duration, token: u64) {
         let client = self.get_client();
         let state = client.borrow();
         let surface_id = surface_id.clone();
         let this = self.clone();
         if let Err(err) = state.loop_handle.insert_source(
-            Timer::from_duration(FRAME_RETRY_INTERVAL),
+            Timer::from_duration(delay.max(FRAME_RETRY_INTERVAL)),
             move |deadline, _, _| {
                 let Some(client) = this.0.upgrade() else {
                     return TimeoutAction::Drop;
                 };
                 let window = get_window(&mut client.borrow_mut(), &surface_id);
                 if let Some(window) = window {
-                    window.retry_timer_fired(deadline);
+                    window.retry_timer_fired(deadline, token);
                 }
                 TimeoutAction::Drop
             },

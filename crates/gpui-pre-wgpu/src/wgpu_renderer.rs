@@ -263,6 +263,7 @@ pub struct WgpuRenderer {
     observed_error_generation: u64,
     last_surface_error: Option<String>,
     needs_redraw: bool,
+    suboptimal: SuboptimalRebuild,
     /// The device's shared fence watcher, taken on first use and again after device recovery.
     #[cfg(not(target_family = "wasm"))]
     gpu_fence: Option<(Arc<crate::gpu_fence::GpuFence>, Arc<wgpu::Device>)>,
@@ -529,6 +530,7 @@ impl WgpuRenderer {
             observed_error_generation: 0,
             last_surface_error: None,
             needs_redraw: false,
+            suboptimal: SuboptimalRebuild::default(),
             #[cfg(not(target_family = "wasm"))]
             gpu_fence: None,
             #[cfg(not(target_family = "wasm"))]
@@ -1130,6 +1132,7 @@ impl WgpuRenderer {
         // panics when the device/surface is in an invalid state during resize.
         resources.invalidate_intermediate_textures();
 
+        self.suboptimal.swapchain_replaced();
         if let RendererState::Ready { surface, core } = &self.state {
             surface.configure(&core.resources.device, &self.surface_config);
         }
@@ -1170,6 +1173,7 @@ impl WgpuRenderer {
         );
         resources.pipelines.subpixel_sprites = subpixel_sprites;
 
+        self.suboptimal.swapchain_replaced();
         if let RendererState::Ready { surface, core } = &self.state {
             surface.configure(&core.resources.device, &self.surface_config);
         }
@@ -1251,17 +1255,11 @@ impl WgpuRenderer {
             self.failed_frame_count = 0;
         }
 
-        let frame = match surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(frame) => frame,
-            wgpu::CurrentSurfaceTexture::Suboptimal(frame) => {
-                // Textures must be destroyed before the surface can be reconfigured.
-                drop(frame);
-                surface.configure(&core.resources.device, &self.surface_config);
-                return false;
-            }
+        let (acquired, frame) = match surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(frame) => (Acquired::Clean, Some(frame)),
+            wgpu::CurrentSurfaceTexture::Suboptimal(frame) => (Acquired::Suboptimal, Some(frame)),
             wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated => {
-                surface.configure(&core.resources.device, &self.surface_config);
-                return false;
+                (Acquired::Unusable, None)
             }
             wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
                 return false;
@@ -1270,6 +1268,15 @@ impl WgpuRenderer {
                 self.last_surface_error = Some("Surface texture validation error".to_string());
                 return false;
             }
+        };
+        if self.suboptimal.rebuilds(acquired) {
+            // Textures must be destroyed before the surface can be reconfigured.
+            drop(frame);
+            surface.configure(&core.resources.device, &self.surface_config);
+            return false;
+        }
+        let Some(frame) = frame else {
+            return false;
         };
 
         // The acquired texture is the authority on frame dimensions; the surface
@@ -1296,6 +1303,39 @@ impl WgpuRenderer {
 
         frame.present();
         true
+    }
+}
+
+/// What an acquire handed back, as far as the swapchain is concerned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Acquired {
+    Clean,
+    Suboptimal,
+    /// Lost or outdated: no image, and the swapchain has to be rebuilt.
+    Unusable,
+}
+
+/// Whether the current swapchain was already rebuilt for a suboptimal acquire.
+#[derive(Debug, Default)]
+struct SuboptimalRebuild(bool);
+
+impl SuboptimalRebuild {
+    /// Whether this acquire rebuilds the swapchain and fails the frame; one that stays suboptimal is rebuilt once.
+    fn rebuilds(&mut self, acquired: Acquired) -> bool {
+        match acquired {
+            Acquired::Clean => {
+                self.0 = false;
+                false
+            }
+            Acquired::Suboptimal => !std::mem::replace(&mut self.0, true),
+            // The mark stays: cleared here, a driver that alternates outdated and suboptimal would never present.
+            Acquired::Unusable => true,
+        }
+    }
+
+    /// A swapchain built for another reason (size, alpha mode, surface) earns its own rebuild.
+    fn swapchain_replaced(&mut self) {
+        self.0 = false;
     }
 }
 
@@ -2332,6 +2372,7 @@ impl WgpuRenderer {
             }
         };
         surface.configure(&core.resources.device, &self.surface_config);
+        self.suboptimal.swapchain_replaced();
         core.resources.invalidate_intermediate_textures();
         self.state = RendererState::Ready { surface, core };
 
@@ -2820,6 +2861,56 @@ mod tests {
     };
     #[cfg(target_os = "linux")]
     use gpui::{DevicePixels, PlatformHeadlessRenderer, Scene};
+
+    #[test]
+    fn a_swapchain_that_stays_suboptimal_is_rebuilt_once() {
+        let mut mark = SuboptimalRebuild::default();
+        let rebuilds = (0..10_000)
+            .filter(|_| mark.rebuilds(Acquired::Suboptimal))
+            .count();
+        assert_eq!(rebuilds, 1);
+    }
+
+    /// Whether a swapchain that spent its one rebuild is rebuilt again for a suboptimal acquire after `event`.
+    fn rebuilds_after(event: impl FnOnce(&mut SuboptimalRebuild)) -> bool {
+        let mut mark = SuboptimalRebuild::default();
+        assert!(mark.rebuilds(Acquired::Suboptimal));
+        assert!(!mark.rebuilds(Acquired::Suboptimal));
+        event(&mut mark);
+        mark.rebuilds(Acquired::Suboptimal)
+    }
+
+    #[test]
+    fn a_new_swapchain_earns_its_own_suboptimal_rebuild() {
+        assert!(rebuilds_after(|mark| {
+            assert!(!mark.rebuilds(Acquired::Clean));
+        }));
+        assert!(rebuilds_after(SuboptimalRebuild::swapchain_replaced));
+        assert!(!rebuilds_after(|mark| {
+            assert!(mark.rebuilds(Acquired::Unusable));
+        }));
+        assert!(!rebuilds_after(|_| {}));
+    }
+
+    #[test]
+    fn suboptimal_and_outdated_in_turn_present_every_suboptimal_frame() {
+        let mut mark = SuboptimalRebuild::default();
+        let rebuilt = [Acquired::Suboptimal, Acquired::Unusable]
+            .into_iter()
+            .cycle()
+            .take(10_000)
+            .map(|acquired| (acquired, mark.rebuilds(acquired)))
+            .filter(|&(_, rebuilds)| rebuilds)
+            .collect::<Vec<_>>();
+        // The first suboptimal acquire and every outdated one rebuild; the other 4,999 suboptimal frames present.
+        assert_eq!(rebuilt.len(), 5_001);
+        assert_eq!(rebuilt[0].0, Acquired::Suboptimal);
+        assert!(
+            rebuilt[1..]
+                .iter()
+                .all(|&(acquired, _)| acquired == Acquired::Unusable)
+        );
+    }
 
     #[cfg(target_os = "linux")]
     fn device_size(width: i32, height: i32) -> Size<DevicePixels> {
